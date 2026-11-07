@@ -2,7 +2,9 @@
 
 These guidelines define practical weather-alert rules for Dubai, UAE. They are designed to protect residents, commuters and outdoor workers. Official instructions from the UAE National Center of Meteorology (NCM), NCEMA, Dubai Police and other competent authorities always take priority.
 
-## Heat and High Temperatures
+## Heat
+
+Heatwave, scorching weather, scorching conditions, extreme heat and very high temperatures are related search terms for this section.
 
 Issue a heat alert when NCM publishes a relevant heat warning or an official public-health advisory identifies dangerous heat conditions affecting Dubai.
 
@@ -15,7 +17,9 @@ This occupational midday-break requirement must not be misrepresented as a gener
 Source: UAE Ministry of Human Resources and Emiratisation (MoHRE), Midday Break policy information:
 https://www.dmi.gov.ae/content/dubaione/en-ae/programs/181/MoHREannouncesreturnofMiddayWorkBan.html
 
-## Strong Winds and Dust Storms
+## Wind
+
+Strong winds, high winds, wind gusts and dust storms are related search terms for this section.
 
 Issue a wind alert when NCM publishes a relevant warning affecting Dubai.
 
@@ -35,7 +39,11 @@ https://www.adphc.gov.ae/-/media/Project/ADPHC/ADPHC/PDF/OSHAD-SF/Technical-Guid
 
 Note: These wind bands are a published UAE safety reference, not official Dubai NCM warning thresholds.
 
-## Heavy Rain and Flooding
+## Rain
+
+Heavy rain, flooding, flash floods, floodwater and water accumulation are related search terms for this section.
+
+Flooding and flash floods can create dangerous conditions, including when the daily rainfall total is relatively low.
 
 Issue a rain or flooding alert when NCM or another relevant UAE authority publishes a warning affecting Dubai, or when an authoritative source confirms hazardous flooding or water accumulation.
 
@@ -55,7 +63,9 @@ After rainfall, warn residents about hidden hazards, damaged electrical equipmen
 Source: Abu Dhabi Public Health Centre, ADOSH-SF Technical Guideline, Dealing with Adverse Weather Conditions, Version 4.0, 15 July 2024, sections 4.4, 4.6 and 6.1:
 https://www.adphc.gov.ae/-/media/Project/ADPHC/ADPHC/PDF/OSHAD-SF/Technical-Guidelines/Dealing-with-Adverse-Weather-Eng.pdf
 
-## Cold Weather and Frost
+## Cold
+
+Cold weather, low temperatures, frost and icy roads are related search terms for this section.
 
 Issue a cold-weather alert when NCM publishes an official warning about unusually cold conditions, frost or potentially icy surfaces affecting Dubai.
 
@@ -102,6 +112,25 @@ Send an updated alert when:
 Close or expire alerts when the official warning is cancelled or the relevant hazard period ends.
 
 Never suppress an urgent safety escalation merely to prevent a duplicate notification.
+
+## Search and Retrieval Guidance
+
+The section headings are intentional retrieval boundaries. Keep each weather hazard's rules under its own heading so search results can be attributed to the correct condition.
+
+Alternative words and phrases in each section help basic keyword search find relevant guidance. They are retrieval terms, not independent alert triggers.
+
+A keyword match does not prove that a weather condition exists or that an alert threshold has been crossed. The application must separately verify current weather data, location, source authority and applicable alert conditions.
+
+Keep weather sections separate:
+
+- Heat-related guidance belongs under `## Heat`.
+- Wind-related guidance belongs under `## Wind`.
+- Rain and flooding guidance belongs under `## Rain`.
+- Cold-related guidance belongs under `## Cold`.
+
+Do not delete or merge these headings during document preparation. Large mixed sections can cause retrieval to return unrelated guidance and lead to incorrect citations.
+
+If no section matches a query, return a clear no-match result. Do not invent guidance or interpret missing search results as proof that no weather hazard exists.
 
 ## Source Validation and Authority
 
