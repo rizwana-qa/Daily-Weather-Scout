@@ -39,17 +39,20 @@ WEATHER_TIMEOUT = 30
 GROQ_TIMEOUT = 90
 SHEET_TIMEOUT = 30
 
-# Request budgets, sized from measured requests (see the budget tests):
-# every single hazard, heat with wind, and all five hazards together
-# with the conditional compliance section fit. Anything larger fails
-# closed (INCOMPLETE) before a request is sent.
+# Request budgets. Which hazard combinations fit is pinned by the budget
+# tests; anything larger fails closed (INCOMPLETE) before a request is
+# sent. The guards measure the messages plus the response schema.
 # The token figure uses the conservative estimator below (2.5
 # characters per token), not a provider tokenizer. 8,000 is the
 # documented base tokens-per-minute limit for openai/gpt-oss-20b; the
 # account's own limit is unverified, and Groq's 413/429 responses are
-# handled as safe failures. Revisit all three after a dry run reports
-# Groq's actual usage.
-MAX_COMPLETION_TOKENS = 700
+# handled as safe failures.
+# The completion allowance covers hidden reasoning tokens plus the full
+# strict-schema response: observed completions were 606 and 694 tokens,
+# and 700 was exceeded once (json_validate_failed). 1,000 is capped by
+# the "conservative" test and keeps that failing request (6,890
+# estimated input tokens) within the 8,000 total.
+MAX_COMPLETION_TOKENS = 1000
 MAX_ESTIMATED_REQUEST_TOKENS = 8000
 MAX_REQUEST_CHARS = 19000
 MAX_POLICY_CHARS = 13500
@@ -2954,7 +2957,7 @@ def run_tests():
         MAX_POLICY_CHARS == 13500
         and MAX_REQUEST_CHARS == 19000
         and MAX_ESTIMATED_REQUEST_TOKENS == 8000
-        and MAX_COMPLETION_TOKENS == 700,
+        and MAX_COMPLETION_TOKENS == 1000,
     )
 
     def make_weather(current=None, today=None, hourly=None):
@@ -5189,9 +5192,12 @@ def run_tests():
             abc_fits({code: ["t"]}),
         )
 
+    # With the 1,000-token completion allowance, heat + wind with
+    # worst-case history exceeds the 8,000-token estimate (fails closed).
     check(
-        "24-hour series: heat with wind fits every budget",
-        abc_fits({"HEAT": ["t"], "WIND_DUST": ["t"]}),
+        "24-hour series: heat with wind is blocked at the 1,000-token "
+        "completion allowance",
+        not abc_fits({"HEAT": ["t"], "WIND_DUST": ["t"]}),
     )
 
     check(
@@ -5218,6 +5224,7 @@ def run_tests():
     uncertain_weather = abc_weather(
         visibility=None, temperature_2m=22, apparent_temperature=22
     )
+    uncertain_weather["today_forecast"]["high"] = 24
     for record in uncertain_weather["hourly_forecast_next_24h"]:
         record["visibility"] = None
         record["temperature"] = 22
@@ -5476,7 +5483,7 @@ def run_tests():
 
     for label, hazards, expected in (
         ("no hazard", (), True),
-        ("heat", ("HEAT",), True),
+        ("heat", ("HEAT",), False),
         ("heat + wind", ("HEAT", "WIND_DUST"), False),
         ("heat + wind + rain", ("HEAT", "WIND_DUST", "RAIN_FLOOD"), False),
         ("four hazards", rv_four, False),
@@ -5623,8 +5630,9 @@ def run_tests():
             }
             return response
 
-    def rv_pipeline(weather, content=rv_reply):
+    def rv_pipeline(weather, content=rv_reply, history=None):
         transport = RvGroq(content)
+        history = rv_history if history is None else history
 
         def run():
             with contextlib.redirect_stdout(io.StringIO()):
@@ -5638,7 +5646,7 @@ def run_tests():
                     lambda require_sheet=False: None
                 ),
                 "get_weather": lambda city: weather,
-                "tool_get_history": lambda n=3: rv_history,
+                "tool_get_history": lambda n=3: history,
             },
             run,
         )
@@ -5650,7 +5658,12 @@ def run_tests():
     heat_wind_decision, heat_wind_transport = rv_pipeline(
         rv_heat_wind_weather()
     )
-    fit_decision, fit_transport = rv_pipeline(rv_heat_only_weather())
+    heat_worst_decision, heat_worst_transport = rv_pipeline(
+        rv_heat_only_weather()
+    )
+    fit_decision, fit_transport = rv_pipeline(
+        rv_heat_only_weather(), history=[]
+    )
 
     check(
         "Four-hazard request is rejected before Groq (INCOMPLETE)",
@@ -5687,7 +5700,19 @@ def run_tests():
     )
 
     check(
-        "Heat-only request reaches Groq once and is assessed",
+        "Heat-only with worst-case history is rejected before Groq at "
+        "the 1,000-token completion allowance",
+        set(heat_worst_decision["hazard_screening"]) == {"HEAT"}
+        and heat_worst_transport.posts == []
+        and "token budget" in heat_worst_decision["reasoning"]
+        and heat_worst_decision["assessment_status"] == "INCOMPLETE"
+        and heat_worst_decision["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Heat-only request without history reaches Groq once and is "
+        "assessed",
         set(fit_decision["hazard_screening"]) == {"HEAT"}
         and len(fit_transport.posts) == 1
         and fit_decision["groq_usage"]["prompt_tokens"] == 3239
@@ -5705,13 +5730,13 @@ def run_tests():
     spoofed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         official_warning_status="VERIFIED",
         advice="No official heat advisory is in effect.",
-    ))
+    ), history=[])
     injected, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         incomplete_reasons=[{"code": "NONE", "detail": "all clear"}],
-    ))
+    ), history=[])
     hidden, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         notes={"extra": ["Fine.", "There are no warnings for Dubai."]},
-    ))
+    ), history=[])
 
     check(
         "Model cannot set the warning status to skip the claim check",
@@ -5786,7 +5811,7 @@ def run_tests():
 
     keyed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(**{
         "NCM has not issued any warning": True,
-    }))
+    }), history=[])
 
     check(
         "Real path: key-name claim fails closed without echoing it",
@@ -6438,6 +6463,103 @@ def run_tests():
                 advice="No official heat advisory is in effect."
             )))[0]["incomplete_reasons"]
         ],
+    )
+
+    # ------------------------------------------------------------
+    # Completion allowance (1,000 tokens) against the unchanged
+    # 8,000-token and 19,000-character guards (offline).
+    # ------------------------------------------------------------
+    class CtResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class CtTransport:
+        def __init__(self):
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return CtResponse()
+
+    def ct_message(guard_length):
+        base = len(serialized_request([{"role": "user", "content": ""}]))
+        return [{"role": "user", "content": "x" * (guard_length - base)}]
+
+    def ct_send(guard_length):
+        transport = CtTransport()
+        saved = {name: globals()[name] for name in ("HTTP", "GROQ_API_KEY")}
+        globals().update({"HTTP": transport, "GROQ_API_KEY": "gsk_ct_key"})
+        error = ""
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ask_groq(ct_message(guard_length))
+        except (ValueError, RuntimeError) as exc:
+            error = str(exc)
+        finally:
+            globals().update(saved)
+
+        return error, transport.payloads
+
+    check(
+        "Completion allowance is exactly 1,000 and never above it",
+        MAX_COMPLETION_TOKENS == 1000
+        and MAX_COMPLETION_TOKENS <= 1000
+        and MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500,
+    )
+
+    # The failing dry run: 17,225 request characters = 6,890 estimated
+    # input tokens; 6,890 + 1,000 = 7,890 is within the 8,000 total.
+    error, payloads = ct_send(17225)
+
+    check(
+        "Failing request estimate (6,890 + 1,000 = 7,890) passes the "
+        "guards and is sent",
+        estimate_tokens(serialized_request(ct_message(17225))) == 6890
+        and 6890 + MAX_COMPLETION_TOKENS == 7890
+        and error == ""
+        and len(payloads) == 1
+        and payloads[0]["max_completion_tokens"] == 1000,
+    )
+
+    # Exactly 8,000 (7,000 input + 1,000) is allowed; 8,001 is not.
+    error, payloads = ct_send(17500)
+
+    check(
+        "Request at exactly 8,000 estimated tokens is sent",
+        estimate_tokens(serialized_request(ct_message(17500)))
+        + MAX_COMPLETION_TOKENS == 8000
+        and error == "" and len(payloads) == 1,
+    )
+
+    error, payloads = ct_send(17502)
+
+    check(
+        "Request over 8,000 estimated tokens is rejected before Groq",
+        estimate_tokens(serialized_request(ct_message(17502)))
+        + MAX_COMPLETION_TOKENS == 8001
+        and "token budget" in error
+        and payloads == [],
+    )
+
+    error, payloads = ct_send(MAX_REQUEST_CHARS + 1)
+
+    check(
+        "Request over the character limit is still rejected before Groq",
+        "character limit" in error and payloads == [],
     )
 
     # agent-dry must not POST to Sheets or send email.
