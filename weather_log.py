@@ -525,6 +525,11 @@ def ask_groq(messages, temperature=0.1):
     LAST_GROQ_USAGE.update({
         "prompt_tokens": usage_number(usage, "prompt_tokens"),
         "completion_tokens": usage_number(usage, "completion_tokens"),
+        "reasoning_tokens": usage_number(
+            usage.get("completion_tokens_details")
+            if isinstance(usage, dict) else None,
+            "reasoning_tokens",
+        ),
         "total_tokens": usage_number(usage, "total_tokens"),
         "finish_reason": (
             finish_reason if isinstance(finish_reason, str) else None
@@ -1643,7 +1648,10 @@ def validate_decision(decision, retrieved_sections):
 
     for field in ("hazard_type", "advice", "reasoning"):
         if not isinstance(decision[field], str):
-            raise ValueError(f"Invalid text field: {field}")
+            raise ValueError(
+                f"Invalid text field: {field} (expected text, "
+                f"received {type(decision[field]).__name__})"
+            )
 
         if not decision[field].strip():
             raise ValueError(f"Empty text field: {field}")
@@ -1799,17 +1807,19 @@ Requirements:
 10. In sources, cite exact policy section titles.
 11. Return a single JSON object only.
 
-Return exactly these keys:
-hazard_type, likelihood_score, likelihood_reason, severity_score,
-severity_reason, exposure_score, exposure_reason, duration_score,
-duration_reason, geographic_impact_score, geographic_impact_reason,
-alert_recommendation, advice, reasoning, recommended_actions,
-limitations, missing_evidence, sources.
+Return exactly these 18 keys in one JSON object.
+Plain-text strings (never arrays or objects): hazard_type, advice,
+reasoning, alert_recommendation, likelihood_reason, severity_reason,
+exposure_reason, duration_reason, geographic_impact_reason.
+Integer scores: likelihood_score, severity_score, exposure_score,
+duration_score, geographic_impact_score.
+Arrays of strings: recommended_actions, limitations, missing_evidence,
+sources.
 
 Each score must be an integer from 1 to 5 when evidence supports it.
 If evidence for a dimension is insufficient, return null for that
 score, never a guessed value, and explain why in its rationale and in
-limitations. All list fields must be JSON arrays of strings.
+limitations.
 """
 
 
@@ -2098,6 +2108,7 @@ def run_weather_agent():
         decision["policy_path"] = str(GUIDELINES_PATH)
 
         decision["official_warning_status"] = "NOT_CHECKED"
+        decision["groq_usage"] = dict(LAST_GROQ_USAGE)
 
         decision["evidence_quality"] = "E0"
         decision["evidence_confidence"] = "NONE"
@@ -3906,6 +3917,456 @@ def run_tests():
         and Path(loaded_elsewhere["path"]).resolve()
         == (Path(__file__).resolve().parent / "guidelines.md")
         and loaded_elsewhere["hash"] == hazard_policy["hash"],
+    )
+
+    # ------------------------------------------------------------
+    # Regression: dry run failed with "ValueError: Invalid text
+    # field: advice" although Groq reported finish_reason=stop with
+    # 694 of 700 completion tokens. The JSON parsed and passed every
+    # earlier validation step, so `advice` was present but not a
+    # string. The prompt never stated that advice is plain text.
+    # Everything below is self-contained and offline.
+    # ------------------------------------------------------------
+    def adv_response(**changes):
+        body = {
+            "hazard_type": "HEAT",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 3, "exposure_reason": "er",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 3,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity at midday.",
+            "reasoning": "Temperature reaches the screening value.",
+            "recommended_actions": ["Drink water"],
+            "limitations": ["Official warnings not checked"],
+            "missing_evidence": [],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return body
+
+    adv_sections = [
+        {"section": "6.1 Extreme Heat", "text": "x"},
+        {"section": "16. Final Decision Rule", "text": "x"},
+    ]
+
+    def adv_validate(**changes):
+        try:
+            return validate_decision(adv_response(**changes), adv_sections)
+        except ValueError as exc:
+            return str(exc)
+
+    def adv_raises(function):
+        try:
+            function()
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    def adv_error(body):
+        try:
+            validate_decision(body, adv_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    # 1. A valid response containing advice.
+    adv_ok = adv_validate()
+
+    check(
+        "Valid response with advice passes validation unchanged",
+        isinstance(adv_ok, dict)
+        and adv_ok["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and adv_ok["risk_score"] == 9.0
+        and adv_ok["risk_band"] == "MODERATE"
+        and adv_ok["assessment_status"] == "PRELIMINARY",
+    )
+
+    # 2. Invalid types for advice are rejected and named.
+    for label, bad in {
+        "list": ["a", "b"],
+        "dict": {"text": "a"},
+        "null": None,
+        "int": 3,
+        "bool": True,
+    }.items():
+        message = adv_validate(advice=bad)
+
+        check(
+            f"advice of type {label} is rejected with the type named",
+            isinstance(message, str)
+            and message.startswith("Invalid text field: advice")
+            and "expected text" in message
+            and f"received {type(bad).__name__}" in message,
+        )
+
+    check(
+        "Blank advice is rejected as empty",
+        adv_validate(advice="   ") == "Empty text field: advice",
+    )
+
+    check(
+        "Type errors also name hazard_type and reasoning",
+        adv_validate(hazard_type=["HEAT"]).startswith(
+            "Invalid text field: hazard_type"
+        )
+        and adv_validate(reasoning={"a": 1}).startswith(
+            "Invalid text field: reasoning"
+        ),
+    )
+
+    check(
+        "Type error reports the type, never the model's content",
+        "secret-model-text" not in adv_validate(
+            advice=["secret-model-text"]
+        ),
+    )
+
+    # 3. Missing required fields: every key is required.
+    adv_keys = list(adv_response())
+
+    check(
+        "Eighteen response keys are required",
+        len(adv_keys) == 18,
+    )
+
+    for key in adv_keys:
+        body = adv_response()
+        del body[key]
+
+        check(
+            f"Missing required field is rejected: {key}",
+            adv_error(body) == "Missing assessment fields: " + key,
+        )
+
+    check(
+        "Non-object model output is rejected",
+        adv_error([1, 2]) == "AI returned an invalid assessment."
+        and adv_error("text") == "AI returned an invalid assessment.",
+    )
+
+    # 4. Malformed or truncated JSON never reaches validation.
+    adv_json = json_text(adv_response())
+    truncated_failures = 0
+
+    for cut in range(1, len(adv_json), 37):
+        try:
+            parse_json_response(adv_json[:cut])
+        except ValueError as exc:
+            if "invalid JSON" in str(exc):
+                truncated_failures += 1
+
+    check(
+        "Truncated JSON is always rejected as invalid",
+        truncated_failures == len(range(1, len(adv_json), 37)),
+    )
+
+    check(
+        "Malformed and non-object JSON are rejected",
+        all(
+            "JSON" in adv_raises(lambda text=text: parse_json_response(text))
+            for text in (
+                "{not json", "", "   ", "[1, 2]", "\"text\"", "null",
+                "{\"advice\": }",
+            )
+        ),
+    )
+
+    # Stop plus valid JSON does not prove schema completeness.
+    incomplete_body = adv_response()
+    del incomplete_body["sources"]
+
+    check(
+        "Valid JSON with a missing field is rejected despite a "
+        "clean finish",
+        "Missing assessment fields: sources" in adv_error(
+            parse_json_response(json_text(incomplete_body))
+        ),
+    )
+
+    # Contract: the prompt, the validator and the payload agree.
+    # Parse the typed key groups; a missing group yields no keys, so
+    # an old or broken prompt fails these checks instead of crashing.
+    contract = re.search(
+        r"Return exactly these 18 keys(.*?)Each score must be",
+        SYSTEM_PROMPT,
+        re.S,
+    )
+    prompt_text = contract.group(1) if contract else ""
+
+    def adv_group_keys(label, following):
+        match = re.search(
+            re.escape(label) + r"[^:]*:(.*?)(?:" + following + r"|\Z)",
+            prompt_text,
+            re.S,
+        )
+        listed = match.group(1) if match else ""
+        return [key for key in re.split(r"[\s,.]+", listed) if key]
+
+    string_keys = adv_group_keys("Plain-text strings", "Integer scores")
+    score_keys = adv_group_keys("Integer scores", "Arrays of strings")
+    array_keys = adv_group_keys("Arrays of strings", r"\Z")
+    prompt_keys = string_keys + score_keys + array_keys
+
+    check(
+        "Prompt lists exactly the keys the validator requires",
+        sorted(prompt_keys) == sorted(adv_keys)
+        and len(set(prompt_keys)) == 18,
+    )
+
+    check(
+        "Prompt states the type of every key",
+        "never arrays or objects" in prompt_text
+        and {"hazard_type", "advice", "reasoning",
+             "alert_recommendation"} <= set(string_keys)
+        and set(score_keys)
+        == {k for k in adv_keys if k.endswith("_score")}
+        and set(array_keys)
+        == {"recommended_actions", "limitations", "missing_evidence",
+            "sources"}
+        and all(
+            isinstance(adv_response()[key], str) for key in string_keys
+        )
+        and all(
+            type(adv_response()[key]) is int for key in score_keys
+        )
+        and all(
+            isinstance(adv_response()[key], list) for key in array_keys
+        ),
+    )
+
+    check(
+        "Decision fields reach the Sheets payload as text",
+        isinstance(adv_ok["advice"], str)
+        and isinstance(adv_ok["reasoning"], str),
+    )
+
+    # 5. A complete valid response reaches assessment construction.
+    def adv_weather():
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00",
+                "temperature_2m": 35.5, "apparent_temperature": 34.3,
+                "precipitation": 0, "wind_speed_10m": 5,
+                "wind_gusts_10m": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            },
+            "today_forecast": {
+                "high": 36, "low": 25, "wind": 8, "gust": 15,
+                "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": "2026-11-08T13:00", "temperature": 35,
+                "apparent_temperature": 34, "precipitation": 0,
+                "wind": 5, "gust": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            }],
+            "history_summary": {},
+        }
+
+    def adv_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def adv_assess(reply):
+        return adv_override(
+            {"ask_groq": lambda messages, temperature=0.1: reply},
+            lambda: assess_weather(
+                adv_weather(), [], load_guidelines_quietly(),
+                adv_sections,
+            ),
+        )
+
+    def load_guidelines_quietly():
+        with contextlib.redirect_stdout(io.StringIO()):
+            return load_guidelines()
+
+    constructed = adv_assess(json_text(adv_response()))
+
+    check(
+        "Complete valid response reaches assessment construction",
+        constructed["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and constructed["risk_score"] == 9.0
+        and constructed["risk_band"] == "MODERATE"
+        and constructed["assessment_status"] == "INCOMPLETE"
+        and constructed["alert_recommendation"] == "MONITOR"
+        and constructed["sources"] == ["6.1 Extreme Heat"]
+        and constructed["official_warning_status"]
+        == "NOT_CHECKED",
+    )
+
+    check(
+        "Assessment construction still fails closed on bad advice",
+        "Invalid text field: advice" in adv_raises(
+            lambda: adv_assess(json_text(adv_response(advice=["a"])))
+        ),
+    )
+
+    # 6. Real retrieval and assessment path, mocked external services
+    #    (weather, history, Groq transport). Real guidelines.md,
+    #    real retrieval, real ask_groq, real validation.
+    class AdvResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content, finish="stop", usage=None):
+            self.content = content
+            self.finish = finish
+            self.usage = usage
+
+        def json(self):
+            body = {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": self.finish,
+                }]
+            }
+
+            if self.usage is not None:
+                body["usage"] = self.usage
+
+            return body
+
+    class AdvHttp:
+        def __init__(self, response):
+            self.response = response
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return self.response
+
+    incident_usage = {
+        "prompt_tokens": 3239,
+        "completion_tokens": 694,
+        "total_tokens": 3933,
+        "completion_tokens_details": {"reasoning_tokens": 301},
+    }
+
+    def adv_pipeline(content, finish="stop", usage=incident_usage):
+        transport = AdvHttp(AdvResponse(content, finish, usage))
+        printed = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()[0]
+
+        result = adv_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_adv_test_key_not_real",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: adv_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+        return result, printed.getvalue(), transport
+
+    # Sources must be section titles actually retrieved for a heat day.
+    real_sources = ["6.1 Extreme Heat", "16. Final Decision Rule"]
+
+    good_result, good_output, good_transport = adv_pipeline(
+        json_text(adv_response(sources=real_sources))
+    )
+
+    check(
+        "Real path completes a valid response and records usage",
+        "load_guidelines" in good_result["tools_used"]
+        and "search_guidelines" in good_result["tools_used"]
+        and good_result["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and good_result["assessment_status"] == "INCOMPLETE"
+        and good_result["send_alert"] is False
+        and good_result["notification_status"] == "NOT_SENT"
+        and good_result["official_warning_status"] == "NOT_CHECKED"
+        and good_result["groq_usage"]["prompt_tokens"] == 3239
+        and good_result["groq_usage"]["completion_tokens"] == 694
+        and good_result["groq_usage"]["reasoning_tokens"] == 301
+        and good_result["groq_usage"]["finish_reason"] == "stop"
+        and "gsk_adv_test_key_not_real" not in good_output
+        and len(good_transport.posts) == 1,
+    )
+
+    incident_result, incident_output, _ = adv_pipeline(
+        json_text(adv_response(
+            advice=["Limit activity", "Drink water"],
+            sources=real_sources,
+        ))
+    )
+
+    check(
+        "Incident reproduced: advice as a list fails closed with the "
+        "type named and usage kept",
+        incident_result["assessment_status"] == "INCOMPLETE"
+        and incident_result["alert_recommendation"]
+        == "UNABLE_TO_ASSESS"
+        and incident_result["risk_band"] == "UNASSESSED"
+        and incident_result["risk_score"] is None
+        and "Invalid text field: advice (expected text, received list)"
+        in incident_result["reasoning"]
+        and incident_result["send_alert"] is False
+        and incident_result["notification_status"] == "NOT_SENT"
+        and incident_result["official_warning_status"] == "NOT_CHECKED"
+        and incident_result["groq_usage"]["completion_tokens"] == 694
+        and incident_result["groq_usage"]["finish_reason"] == "stop"
+        and "gsk_adv_test_key_not_real"
+        not in json_text(incident_result) + incident_output,
+    )
+
+    missing_result, _, _ = adv_pipeline(
+        json_text({
+            key: value for key, value in adv_response().items()
+            if key != "advice"
+        })
+    )
+    truncated_result, _, _ = adv_pipeline(
+        json_text(adv_response())[:200], finish="length"
+    )
+    cut_stop_result, _, _ = adv_pipeline(
+        json_text(adv_response())[:200], finish="stop"
+    )
+
+    check(
+        "Real path fails closed on missing field, truncation and "
+        "malformed JSON",
+        "Missing assessment fields: advice" in missing_result["reasoning"]
+        and "cut off" in truncated_result["reasoning"]
+        and "invalid JSON" in cut_stop_result["reasoning"]
+        and all(
+            result["assessment_status"] == "INCOMPLETE"
+            and result["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and result["send_alert"] is False
+            for result in (
+                missing_result, truncated_result, cut_stop_result
+            )
+        ),
+    )
+
+    check(
+        "Absent reasoning-token detail is recorded as null",
+        adv_pipeline(
+            json_text(adv_response(sources=real_sources)),
+            usage={"prompt_tokens": 1, "completion_tokens": 2,
+                   "total_tokens": 3},
+        )[0]["groq_usage"]["reasoning_tokens"] is None,
     )
 
     # agent-dry must not POST to Sheets or send email.
