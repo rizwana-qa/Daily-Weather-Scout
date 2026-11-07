@@ -13,6 +13,7 @@ CITIES = {
     "Lahore": (31.52, 74.32),
     "Karachi": (24.86, 67.01),
     "Islamabad": (33.69, 73.05),
+    "Dubai": (25.20, 55.27),
 }
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-20b"
