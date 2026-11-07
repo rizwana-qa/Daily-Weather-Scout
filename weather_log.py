@@ -1,8 +1,12 @@
 import os
 import re
 import sys
+import tempfile
 import json
 import math
+import ast
+import contextlib
+import io
 import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -35,10 +39,20 @@ WEATHER_TIMEOUT = 30
 GROQ_TIMEOUT = 90
 SHEET_TIMEOUT = 30
 
+# Request budgets, sized from measured requests (see the budget tests):
+# every single hazard, heat with wind, and all five hazards together
+# with the conditional compliance section fit. Anything larger fails
+# closed (INCOMPLETE) before a request is sent.
+# The token figure uses the conservative estimator below (2.5
+# characters per token), not a provider tokenizer. 8,000 is the
+# documented base tokens-per-minute limit for openai/gpt-oss-20b; the
+# account's own limit is unverified, and Groq's 413/429 responses are
+# handled as safe failures. Revisit all three after a dry run reports
+# Groq's actual usage.
 MAX_COMPLETION_TOKENS = 700
-MAX_ESTIMATED_REQUEST_TOKENS = 5000
-MAX_REQUEST_CHARS = 9000
-MAX_POLICY_CHARS = 5000
+MAX_ESTIMATED_REQUEST_TOKENS = 8000
+MAX_REQUEST_CHARS = 19000
+MAX_POLICY_CHARS = 13500
 MAX_HISTORY_RECORDS = 3
 
 AUTO_APPROVE_ALERTS = (
@@ -153,7 +167,9 @@ def get_weather(city):
             "precipitation,"
             "wind_speed_10m,"
             "wind_gusts_10m,"
-            "visibility"
+            "visibility,"
+            "weather_code,"
+            "cape"
         ),
         "hourly": (
             "temperature_2m,"
@@ -162,7 +178,9 @@ def get_weather(city):
             "precipitation,"
             "wind_speed_10m,"
             "wind_gusts_10m,"
-            "visibility"
+            "visibility,"
+            "weather_code,"
+            "cape"
         ),
         "daily": (
             "temperature_2m_max,"
@@ -247,6 +265,8 @@ def get_weather(city):
         "wind": "wind_speed_10m",
         "gust": "wind_gusts_10m",
         "visibility": "visibility",
+        "weather_code": "weather_code",
+        "cape": "cape",
     }
 
     for index, time_value in enumerate(hourly_times):
@@ -355,6 +375,10 @@ def summarize_weather(weather):
     gusts = values_for("gust")
     precipitation = values_for("precipitation")
     visibility = values_for("visibility")
+    cape = values_for("cape")
+    weather_codes = sorted({
+        int(code) for code in values_for("weather_code")
+    })
 
     hourly_summary = {
         "forecast_hours_available": len(hourly),
@@ -372,6 +396,8 @@ def summarize_weather(weather):
             default=None,
         ),
         "visibility_min": min(visibility, default=None),
+        "cape_max": max(cape, default=None),
+        "weather_codes": weather_codes,
     }
 
     return {
@@ -393,7 +419,41 @@ def summarize_weather(weather):
 # 4. GROQ API
 # ============================================================
 
+# Usage reported by the most recent Groq response (empty until a real
+# response is received). Never contains credentials or message text.
+LAST_GROQ_USAGE = {}
+
+
+def usage_number(usage, key):
+    value = usage.get(key) if isinstance(usage, dict) else None
+    return value if type(value) is int else None
+
+
+def describe_groq_http_error(status_code, response):
+    if status_code == 413:
+        reason = "request too large for the model or account limit"
+    elif status_code == 429:
+        reason = "rate or token limit reached (RPM, TPM, RPD or TPD)"
+    elif status_code == 400:
+        reason = "request rejected as invalid"
+    else:
+        reason = "request failed"
+
+    retry_after = response.headers.get("retry-after") if hasattr(
+        response, "headers"
+    ) else None
+
+    message = f"Groq API returned HTTP {status_code} ({reason})"
+
+    if retry_after:
+        message += f"; retry-after {compact_text(retry_after, 20)}s"
+
+    return message + f": {compact_text(response.text, 400)}"
+
+
 def ask_groq(messages, temperature=0.1):
+    LAST_GROQ_USAGE.clear()
+
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is missing.")
 
@@ -427,8 +487,10 @@ def ask_groq(messages, temperature=0.1):
         "messages": messages,
         "temperature": temperature,
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        # Groq documents reasoning_effort and include_reasoning for
+        # openai/gpt-oss-20b; reasoning_format is not supported there.
         "reasoning_effort": "low",
-        "reasoning_format": "hidden",
+        "include_reasoning": False,
         "response_format": {"type": "json_object"},
     }
 
@@ -443,20 +505,45 @@ def ask_groq(messages, temperature=0.1):
     )
 
     if response.status_code != 200:
-        error_body = compact_text(response.text, 700)
-
         raise RuntimeError(
-            f"Groq API returned HTTP {response.status_code}: "
-            f"{error_body}"
+            describe_groq_http_error(response.status_code, response)
         )
 
     try:
         result = response.json()
-        content = result["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        choice = result["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
+    except (ValueError, KeyError, IndexError, TypeError,
+            AttributeError) as exc:
         raise RuntimeError(
             "Groq returned an unexpected response structure."
         ) from exc
+
+    usage = result.get("usage")
+
+    LAST_GROQ_USAGE.update({
+        "prompt_tokens": usage_number(usage, "prompt_tokens"),
+        "completion_tokens": usage_number(usage, "completion_tokens"),
+        "total_tokens": usage_number(usage, "total_tokens"),
+        "finish_reason": (
+            finish_reason if isinstance(finish_reason, str) else None
+        ),
+        "estimated_input_tokens": estimated_input_tokens,
+        "completion_allowance": MAX_COMPLETION_TOKENS,
+    })
+
+    print("\nGROQ USAGE (reported by the API)")
+
+    for key, value in LAST_GROQ_USAGE.items():
+        print(f"{key}: {value}")
+
+    if finish_reason != "stop":
+        raise RuntimeError(
+            "Groq response is incomplete or was cut off: "
+            f"finish_reason={finish_reason!r}. The completion allowance "
+            f"is {MAX_COMPLETION_TOKENS} tokens."
+        )
 
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("Groq returned an empty response.")
@@ -504,8 +591,11 @@ def words(text):
 
 
 def normalize_heading(text):
+    # Ignore leading section numbers such as "8." so renumbering
+    # guidelines.md does not break mandatory-section matching.
+    text = re.sub(r"^\s*\d+(?:\.\d+)*\.?\s+", "", str(text))
     return " ".join(
-        re.findall(r"[a-z0-9]+", str(text).lower())
+        re.findall(r"[a-z0-9]+", text.lower())
     )
 
 
@@ -568,37 +658,39 @@ def load_guidelines():
     }
 
 
-# These headings match the current guidelines.md file.
-# If you rename a heading in guidelines.md, update it here too.
+# Core sections that are always sent to the model. They must match
+# headings in guidelines.md (v2.0), ignoring section numbers. Their
+# combined size must stay within MAX_POLICY_CHARS, which is itself
+# bound by the Groq request limits above. Section 4 holds the 1-5
+# scoring scales the model needs whenever it assigns risk scores;
+# section 13 governs the advice it writes. If you rename a heading in
+# guidelines.md, update it here too.
 MANDATORY_SECTION_ALIASES = {
-    "Purpose and Safety Principles": (
-        "Purpose and Safety Principles",
+    "Risk Assessment Dimensions": (
+        "Risk Assessment Dimensions",
     ),
-    "Source Authority and Validation": (
-        "Source Authority and Validation",
+    "Advice and Communication Requirements": (
+        "Advice and Communication Requirements",
     ),
-    "Risk Assessment and Alert Severity": (
-        "Risk Assessment and Alert Severity",
+    "Alert Decision Framework": (
+        "Alert Decision Framework",
     ),
-    "Alert Decision Requirements": (
-        "Alert Decision Requirements",
+    "Official Warning Override": (
+        "Official Warning Override",
     ),
-    "Alert Approval and Authorization Policy": (
-        "Alert Approval and Authorization Policy",
+    "Human Approval and Notification Governance": (
+        "Human Approval and Notification Governance",
     ),
-    "Failure Handling and Safe Operation": (
-        "Failure Handling and Safe Operation",
-    ),
-    "Audit Trail and Compliance Controls": (
-        "Audit Trail and Compliance Controls",
-    ),
-    "Final Safety Rule": (
-        "Final Safety Rule",
+    "Final Decision Rule": (
+        "Final Decision Rule",
     ),
 }
 
 
-def find_mandatory_sections(chunks):
+def find_mandatory_sections(chunks, aliases=None):
+    if aliases is None:
+        aliases = MANDATORY_SECTION_ALIASES
+
     selected = []
     missing = []
 
@@ -607,10 +699,10 @@ def find_mandatory_sections(chunks):
         for title in chunks
     }
 
-    for required_name, aliases in MANDATORY_SECTION_ALIASES.items():
+    for required_name, alias_names in aliases.items():
         match = None
 
-        for alias in aliases:
+        for alias in alias_names:
             normalized_alias = normalize_heading(alias)
 
             if normalized_alias in normalized_titles:
@@ -630,12 +722,528 @@ def section_character_count(title, body):
     return len(title) + len(body)
 
 
-def search_guidelines(policy, query, k=1):
-    """
-    Retrieve all mandatory sections and up to k relevant optional sections.
+# Hazard-specific retrieval (guidelines.md section 6).
+#
+# Section 6 is split into its "###" subsections. Every subsection whose
+# hazard is detected, or cannot be ruled out, is sent in full. If the
+# required text does not fit MAX_POLICY_CHARS the run fails safely.
+#
+# The values below are RETRIEVAL-SCREENING values only. guidelines.md
+# defines no numeric hazard thresholds and forbids inventing them, so
+# these are deliberately conservative triggers for attaching guidance.
+# They never classify risk, never lower a score and never exclude a
+# hazard whose data is missing. Review them with the policy owner.
+HAZARD_SCREENING = {
+    "heat_temperature_c": 30.0,
+    "heat_apparent_c": 32.0,
+    "cold_temperature_c": 12.0,
+    "wind_kmh": 20.0,
+    "gust_kmh": 40.0,
+    "visibility_m": 5000.0,
+    "cape_jkg": 500.0,
+}
 
-    Mandatory policy content is never removed or truncated.
-    Optional sections are excluded first if the character budget is exceeded.
+# Hazard code -> section 6 subsection title (section numbers ignored).
+HAZARD_POLICY_TITLES = {
+    "HEAT": "Extreme Heat",
+    "WIND_DUST": "Wind and Dust",
+    "RAIN_FLOOD": "Rain, Thunderstorms and Flooding",
+    "COLD": "Low Temperatures and Cold Conditions",
+    "LIGHTNING": "Lightning and Thunderstorms",
+}
+
+
+# WMO weather interpretation codes reported by Open-Meteo.
+WMO_RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82}
+WMO_THUNDERSTORM_CODES = {95, 96, 97, 99}
+WMO_KNOWN_CODES = {
+    0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+    71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 97, 99,
+}
+
+# Physical plausibility ranges. A value outside its range, or one that
+# is not a finite number, is unreliable: it is dropped and reported as
+# uncertainty. It is never used as evidence of safety.
+PLAUSIBLE_RANGES = {
+    "highs": (-50.0, 70.0),
+    "lows": (-50.0, 70.0),
+    "apparent": (-60.0, 80.0),
+    "wind": (0.0, 400.0),
+    "gust": (0.0, 500.0),
+    "precipitation": (0.0, 500.0),
+    "visibility": (0.0, 200000.0),
+    "cape": (0.0, 10000.0),
+}
+
+
+def collect_weather_values(weather):
+    """
+    Gather usable measurements from the current, hourly and daily
+    evidence. Missing values (None) are simply absent; present but
+    invalid values are counted under "unreliable".
+    """
+    weather = weather if isinstance(weather, dict) else {}
+
+    current = weather.get("current")
+    current = current if isinstance(current, dict) else {}
+
+    today = weather.get("today_forecast")
+    today = today if isinstance(today, dict) else {}
+
+    hourly = weather.get("hourly_forecast_next_24h")
+    hourly = [
+        record for record in hourly
+        if isinstance(record, dict)
+    ] if isinstance(hourly, list) else []
+
+    unreliable = {}
+
+    def gather(name, current_key, hourly_key, today_key=None):
+        raw = [current.get(current_key)]
+        raw += [record.get(hourly_key) for record in hourly]
+
+        if today_key:
+            raw.append(today.get(today_key))
+
+        low, high = PLAUSIBLE_RANGES[name]
+        usable = []
+
+        for value in raw:
+            if value is None:
+                continue
+
+            number = safe_number(value)
+
+            if number is None or not low <= number <= high:
+                unreliable[name] = unreliable.get(name, 0) + 1
+                continue
+
+            usable.append(number)
+
+        return usable
+
+    codes = []
+
+    raw_codes = [current.get("weather_code")]
+    raw_codes += [record.get("weather_code") for record in hourly]
+
+    for value in raw_codes:
+        if value is None:
+            continue
+
+        number = safe_number(value)
+
+        if (
+            number is None
+            or number != int(number)
+            or int(number) not in WMO_KNOWN_CODES
+        ):
+            unreliable["codes"] = unreliable.get("codes", 0) + 1
+            continue
+
+        codes.append(int(number))
+
+    return {
+        "highs": gather(
+            "highs", "temperature_2m", "temperature", "high"
+        ),
+        "lows": gather(
+            "lows", "temperature_2m", "temperature", "low"
+        ),
+        "apparent": gather(
+            "apparent", "apparent_temperature", "apparent_temperature"
+        ),
+        "wind": gather("wind", "wind_speed_10m", "wind", "wind"),
+        "gust": gather("gust", "wind_gusts_10m", "gust", "gust"),
+        "precipitation": gather(
+            "precipitation", "precipitation", "precipitation",
+            "precipitation",
+        ),
+        "visibility": gather(
+            "visibility", "visibility", "visibility"
+        ),
+        "cape": gather("cape", "cape", "cape"),
+        "codes": codes,
+        "unreliable": unreliable,
+    }
+
+
+def identify_hazards(weather):
+    """
+    Return {hazard_code: [reasons]} for every hazard that the weather
+    evidence indicates or cannot rule out. Reasons that start with
+    "UNCERTAIN" mean essential evidence is missing or unreliable; they
+    attach the guidance and are treated as an evidence gap, never as
+    proof of safety. Multiple hazards can be returned together.
+
+    Rain/flood and thunderstorm/lightning are detected separately:
+    rain from precipitation and rain weather codes, thunderstorms from
+    thunderstorm weather codes and from instability (CAPE) together
+    with rain evidence.
+    """
+    values = collect_weather_values(weather)
+    unreliable = values["unreliable"]
+    screen = HAZARD_SCREENING
+    hazards = {}
+
+    def add(code, reason):
+        hazards.setdefault(code, []).append(reason)
+
+    def reject(name, label, codes):
+        if unreliable.get(name):
+            for code in codes:
+                add(
+                    code,
+                    f"UNCERTAIN: unreliable {label} values rejected",
+                )
+
+    # Heat.
+    if not values["highs"] and not values["apparent"]:
+        add("HEAT", "UNCERTAIN: no temperature data")
+
+    if values["highs"] and (
+        max(values["highs"]) >= screen["heat_temperature_c"]
+    ):
+        add(
+            "HEAT",
+            f"temperature {max(values['highs'])} C reaches the "
+            "heat screening value",
+        )
+
+    if values["apparent"] and (
+        max(values["apparent"]) >= screen["heat_apparent_c"]
+    ):
+        add(
+            "HEAT",
+            f"apparent temperature {max(values['apparent'])} C "
+            "reaches the heat screening value",
+        )
+
+    reject("highs", "temperature", ("HEAT", "COLD"))
+    reject("lows", "temperature", ("HEAT", "COLD"))
+    reject("apparent", "apparent temperature", ("HEAT",))
+
+    # Cold.
+    if not values["lows"]:
+        add("COLD", "UNCERTAIN: no minimum temperature data")
+    elif min(values["lows"]) <= screen["cold_temperature_c"]:
+        add(
+            "COLD",
+            f"minimum temperature {min(values['lows'])} C is at or "
+            "below the cold screening value",
+        )
+
+    # Wind and dust.
+    if not values["wind"] and not values["gust"]:
+        add("WIND_DUST", "UNCERTAIN: no wind or gust data")
+
+    if values["wind"] and max(values["wind"]) >= screen["wind_kmh"]:
+        add(
+            "WIND_DUST",
+            f"wind {max(values['wind'])} km/h reaches the wind "
+            "screening value",
+        )
+
+    if values["gust"] and max(values["gust"]) >= screen["gust_kmh"]:
+        add(
+            "WIND_DUST",
+            f"gust {max(values['gust'])} km/h reaches the gust "
+            "screening value",
+        )
+
+    if not values["visibility"]:
+        add(
+            "WIND_DUST",
+            "UNCERTAIN: no visibility data, dust cannot be excluded",
+        )
+    elif min(values["visibility"]) < screen["visibility_m"]:
+        add(
+            "WIND_DUST",
+            f"visibility {min(values['visibility'])} m is below the "
+            "visibility screening value",
+        )
+
+    reject("wind", "wind speed", ("WIND_DUST",))
+    reject("gust", "wind gust", ("WIND_DUST",))
+    reject("visibility", "visibility", ("WIND_DUST",))
+
+    # Rain and flooding.
+    codes = values["codes"]
+    precipitation = values["precipitation"]
+    thunderstorm = any(
+        code in WMO_THUNDERSTORM_CODES for code in codes
+    )
+    rain_code = any(code in WMO_RAIN_CODES for code in codes)
+    rain_signal = (
+        bool(precipitation and max(precipitation) > 0)
+        or rain_code
+        or thunderstorm
+    )
+
+    if precipitation and max(precipitation) > 0:
+        add(
+            "RAIN_FLOOD",
+            f"precipitation signal {max(precipitation)} mm",
+        )
+
+    if rain_code:
+        add("RAIN_FLOOD", "rain weather code reported")
+
+    if thunderstorm:
+        add("RAIN_FLOOD", "thunderstorm weather code reported")
+
+    if not precipitation and not codes:
+        add(
+            "RAIN_FLOOD",
+            "UNCERTAIN: no precipitation or weather-code data",
+        )
+
+    reject("precipitation", "precipitation", ("RAIN_FLOOD",))
+
+    if unreliable.get("codes"):
+        add(
+            "RAIN_FLOOD",
+            "UNCERTAIN: unreliable weather codes rejected",
+        )
+
+    # Thunderstorms and lightning.
+    if thunderstorm:
+        add("LIGHTNING", "thunderstorm weather code reported")
+
+    if rain_signal and values["cape"] and (
+        max(values["cape"]) >= screen["cape_jkg"]
+    ):
+        add(
+            "LIGHTNING",
+            f"rain evidence with CAPE {max(values['cape'])} J/kg at "
+            "or above the instability screening value",
+        )
+
+    if not codes:
+        add(
+            "LIGHTNING",
+            "UNCERTAIN: no usable weather code, thunderstorms "
+            "cannot be excluded",
+        )
+
+    reject("cape", "CAPE", ("LIGHTNING",))
+
+    if unreliable.get("codes"):
+        add(
+            "LIGHTNING",
+            "UNCERTAIN: unreliable weather codes rejected",
+        )
+
+    return hazards
+
+
+def uncertain_hazards(hazards):
+    """Hazards with at least one UNCERTAIN (evidence gap) reason."""
+    return {
+        code: [r for r in reasons if r.startswith("UNCERTAIN")]
+        for code, reasons in hazards.items()
+        if any(r.startswith("UNCERTAIN") for r in reasons)
+    }
+
+
+def apply_evidence_uncertainty(decision, hazards):
+    """
+    Guidelines sections 3 and 8: essential evidence that is missing or
+    unreliable means the assessment is incomplete and cannot end in a
+    low-risk or monitor-only result.
+    """
+    gaps = uncertain_hazards(hazards)
+
+    if not gaps:
+        return decision
+
+    summary = "; ".join(
+        f"{code}: {reasons[0]}" for code, reasons in gaps.items()
+    )
+
+    decision["limitations"].append(
+        "Essential weather evidence is missing or unreliable ("
+        + summary
+        + "). Missing evidence is not evidence of safety."
+    )
+    decision["missing_evidence"].append(
+        "Weather evidence gaps: " + summary
+    )
+
+    recommendation = decision.get("alert_recommendation")
+
+    if recommendation in ("NO_ALERT_RECOMMENDED", "MONITOR"):
+        decision["alert_recommendation"] = "UNABLE_TO_ASSESS"
+    elif recommendation == "ADVISORY_RECOMMENDED":
+        decision["alert_recommendation"] = "ESCALATE_FOR_REVIEW"
+
+    enforce_assessment_status(decision)
+
+    return decision
+
+
+# Guidelines section 7: the UAE midday break generally applies from
+# 15 June to 15 September.
+MIDDAY_BREAK_START = (6, 15)
+MIDDAY_BREAK_END = (9, 15)
+
+
+def select_conditional_sections(policy, hazards, weather):
+    """
+    Sections retrieved only when they apply:
+    - Regulatory and Workplace Compliance (section 7) when heat is
+      relevant, when the date is inside the midday-break season, or
+      when the date cannot be established.
+    - Data Quality and Assessment Completeness (section 11) whenever
+      essential evidence is missing or unreliable.
+    """
+    wanted = []
+
+    current = (
+        weather.get("current")
+        if isinstance(weather, dict) else None
+    )
+    current_time = local_datetime(
+        current.get("time") if isinstance(current, dict) else None
+    )
+
+    in_season = (
+        current_time is None
+        or MIDDAY_BREAK_START
+        <= (current_time.month, current_time.day)
+        <= MIDDAY_BREAK_END
+    )
+
+    if "HEAT" in hazards or in_season:
+        wanted.append("Regulatory and Workplace Compliance")
+
+    if uncertain_hazards(hazards):
+        wanted.append("Data Quality and Assessment Completeness")
+
+    aliases = {name: (name,) for name in wanted}
+    selected, missing = find_mandatory_sections(
+        policy["sections"], aliases
+    )
+
+    if missing:
+        raise ValueError(
+            "Conditional policy section is missing from "
+            "guidelines.md: " + "; ".join(missing)
+        )
+
+    return [
+        {"section": title, "text": policy["sections"][title]}
+        for title in selected
+    ]
+
+
+def parse_hazard_sections(policy):
+    chunks = policy["sections"]
+
+    parent = next(
+        (
+            title for title in chunks
+            if normalize_heading(title) == "weather hazard assessment"
+        ),
+        None,
+    )
+
+    if parent is None:
+        raise ValueError(
+            "Weather hazard guidance is missing from guidelines.md: "
+            "Weather Hazard Assessment"
+        )
+
+    pieces = re.split(r"\n(?=### )", chunks[parent])
+    intro = pieces[0].strip()
+    blocks = {}
+
+    for piece in pieces[1:]:
+        title, _, body = piece.strip()[4:].partition("\n")
+        title = title.strip()
+
+        if not title or title in blocks:
+            raise ValueError(
+                f"Invalid or duplicate hazard heading: {title!r}"
+            )
+
+        blocks[title] = body.strip()
+
+    return parent, intro, blocks
+
+
+def select_hazard_guidance(policy, hazards):
+    """
+    Return the complete section 6 text required for the hazards:
+    the section introduction, each detected hazard subsection in
+    policy order, and every subsection this code does not recognise
+    (unknown hazards cannot be screened, so they are always sent).
+    """
+    unknown_codes = [
+        code for code in hazards
+        if code not in HAZARD_POLICY_TITLES
+    ]
+
+    if unknown_codes:
+        raise ValueError(
+            "Unrecognized hazard code: " + ", ".join(unknown_codes)
+        )
+
+    parent, intro, blocks = parse_hazard_sections(policy)
+
+    by_name = {
+        normalize_heading(title): title
+        for title in blocks
+    }
+
+    selected = []
+    missing = []
+
+    for code, policy_title in HAZARD_POLICY_TITLES.items():
+        if code not in hazards:
+            continue
+
+        title = by_name.get(normalize_heading(policy_title))
+
+        if title is None:
+            missing.append(policy_title)
+        else:
+            selected.append(title)
+
+    if missing:
+        raise ValueError(
+            "Hazard guidance is missing from guidelines.md: "
+            + "; ".join(missing)
+        )
+
+    known = {
+        normalize_heading(title)
+        for title in HAZARD_POLICY_TITLES.values()
+    }
+
+    selected += [
+        title for title in blocks
+        if normalize_heading(title) not in known
+    ]
+
+    selected = list(dict.fromkeys(selected))
+
+    return [{"section": parent, "text": intro}] + [
+        {"section": title, "text": blocks[title]}
+        for title in selected
+    ]
+
+
+def search_guidelines(policy, query, k=1, required_sections=None):
+    """
+    Retrieve all mandatory sections, every required section
+    (required_sections: list of {"section", "text"}, e.g. hazard
+    guidance) and up to k other relevant sections.
+
+    Mandatory and required content is never removed or truncated; if
+    it cannot fit the budget a ValueError is raised so the caller
+    fails safely. Only other optional sections are excluded when the
+    character budget is exceeded.
     """
     if not isinstance(policy, dict) or not policy.get("sections"):
         raise ValueError("Loaded policy is invalid or empty.")
@@ -650,11 +1258,26 @@ def search_guidelines(policy, query, k=1):
             + "; ".join(missing)
         )
 
+    required = list(required_sections or [])
+    texts = dict(chunks)
+
+    for item in required:
+        texts[item["section"]] = item["text"]
+
+    # Sections that must be sent in full or the run must fail.
+    mandatory = list(dict.fromkeys(
+        mandatory + [item["section"] for item in required]
+    ))
+
     query_words = set(words(query))
 
+    # Section 6 is retrieved only through hazard subsections, so the
+    # whole section is not an optional candidate (no duplicates).
     documents = {
         title: words(title + " " + body)
         for title, body in chunks.items()
+        if title not in mandatory
+        and normalize_heading(title) != "weather hazard assessment"
     }
 
     document_count = len(documents)
@@ -716,12 +1339,12 @@ def search_guidelines(policy, query, k=1):
     selected = list(dict.fromkeys(selected))
 
     mandatory_chars = sum(
-        section_character_count(title, chunks[title])
+        section_character_count(title, texts[title])
         for title in mandatory
     )
 
     additional_chars = sum(
-        section_character_count(title, chunks[title])
+        section_character_count(title, texts[title])
         for title in additional_sections
     )
 
@@ -739,10 +1362,11 @@ def search_guidelines(policy, query, k=1):
     # Never silently remove mandatory policy content.
     if mandatory_chars > MAX_POLICY_CHARS:
         raise ValueError(
-            "Mandatory policy sections alone exceed the "
+            "Mandatory and hazard-relevant policy sections exceed the "
             f"{MAX_POLICY_CHARS}-character budget. "
-            f"Mandatory characters: {mandatory_chars}. "
-            "No mandatory safety content was removed."
+            f"Required characters: {mandatory_chars}. "
+            f"Required sections: {mandatory}. "
+            "No required policy content was removed."
         )
 
     # Exclude optional sections from the end until the budget is met.
@@ -753,7 +1377,7 @@ def search_guidelines(policy, query, k=1):
         print("Optional section excluded to meet budget:", removed)
 
         additional_chars = sum(
-            section_character_count(title, chunks[title])
+            section_character_count(title, texts[title])
             for title in additional_sections
         )
 
@@ -768,10 +1392,23 @@ def search_guidelines(policy, query, k=1):
     results = [
         {
             "section": title,
-            "text": chunks[title],
+            "text": texts[title],
         }
         for title in selected
     ]
+
+    # Final guarantee: every required section is present, complete
+    # and appears exactly once.
+    returned = [item["section"] for item in results]
+
+    for item in mandatory:
+        if returned.count(item) != 1 or texts[item] != next(
+            entry["text"] for entry in results
+            if entry["section"] == item
+        ):
+            raise ValueError(
+                f"Required policy section not retrieved intact: {item}"
+            )
 
     print("Final retrieved sections:", selected)
     print("Final retrieved policy characters:", total_chars)
@@ -825,17 +1462,17 @@ def summarize_history(history):
 
         compact.append({
             "timestamp": compact_text(
-                item.get("timestamp"), 40
+                item.get("timestamp"), 32
             ),
             "city": compact_text(
                 item.get("city"), 40
             ),
             "advice": compact_text(
-                item.get("advice"), 180
+                item.get("advice"), 120
             ),
             "alert_sent": item.get("alert_sent"),
             "alert_message": compact_text(
-                item.get("alert_message"), 120
+                item.get("alert_message"), 80
             ),
         })
 
@@ -854,10 +1491,12 @@ def calculate_risk_score(
     geographic_impact,
 ):
     """
-    Provisional internal calculation only.
+    Provisional internal calculation defined in guidelines.md
+    section 5 (Risk Calculation Model). Weights and band limits must
+    match that section; a test enforces this. It must not be
+    represented as an official UAE or NCM risk model.
 
-    This formula is not defined by the current guidelines.md file
-    and must not be represented as an official UAE or NCM risk model.
+    Bands use the unrounded score; only the returned value is rounded.
     """
 
     dimensions = [
@@ -881,8 +1520,6 @@ def calculate_risk_score(
         + 0.30 * geographic_impact * severity
     )
 
-    score = round(score, 2)
-
     if score <= 5:
         band = "LOW"
     elif score <= 10:
@@ -892,7 +1529,7 @@ def calculate_risk_score(
     else:
         band = "CRITICAL"
 
-    return score, band
+    return round(score, 2), band
 
 
 # ============================================================
@@ -973,12 +1610,20 @@ def validate_decision(decision, retrieved_sections):
         "geographic_impact_score",
     )
 
+    # Guideline section 5 rule 4: an essential dimension that cannot
+    # be assessed is UNASSESSED (null), never a guessed score.
+    # Any other non-integer or out-of-range value is malformed output.
+    unassessed = []
+
     for field in dimension_fields:
         value = decision[field]
 
-        if type(value) is not int or not 1 <= value <= 5:
+        if value is None or value == "UNASSESSED":
+            decision[field] = None
+            unassessed.append(field)
+        elif type(value) is not int or not 1 <= value <= 5:
             raise ValueError(
-                f"Invalid or unassessed risk dimension: {field}"
+                f"Invalid risk dimension value: {field}"
             )
 
     reason_fields = (
@@ -1043,8 +1688,38 @@ def validate_decision(decision, retrieved_sections):
     decision["risk_score"] = score
     decision["risk_band"] = band
 
+    if unassessed:
+        # No misleading risk classification and no low-risk or
+        # advisory conclusion from incomplete scoring evidence.
+        if recommendation not in (
+            "ESCALATE_FOR_REVIEW",
+            "UNABLE_TO_ASSESS",
+        ):
+            decision["alert_recommendation"] = "UNABLE_TO_ASSESS"
+
+        decision["limitations"].append(
+            "Risk score not calculated because these dimensions "
+            "could not be assessed: " + ", ".join(unassessed) + "."
+        )
+        decision["missing_evidence"].append(
+            "Evidence required to score: " + ", ".join(unassessed) + "."
+        )
+
     # The model's preliminary analysis is not a completed safety clearance.
     decision["assessment_status"] = "PRELIMINARY"
+
+    return decision
+
+
+def enforce_assessment_status(decision):
+    """
+    Official warning verification is a required evidence dependency.
+    An assessment can only be COMPLETE when it has been VERIFIED;
+    any other warning status, including a missing one, forces
+    INCOMPLETE. No official warning feed is integrated today.
+    """
+    if decision.get("official_warning_status") != "VERIFIED":
+        decision["assessment_status"] = "INCOMPLETE"
 
     return decision
 
@@ -1078,14 +1753,13 @@ def apply_official_warning_guard(decision):
         )
 
     decision["limitations"].append(
-        "The five-dimension risk score is a provisional internal "
-        "calculation. It is not a risk formula defined in guidelines.md "
-        "or an official UAE/NCM classification."
+        "The five-dimension risk score is the provisional internal "
+        "model in guidelines.md section 5. It is not an official "
+        "UAE/NCM classification."
     )
 
-    # Official warning verification is a required evidence dependency.
-    # Until integrated, the final status cannot be COMPLETE.
-    decision["assessment_status"] = "INCOMPLETE"
+    decision["official_warning_status"] = "NOT_CHECKED"
+    enforce_assessment_status(decision)
 
     decision["missing_evidence"].append(
         "Current official NCM and relevant UAE emergency authority "
@@ -1102,55 +1776,72 @@ def apply_official_warning_guard(decision):
 SYSTEM_PROMPT = """
 You are an evidence-based weather safety assessment agent.
 
-Follow the supplied weather safety guidelines. Do not invent weather
-measurements, official warnings, regulatory requirements, thresholds,
-or geographic information.
-
-Assess only the supplied city and evidence.
+Follow the supplied policy sections. Never invent weather
+measurements, official warnings, regulatory requirements, thresholds
+or geographic information. Assess only the supplied city and evidence.
 
 Requirements:
-1. Identify relevant hazards using actual measurements and forecasts.
-2. Evaluate the five requested risk dimensions provisionally.
-3. Give a separate evidence-based rationale for each dimension.
-4. Never treat missing evidence as a low score.
-5. Official warning status is NOT_CHECKED. Do not claim otherwise.
-6. Open-Meteo is a weather data source, not an official UAE warning authority.
-7. Distinguish current observations, forecasts and historical context.
-8. Do not assume all residents or workers have equal exposure.
-9. Do not let previous alerts suppress a new or different hazard.
-10. Do not recommend an alert solely because a value is unusual.
-11. Use only recommendation values defined in the supplied policy.
-12. Explain missing evidence and limitations.
-13. Cite exact section titles from the supplied policy.
-14. Do not claim that the assessment is a completed safety clearance.
-15. Return a single JSON object only.
+1. Identify hazards from actual measurements and forecasts.
+2. Score the five risk dimensions provisionally, using the scale
+   definitions in the supplied policy, with a separate evidence-based
+   rationale for each.
+3. Never treat missing evidence as a low score.
+4. Official warning status is NOT_CHECKED; do not claim otherwise.
+   Open-Meteo is a weather data source, not an official UAE warning
+   authority.
+5. Distinguish current observations, forecasts and historical context.
+6. Do not assume all residents or workers have equal exposure.
+7. Previous alerts must not suppress a new or different hazard. Do not
+   recommend an alert solely because a value is unusual.
+8. Use only recommendation values defined in the supplied policy.
+9. Explain missing evidence and limitations. The assessment is never a
+   completed safety clearance.
+10. In sources, cite exact policy section titles.
+11. Return a single JSON object only.
 
-Return these exact keys:
-hazard_type,
-likelihood_score,
-likelihood_reason,
-severity_score,
-severity_reason,
-exposure_score,
-exposure_reason,
-duration_score,
-duration_reason,
-geographic_impact_score,
-geographic_impact_reason,
-alert_recommendation,
-advice,
-reasoning,
-recommended_actions,
-limitations,
-missing_evidence,
-sources.
+Return exactly these keys:
+hazard_type, likelihood_score, likelihood_reason, severity_score,
+severity_reason, exposure_score, exposure_reason, duration_score,
+duration_reason, geographic_impact_score, geographic_impact_reason,
+alert_recommendation, advice, reasoning, recommended_actions,
+limitations, missing_evidence, sources.
 
-All five scores must be integers from 1 to 5 when evidence supports
-a provisional assessment. If evidence is insufficient, explain this
-in the relevant rationale and limitations.
-
-All list fields must be JSON arrays of strings.
+Each score must be an integer from 1 to 5 when evidence supports it.
+If evidence for a dimension is insufficient, return null for that
+score, never a guessed value, and explain why in its rationale and in
+limitations. All list fields must be JSON arrays of strings.
 """
+
+
+POLICY_BLOCK_START = "=== POLICY SECTION: "
+POLICY_BLOCK_END = "=== END POLICY SECTION ==="
+
+
+def format_policy_text(sections):
+    """
+    Render policy sections as plain text. Section text is sent
+    verbatim (no JSON escaping); a section that contains the block
+    delimiters is rejected so it cannot break out of its block.
+    """
+    blocks = []
+
+    for item in sections:
+        if (
+            POLICY_BLOCK_START in item["text"]
+            or POLICY_BLOCK_END in item["text"]
+            or "\n" in item["section"]
+        ):
+            raise ValueError(
+                "Policy section cannot be rendered safely: "
+                + item["section"]
+            )
+
+        blocks.append(
+            f"{POLICY_BLOCK_START}{item['section']} ===\n"
+            f"{item['text']}\n{POLICY_BLOCK_END}"
+        )
+
+    return "\n\n".join(blocks)
 
 
 def assess_weather(weather, history, policy, retrieved_sections):
@@ -1161,24 +1852,25 @@ def assess_weather(weather, history, policy, retrieved_sections):
         "city": CITY,
         "weather": compact_weather,
         "recent_agent_history": compact_history,
-        "policy_name": "Dubai Weather Safety Guidelines",
         "policy_version": policy["version"],
-        "policy_hash": policy["hash"],
-        "retrieved_guideline_sections": retrieved_sections,
         "official_warning_status": (
             "NOT_CHECKED. No NCM or other official warning feed "
             "is integrated."
         ),
         "risk_score_notice": (
-            "Any calculated risk score is provisional and is not "
-            "defined by the current guidelines.md policy."
+            "Any calculated risk score is the provisional internal "
+            "model in guidelines.md section 5, not an official "
+            "UAE/NCM classification."
         ),
     }
 
     user_prompt = (
-        "Assess the supplied weather situation using the policy. "
-        "Do not infer official warning status. "
-        "Do not claim the assessment is complete.\n\n"
+        "Assess the supplied weather situation using the policy "
+        "sections below. Do not infer official warning status. "
+        "Do not claim the assessment is complete. Cite section "
+        "titles exactly as written in the section headers.\n\n"
+        + format_policy_text(retrieved_sections)
+        + "\n\nEVIDENCE AND STATUS (JSON):\n"
         + json_text(context)
     )
 
@@ -1291,10 +1983,26 @@ def run_weather_agent():
             "thunderstorms lightning cold weather safety"
         )
 
+        # Identify hazards from the retrieved weather evidence and
+        # attach the complete matching section 6 guidance. Anything
+        # that cannot fit the budget raises and fails safely.
+        hazards = identify_hazards(weather)
+        used.append("identify_hazards")
+        print("Hazards identified:", sorted(hazards))
+
+        hazard_sections = select_hazard_guidance(policy, hazards)
+        conditional_sections = select_conditional_sections(
+            policy, hazards, weather
+        )
+
+        # Optional ranked sections are disabled (k=0): everything the
+        # model receives is mandatory or required, so no optional text
+        # can push the request over its budget.
         retrieved_sections = search_guidelines(
             policy,
             query,
-            k=1,
+            k=0,
+            required_sections=hazard_sections + conditional_sections,
         )
         used.append("search_guidelines")
 
@@ -1333,6 +2041,10 @@ def run_weather_agent():
         decision["tools_used"] = used
 
         decision["weather_summary"] = summarize_weather(weather)
+        decision["hazard_screening"] = hazards
+        decision["groq_usage"] = dict(LAST_GROQ_USAGE)
+
+        apply_evidence_uncertainty(decision, hazards)
 
         decision["history_checked"] = (
             history_status == "AVAILABLE"
@@ -1356,6 +2068,8 @@ def run_weather_agent():
         decision["send_alert"] = False
         decision["alert_message"] = ""
         decision["notification_status"] = "NOT_SENT"
+
+        enforce_assessment_status(decision)
 
         return decision, used
 
@@ -1387,6 +2101,8 @@ def run_weather_agent():
 
         decision["evidence_quality"] = "E0"
         decision["evidence_confidence"] = "NONE"
+
+        enforce_assessment_status(decision)
 
         decision["approval_status"] = "NOT_AUTHORIZED"
         decision["send_alert"] = False
@@ -1640,6 +2356,1628 @@ def run_tests():
         guarded["alert_recommendation"] == "ESCALATE_FOR_REVIEW",
     )
 
+    # A decision claiming COMPLETE or a verified warning cannot
+    # survive while no official warning feed is integrated.
+    guarded = apply_official_warning_guard({
+        "alert_recommendation": "MONITOR",
+        "assessment_status": "COMPLETE",
+        "official_warning_status": "VERIFIED",
+        "limitations": [],
+        "missing_evidence": [],
+    })
+
+    check(
+        "COMPLETE status is blocked without warning verification",
+        guarded["assessment_status"] == "INCOMPLETE"
+        and guarded["official_warning_status"] == "NOT_CHECKED",
+    )
+
+    check(
+        "Status helper only allows COMPLETE when warnings verified",
+        enforce_assessment_status({
+            "assessment_status": "COMPLETE",
+            "official_warning_status": "NOT_CHECKED",
+        })["assessment_status"] == "INCOMPLETE"
+        and enforce_assessment_status({
+            "assessment_status": "COMPLETE",
+        })["assessment_status"] == "INCOMPLETE"
+        and enforce_assessment_status({
+            "assessment_status": "COMPLETE",
+            "official_warning_status": "VERIFIED",
+        })["assessment_status"] == "COMPLETE",
+    )
+
+    # Band boundaries from guidelines.md section 5.
+    check(
+        "Risk band boundaries match policy (5, 10, 15)",
+        [
+            calculate_risk_score(1, 5, 1, 1, 1)[1],   # 5.00
+            calculate_risk_score(2, 5, 1, 1, 1)[1],   # 6.75
+            calculate_risk_score(2, 5, 2, 2, 2)[1],   # 10.00
+            calculate_risk_score(3, 5, 3, 3, 3)[1],   # 15.00
+            calculate_risk_score(4, 5, 4, 4, 4)[1],   # 20.00
+        ] == ["LOW", "MODERATE", "MODERATE", "HIGH", "CRITICAL"],
+    )
+
+    # Heading matching ignores section numbers.
+    check(
+        "Mandatory matching tolerates renumbered headings",
+        find_mandatory_sections({
+            f"{index}. {name}": ""
+            for index, name in enumerate(
+                MANDATORY_SECTION_ALIASES, start=40
+            )
+        })[1] == [],
+    )
+
+    # Helper: temporarily override module globals during a check.
+    def with_globals(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    # Unassessable dimensions (guidelines section 5, rule 4).
+    def decision_with(**changes):
+        base = {
+            "hazard_type": "HEAT",
+            "likelihood_score": 3,
+            "likelihood_reason": "r",
+            "severity_score": 3,
+            "severity_reason": "r",
+            "exposure_score": 3,
+            "exposure_reason": "r",
+            "duration_score": 3,
+            "duration_reason": "r",
+            "geographic_impact_score": 3,
+            "geographic_impact_reason": "r",
+            "alert_recommendation": "NO_ALERT_RECOMMENDED",
+            "advice": "a",
+            "reasoning": "r",
+            "recommended_actions": [],
+            "limitations": [],
+            "missing_evidence": [],
+            "sources": ["Final Decision Rule"],
+        }
+        base.update(changes)
+        return base
+
+    sections = [{"section": "Final Decision Rule", "text": "x"}]
+
+    validated = validate_decision(
+        decision_with(exposure_score=None), sections
+    )
+
+    check(
+        "Unassessed dimension gives no score or risk band",
+        validated["risk_score"] is None
+        and validated["risk_band"] == "UNASSESSED"
+        and validated["exposure_score"] is None,
+    )
+
+    check(
+        "Unassessed dimension blocks low-risk or advisory outcome",
+        validated["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and any(
+            "exposure_score" in item
+            for item in validated["limitations"]
+            + validated["missing_evidence"]
+        ),
+    )
+
+    check(
+        "Unassessed dimension keeps ESCALATE_FOR_REVIEW",
+        validate_decision(
+            decision_with(
+                duration_score="UNASSESSED",
+                alert_recommendation="ESCALATE_FOR_REVIEW",
+            ),
+            sections,
+        )["alert_recommendation"] == "ESCALATE_FOR_REVIEW",
+    )
+
+    for bad_value in (0, 6, 2.5, "3", True):
+        try:
+            validate_decision(
+                decision_with(severity_score=bad_value), sections
+            )
+            rejected = False
+        except ValueError:
+            rejected = True
+
+        check(
+            f"Malformed dimension value {bad_value!r} rejected",
+            rejected,
+        )
+
+    # ------------------------------------------------------------
+    # Hazard retrieval, conditional policy, budgets, Groq handling.
+    # Everything below is offline: no network, no real API key.
+    # ------------------------------------------------------------
+    check(
+        "Request budgets are the documented explicit values",
+        MAX_POLICY_CHARS == 13500
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_COMPLETION_TOKENS == 700,
+    )
+
+    def make_weather(current=None, today=None, hourly=None):
+        base_current = {
+            "time": "2026-11-07T12:00",
+            "temperature_2m": 22,
+            "apparent_temperature": 22,
+            "precipitation": 0,
+            "wind_speed_10m": 5,
+            "wind_gusts_10m": 10,
+            "visibility": 20000,
+            "weather_code": 0,
+            "cape": 0,
+        }
+        base_today = {
+            "high": 24, "low": 18, "wind": 8,
+            "gust": 15, "precipitation": 0,
+        }
+        base_hour = {
+            "time": "2026-11-07T13:00",
+            "temperature": 22, "apparent_temperature": 22,
+            "precipitation": 0, "wind": 5, "gust": 10,
+            "visibility": 20000, "weather_code": 0, "cape": 0,
+        }
+        return {
+            "city": CITY,
+            "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-07T12:00:00+04:00",
+            "current": {**base_current, **(current or {})},
+            "today_forecast": {**base_today, **(today or {})},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [
+                {**base_hour, **(hourly or {})}
+            ],
+            "history_summary": {},
+        }
+
+    def hazards_of(**kwargs):
+        return identify_hazards(make_weather(**kwargs))
+
+    check(
+        "Benign weather identifies no hazard",
+        hazards_of() == {},
+    )
+
+    check(
+        "High CAPE without rain evidence identifies no hazard",
+        hazards_of(current={"cape": 3000}, hourly={"cape": 3000})
+        == {},
+    )
+
+    individual_cases = {
+        "HEAT": (
+            dict(
+                current={"temperature_2m": 41},
+                today={"high": 42},
+                hourly={"temperature": 41},
+            ),
+            {"HEAT"},
+        ),
+        "HEAT via apparent temperature": (
+            dict(current={"apparent_temperature": 38}),
+            {"HEAT"},
+        ),
+        "COLD": (
+            dict(
+                current={"temperature_2m": 8},
+                today={"low": 7},
+                hourly={"temperature": 8},
+            ),
+            {"COLD"},
+        ),
+        "WIND_DUST via wind": (
+            dict(current={"wind_speed_10m": 35}),
+            {"WIND_DUST"},
+        ),
+        "WIND_DUST via gust": (
+            dict(today={"gust": 60}),
+            {"WIND_DUST"},
+        ),
+        "WIND_DUST via visibility": (
+            dict(current={"visibility": 1500}),
+            {"WIND_DUST"},
+        ),
+        "RAIN_FLOOD via precipitation (no lightning)": (
+            dict(
+                hourly={"precipitation": 2.5, "weather_code": 61}
+            ),
+            {"RAIN_FLOOD"},
+        ),
+        "RAIN_FLOOD via drizzle code and precipitation": (
+            dict(
+                current={"precipitation": 0.1, "weather_code": 51}
+            ),
+            {"RAIN_FLOOD"},
+        ),
+        "RAIN_FLOOD via rain code alone": (
+            dict(hourly={"weather_code": 63}),
+            {"RAIN_FLOOD"},
+        ),
+        "LIGHTNING via thunderstorm code (also rain)": (
+            dict(hourly={"weather_code": 95}),
+            {"RAIN_FLOOD", "LIGHTNING"},
+        ),
+        "LIGHTNING via CAPE with rain evidence": (
+            dict(
+                current={"precipitation": 1.0, "weather_code": 61},
+                hourly={"cape": 1500},
+            ),
+            {"RAIN_FLOOD", "LIGHTNING"},
+        ),
+    }
+
+    for label, (kwargs, expected) in individual_cases.items():
+        check(
+            f"Hazard identified individually: {label}",
+            set(hazards_of(**kwargs)) == expected,
+        )
+
+    check(
+        "Simultaneous heat and strong wind identify both hazards",
+        set(
+            hazards_of(
+                current={"temperature_2m": 41, "wind_gusts_10m": 70},
+                today={"high": 42},
+            )
+        ) == {"HEAT", "WIND_DUST"},
+    )
+
+    check(
+        "Every hazard can be identified at the same time",
+        set(
+            hazards_of(
+                current={
+                    "temperature_2m": 8,
+                    "apparent_temperature": 40,
+                    "wind_gusts_10m": 70,
+                    "precipitation": 3,
+                },
+                today={"high": 42},
+                hourly={"weather_code": 95},
+            )
+        ) == set(HAZARD_POLICY_TITLES),
+    )
+
+    # Missing or unreliable evidence is uncertainty, never safety.
+    def only_uncertain(hazards):
+        return all(
+            reasons and all(r.startswith("UNCERTAIN") for r in reasons)
+            for reasons in hazards.values()
+        )
+
+    missing_visibility = hazards_of(
+        current={"visibility": None}, hourly={"visibility": None}
+    )
+
+    check(
+        "Missing visibility makes only wind and dust uncertain",
+        set(missing_visibility) == {"WIND_DUST"}
+        and only_uncertain(missing_visibility),
+    )
+
+    no_rain_data = hazards_of(
+        current={"precipitation": None, "weather_code": None},
+        today={"precipitation": None},
+        hourly={"precipitation": None, "weather_code": None},
+    )
+
+    check(
+        "Missing precipitation and weather code make rain and "
+        "lightning uncertain",
+        set(no_rain_data) == {"RAIN_FLOOD", "LIGHTNING"}
+        and only_uncertain(no_rain_data),
+    )
+
+    no_code = hazards_of(
+        current={"weather_code": None}, hourly={"weather_code": None}
+    )
+
+    check(
+        "Missing weather code makes only lightning uncertain",
+        set(no_code) == {"LIGHTNING"} and only_uncertain(no_code),
+    )
+
+    bad_code = hazards_of(
+        current={"weather_code": 12345}, hourly={"weather_code": "x"}
+    )
+
+    check(
+        "Unrecognized weather codes are rejected as uncertainty",
+        set(bad_code) == {"RAIN_FLOOD", "LIGHTNING"}
+        and only_uncertain(bad_code),
+    )
+
+    check(
+        "Implausible temperature is rejected as uncertainty",
+        {"HEAT", "COLD"} <= set(
+            hazards_of(
+                current={"temperature_2m": 999},
+                today={"high": 999, "low": -999},
+                hourly={"temperature": "hot"},
+            )
+        ),
+    )
+
+    check(
+        "Negative precipitation is rejected as uncertainty",
+        "RAIN_FLOOD" in hazards_of(
+            current={"precipitation": -5},
+            hourly={"precipitation": -5},
+            today={"precipitation": -5},
+        ),
+    )
+
+    check(
+        "Missing or unreadable weather makes every hazard uncertain",
+        set(identify_hazards({})) == set(HAZARD_POLICY_TITLES)
+        and set(identify_hazards(None)) == set(HAZARD_POLICY_TITLES)
+        and set(identify_hazards({"current": "bad"}))
+        == set(HAZARD_POLICY_TITLES)
+        and only_uncertain(identify_hazards({})),
+    )
+
+    check(
+        "uncertain_hazards separates gaps from detections",
+        set(uncertain_hazards(missing_visibility)) == {"WIND_DUST"}
+        and uncertain_hazards(
+            hazards_of(current={"temperature_2m": 41},
+                       today={"high": 41})
+        ) == {},
+    )
+
+    # Evidence gaps cannot end in a low-risk or monitor-only result.
+    def gap_decision(recommendation):
+        return apply_evidence_uncertainty(
+            {
+                "alert_recommendation": recommendation,
+                "assessment_status": "COMPLETE",
+                "limitations": [],
+                "missing_evidence": [],
+            },
+            missing_visibility,
+        )
+
+    check(
+        "Evidence gap maps NO_ALERT and MONITOR to UNABLE_TO_ASSESS",
+        gap_decision("NO_ALERT_RECOMMENDED")["alert_recommendation"]
+        == "UNABLE_TO_ASSESS"
+        and gap_decision("MONITOR")["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Evidence gap maps ADVISORY to ESCALATE_FOR_REVIEW",
+        gap_decision("ADVISORY_RECOMMENDED")["alert_recommendation"]
+        == "ESCALATE_FOR_REVIEW"
+        and gap_decision("ESCALATE_FOR_REVIEW")["alert_recommendation"]
+        == "ESCALATE_FOR_REVIEW"
+        and gap_decision("UNABLE_TO_ASSESS")["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    gapped = gap_decision("MONITOR")
+
+    check(
+        "Evidence gap is recorded and keeps the assessment INCOMPLETE",
+        gapped["assessment_status"] == "INCOMPLETE"
+        and any("WIND_DUST" in item for item in gapped["limitations"])
+        and any(
+            "WIND_DUST" in item for item in gapped["missing_evidence"]
+        ),
+    )
+
+    clean = apply_evidence_uncertainty(
+        {
+            "alert_recommendation": "MONITOR",
+            "limitations": [],
+            "missing_evidence": [],
+        },
+        {},
+    )
+
+    check(
+        "No evidence gap leaves the recommendation unchanged",
+        clean["alert_recommendation"] == "MONITOR"
+        and clean["limitations"] == [],
+    )
+
+    # Complete retrieval: compare with the raw guidelines.md text,
+    # found independently of the production parser.
+    raw_policy = GUIDELINES_PATH.read_text(encoding="utf-8")
+
+    def raw_block(heading):
+        match = re.search(
+            r"^### " + re.escape(heading) + r"\n(.*?)(?=^#{2,3} |\Z)",
+            raw_policy,
+            re.S | re.M,
+        )
+        return match.group(1).strip() if match else None
+
+    def raw_section(heading):
+        match = re.search(
+            r"^## " + re.escape(heading) + r"\n(.*?)(?=^## |\Z)",
+            raw_policy,
+            re.S | re.M,
+        )
+        return match.group(1).strip() if match else None
+
+    raw_headings = {
+        "HEAT": "6.1 Extreme Heat",
+        "WIND_DUST": "6.2 Wind and Dust",
+        "RAIN_FLOOD": "6.3 Rain, Thunderstorms and Flooding",
+        "COLD": "6.4 Low Temperatures and Cold Conditions",
+        "LIGHTNING": "6.5 Lightning and Thunderstorms",
+    }
+
+    hazard_policy = load_guidelines()
+
+    for code, heading in raw_headings.items():
+        retrieved = select_hazard_guidance(hazard_policy, {code: ["t"]})
+        texts_by_title = {
+            item["section"]: item["text"] for item in retrieved
+        }
+
+        check(
+            f"Complete policy text retrieved for {code}",
+            raw_block(heading) is not None
+            and texts_by_title.get(heading) == raw_block(heading)
+            and len(retrieved) == 2,
+        )
+
+    heat_wind = select_hazard_guidance(
+        hazard_policy, {"WIND_DUST": ["t"], "HEAT": ["t"]}
+    )
+    heat_wind_titles = [item["section"] for item in heat_wind]
+
+    check(
+        "Heat and wind retrieve both subsections in policy order",
+        heat_wind_titles[1:] == [
+            "6.1 Extreme Heat", "6.2 Wind and Dust",
+        ]
+        and heat_wind[0]["text"].startswith(
+            "Assess each hazard independently"
+        ),
+    )
+
+    check(
+        "Only relevant hazard subsections are retrieved",
+        not any(
+            title.startswith(("6.3", "6.4", "6.5"))
+            for title in heat_wind_titles
+        ),
+    )
+
+    # Missing and unrecognized hazard sections.
+    parent_title = next(
+        title for title in hazard_policy["sections"]
+        if normalize_heading(title) == "weather hazard assessment"
+    )
+
+    def policy_with_section_6(transform):
+        changed = dict(hazard_policy)
+        changed["sections"] = dict(hazard_policy["sections"])
+        changed["sections"][parent_title] = transform(
+            hazard_policy["sections"][parent_title]
+        )
+        return changed
+
+    def error_of(function):
+        try:
+            function()
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    without_wind = policy_with_section_6(
+        lambda body: re.sub(
+            r"### 6\.2 Wind and Dust\n.*?(?=### )", "", body,
+            flags=re.S,
+        )
+    )
+
+    check(
+        "Missing required hazard subsection fails safely",
+        "missing" in error_of(
+            lambda: select_hazard_guidance(
+                without_wind, {"WIND_DUST": ["t"]}
+            )
+        ),
+    )
+
+    check(
+        "Missing subsection is irrelevant when its hazard is absent",
+        len(select_hazard_guidance(without_wind, {"HEAT": ["t"]})) == 2,
+    )
+
+    with_extra = policy_with_section_6(
+        lambda body: body + "\n\n### 6.6 Seismic Activity\n\nExtra text."
+    )
+    extra_titles = [
+        item["section"]
+        for item in select_hazard_guidance(with_extra, {"HEAT": ["t"]})
+    ]
+
+    check(
+        "Unrecognized hazard subsection is always retrieved",
+        "6.6 Seismic Activity" in extra_titles
+        and "6.1 Extreme Heat" in extra_titles
+        and "6.6 Seismic Activity" in [
+            item["section"]
+            for item in select_hazard_guidance(with_extra, {})
+        ],
+    )
+
+    check(
+        "Unrecognized hazard code is rejected",
+        "Unrecognized" in error_of(
+            lambda: select_hazard_guidance(
+                hazard_policy, {"TSUNAMI": ["t"]}
+            )
+        ),
+    )
+
+    no_parent = dict(hazard_policy)
+    no_parent["sections"] = {
+        title: body
+        for title, body in hazard_policy["sections"].items()
+        if title != parent_title
+    }
+
+    check(
+        "Missing Section 6 fails safely",
+        "missing" in error_of(
+            lambda: select_hazard_guidance(no_parent, {"HEAT": ["t"]})
+        ),
+    )
+
+    # Conditional compliance and data-quality sections (7 and 11).
+    def conditional_titles(hazards, **kwargs):
+        return [
+            normalize_heading(item["section"])
+            for item in select_conditional_sections(
+                hazard_policy, hazards, make_weather(**kwargs)
+            )
+        ]
+
+    compliance = "regulatory and workplace compliance"
+    data_quality = "data quality and assessment completeness"
+
+    check(
+        "Section 7 is not retrieved outside heat and the "
+        "midday-break season",
+        conditional_titles({}) == [],
+    )
+
+    check(
+        "Section 7 is retrieved when heat is relevant",
+        conditional_titles({"HEAT": ["t"]}) == [compliance],
+    )
+
+    check(
+        "Section 7 is retrieved inside the midday-break season",
+        conditional_titles({}, current={"time": "2026-07-01T12:00"})
+        == [compliance]
+        and conditional_titles(
+            {}, current={"time": "2026-06-15T09:00"}
+        ) == [compliance]
+        and conditional_titles(
+            {}, current={"time": "2026-09-15T09:00"}
+        ) == [compliance]
+        and conditional_titles(
+            {}, current={"time": "2026-06-14T09:00"}
+        ) == []
+        and conditional_titles(
+            {}, current={"time": "2026-09-16T09:00"}
+        ) == [],
+    )
+
+    check(
+        "Section 7 is retrieved when the date cannot be established",
+        conditional_titles({}, current={"time": "garbage"})
+        == [compliance],
+    )
+
+    check(
+        "Section 11 is retrieved only when evidence is uncertain",
+        conditional_titles({"WIND_DUST": ["UNCERTAIN: x"]})
+        == [data_quality]
+        and conditional_titles(
+            {"HEAT": ["UNCERTAIN: x"]}
+        ) == [compliance, data_quality]
+        and data_quality not in conditional_titles({"HEAT": ["t"]}),
+    )
+
+    conditional_texts = {
+        normalize_heading(item["section"]): item["text"]
+        for item in select_conditional_sections(
+            hazard_policy,
+            {"HEAT": ["UNCERTAIN: x"]},
+            make_weather(),
+        )
+    }
+
+    check(
+        "Sections 7 and 11 are retrieved completely",
+        conditional_texts.get(compliance)
+        == raw_section("7. Regulatory and Workplace Compliance")
+        and conditional_texts.get(data_quality)
+        == raw_section("11. Data Quality and Assessment Completeness"),
+    )
+
+    no_compliance = dict(hazard_policy)
+    no_compliance["sections"] = {
+        title: body
+        for title, body in hazard_policy["sections"].items()
+        if normalize_heading(title) != compliance
+    }
+
+    check(
+        "Missing Section 7 fails safely",
+        "missing" in error_of(
+            lambda: select_conditional_sections(
+                no_compliance, {"HEAT": ["t"]}, make_weather()
+            )
+        ),
+    )
+
+    # Mandatory core now includes section 4 scales and section 13.
+    def retrieve(hazards, budget=None, k=0, duplicate=False,
+                 weather=None):
+        weather = weather or make_weather()
+        required = select_hazard_guidance(hazard_policy, hazards)
+        required += select_conditional_sections(
+            hazard_policy, hazards, weather
+        )
+
+        if duplicate:
+            required = required + required
+
+        def run():
+            return search_guidelines(
+                hazard_policy, "heat wind rain", k=k,
+                required_sections=required,
+            )
+
+        if budget is None:
+            return run()
+
+        return with_globals({"MAX_POLICY_CHARS": budget}, run)
+
+    everything = {code: ["t"] for code in HAZARD_POLICY_TITLES}
+    results = retrieve(everything, 100000, k=5, duplicate=True)
+    titles = [item["section"] for item in results]
+    texts_by_name = {
+        normalize_heading(item["section"]): item["text"]
+        for item in results
+    }
+
+    check(
+        "Retrieved sections contain no duplicates",
+        len(titles) == len(set(titles)),
+    )
+
+    check(
+        "Whole Section 6 is never sent alongside its subsections",
+        sum(
+            1 for title in titles
+            if normalize_heading(title) == "weather hazard assessment"
+        ) == 1
+        and next(
+            len(item["text"]) for item in results
+            if normalize_heading(item["section"])
+            == "weather hazard assessment"
+        ) < 200,
+    )
+
+    check(
+        "Mandatory core is included with every hazard retrieval",
+        all(
+            normalize_heading(name) in texts_by_name
+            for name in MANDATORY_SECTION_ALIASES
+        ),
+    )
+
+    check(
+        "Section 4 scoring definitions are included completely",
+        texts_by_name.get("risk assessment dimensions")
+        == raw_section("4. Risk Assessment Dimensions")
+        and all(
+            marker in texts_by_name["risk assessment dimensions"]
+            for marker in (
+                "Likelihood (L)", "Severity (S)", "Exposure (E)",
+                "Duration (D)", "Geographic Impact (G)",
+            )
+        ),
+    )
+
+    check(
+        "Section 4 is included even when no hazard is detected",
+        "risk assessment dimensions" in [
+            normalize_heading(item["section"]) for item in retrieve({})
+        ],
+    )
+
+    check(
+        "Section 13 advice requirements are always included",
+        "advice and communication requirements" in [
+            normalize_heading(item["section"]) for item in retrieve({})
+        ],
+    )
+
+    check(
+        "Section 12 (output schema) is enforced in code, not sent",
+        "required structured assessment output" not in {
+            normalize_heading(item["section"])
+            for item in retrieve(everything, 100000)
+        },
+    )
+
+    # Budget enforcement (never silently truncate).
+    required_chars = sum(
+        len(item["section"]) + len(item["text"])
+        for item in retrieve({"HEAT": ["t"]}, 100000)
+    )
+
+    check(
+        "Required text exactly at the character budget is accepted",
+        sum(
+            len(item["section"]) + len(item["text"])
+            for item in retrieve({"HEAT": ["t"]}, required_chars)
+        ) == required_chars,
+    )
+
+    def retrieval_error(hazards, budget):
+        return error_of(lambda: retrieve(hazards, budget))
+
+    check(
+        "One character over the budget fails retrieval",
+        "exceed" in retrieval_error({"HEAT": ["t"]}, required_chars - 1),
+    )
+
+    check(
+        "Benign weather fits the policy budget",
+        retrieval_error({}, MAX_POLICY_CHARS) == "",
+    )
+
+    check(
+        "All five hazards plus sections 7 and 11 fit the policy budget",
+        retrieval_error(
+            {code: ["UNCERTAIN: t"] for code in HAZARD_POLICY_TITLES},
+            MAX_POLICY_CHARS,
+        ) == "",
+    )
+
+    check(
+        "Policy growth beyond the budget fails closed",
+        "exceed" in retrieval_error(
+            {code: ["UNCERTAIN: t"] for code in HAZARD_POLICY_TITLES},
+            MAX_POLICY_CHARS - 2000,
+        ),
+    )
+
+    # Plain-text policy rendering.
+    check(
+        "Plain-text policy keeps text verbatim and in blocks",
+        all(
+            item["text"] in format_policy_text(results)
+            and f"{POLICY_BLOCK_START}{item['section']} ==="
+            in format_policy_text(results)
+            for item in results
+        )
+        and "\\n" not in format_policy_text(results[:1]),
+    )
+
+    check(
+        "Policy text containing a block delimiter is rejected",
+        "cannot be rendered" in error_of(
+            lambda: format_policy_text(
+                [{"section": "S", "text": POLICY_BLOCK_END + " x"}]
+            )
+        )
+        and "cannot be rendered" in error_of(
+            lambda: format_policy_text(
+                [{"section": "S\nT", "text": "x"}]
+            )
+        ),
+    )
+
+    # Request construction and request-size budgets.
+    worst_history = [
+        {
+            "timestamp": "t" * 60,
+            "city": "c" * 60,
+            "advice": "a" * 500,
+            "alert_sent": False,
+            "alert_message": "m" * 500,
+        }
+    ] * MAX_HISTORY_RECORDS
+
+    def build_request(hazards, weather=None):
+        """Real retrieval and prompt assembly under the real limits."""
+        weather = weather or make_weather()
+        captured = []
+
+        def capture(messages, temperature=0.1):
+            captured.append(messages)
+            raise RuntimeError("captured")
+
+        sections = retrieve(hazards, MAX_POLICY_CHARS, weather=weather)
+
+        def assemble():
+            try:
+                assess_weather(
+                    weather, worst_history, hazard_policy, sections
+                )
+            except RuntimeError:
+                pass
+
+        with_globals({"ask_groq": capture}, assemble)
+
+        return sections, captured[0]
+
+    def fits_all_budgets(hazards):
+        sections, messages = build_request(
+            {code: ["t"] for code in hazards}
+        )
+        serialized = json_text(messages)
+
+        return (
+            len(serialized) <= MAX_REQUEST_CHARS
+            and estimate_tokens(serialized) + MAX_COMPLETION_TOKENS
+            <= MAX_ESTIMATED_REQUEST_TOKENS
+        )
+
+    check(
+        "No-hazard request fits every budget with worst-case history",
+        fits_all_budgets([]),
+    )
+
+    for code in HAZARD_POLICY_TITLES:
+        check(
+            f"Single-hazard request fits every budget: {code}",
+            fits_all_budgets([code]),
+        )
+
+    check(
+        "Heat with wind request fits every budget",
+        fits_all_budgets(["HEAT", "WIND_DUST"]),
+    )
+
+    check(
+        "All five hazards together fit every budget",
+        fits_all_budgets(list(HAZARD_POLICY_TITLES)),
+    )
+
+    uncertain_all = {
+        code: ["UNCERTAIN: t"] for code in HAZARD_POLICY_TITLES
+    }
+    _, extreme_messages = build_request(uncertain_all)
+
+    class NoPostHttp:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, *args, **kwargs):
+            self.posts.append(args)
+            raise AssertionError("request must be blocked first")
+
+    def groq_error(messages, **overrides):
+        recorder = NoPostHttp()
+        settings = {"GROQ_API_KEY": "test-key", "HTTP": recorder}
+        settings.update(overrides)
+
+        message = error_of_runtime(
+            lambda: with_globals(
+                settings, lambda: ask_groq(messages)
+            )
+        )
+
+        return message, recorder.posts
+
+    def error_of_runtime(function):
+        try:
+            function()
+            return ""
+        except (ValueError, RuntimeError) as exc:
+            return str(exc)
+
+    message, posts = groq_error(extreme_messages)
+
+    check(
+        "Worst case (all uncertain, sections 7 and 11) fails closed "
+        "on the token estimate before sending",
+        "token budget" in message and not posts,
+    )
+
+    oversized = [
+        {"role": "user", "content": "x" * (MAX_REQUEST_CHARS + 1)}
+    ]
+    message, posts = groq_error(oversized)
+
+    check(
+        "Request over the character limit is blocked before sending",
+        "character limit" in message and not posts,
+    )
+
+    message, posts = groq_error(
+        [{"role": "user", "content": "short"}],
+        MAX_ESTIMATED_REQUEST_TOKENS=10,
+    )
+
+    check(
+        "Request over the token budget is blocked before sending",
+        "token budget" in message and not posts,
+    )
+
+    # Prompt content.
+    sections, messages = build_request({"HEAT": ["t"], "WIND_DUST": ["t"]})
+    user_content = messages[1]["content"]
+
+    check(
+        "Prompt holds policy as plain text, not JSON-escaped",
+        all(item["text"] in user_content for item in sections)
+        and "retrieved_guideline_sections" not in user_content
+        and "Risk Assessment Dimensions" in user_content,
+    )
+
+    check(
+        "System prompt keeps its safety requirements",
+        all(
+            phrase in " ".join(SYSTEM_PROMPT.split())
+            for phrase in (
+                "NOT_CHECKED",
+                "never a completed safety clearance",
+                "Never treat missing evidence as a low score",
+                "not an official UAE warning",
+                "return null for that",
+            )
+        ),
+    )
+
+    check(
+        "History overhead is capped per record",
+        len(json_text(summarize_history(worst_history)))
+        < 3 * 400,
+    )
+
+    # Pipeline with mocked weather and model (offline).
+    sent_messages = []
+
+    model_reply = json_text({
+        "hazard_type": "NONE",
+        "likelihood_score": 1, "likelihood_reason": "r",
+        "severity_score": 1, "severity_reason": "r",
+        "exposure_score": 1, "exposure_reason": "r",
+        "duration_score": 1, "duration_reason": "r",
+        "geographic_impact_score": 1,
+        "geographic_impact_reason": "r",
+        "alert_recommendation": "NO_ALERT_RECOMMENDED",
+        "advice": "a", "reasoning": "r",
+        "recommended_actions": [], "limitations": [],
+        "missing_evidence": [],
+        "sources": ["16. Final Decision Rule"],
+    })
+
+    def recording_model(messages, temperature=0.1):
+        sent_messages.append(messages)
+        return model_reply
+
+    def pipeline(weather_fixture, **overrides):
+        settings = {
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: weather_fixture,
+            "tool_get_history": lambda n=3: [],
+            "ask_groq": recording_model,
+        }
+        settings.update(overrides)
+
+        return with_globals(settings, lambda: run_weather_agent()[0])
+
+    benign_decision = pipeline(make_weather())
+
+    check(
+        "Benign weather completes retrieval and stays INCOMPLETE",
+        benign_decision["hazard_screening"] == {}
+        and benign_decision["assessment_status"] == "INCOMPLETE"
+        and benign_decision["alert_recommendation"] == "MONITOR"
+        and benign_decision["send_alert"] is False
+        and len(sent_messages) == 1
+        and len(json_text(sent_messages[0])) <= MAX_REQUEST_CHARS,
+    )
+
+    sent_messages.clear()
+
+    hot_windy = make_weather(
+        current={"temperature_2m": 41, "wind_gusts_10m": 70},
+        today={"high": 42},
+    )
+
+    hot_decision = pipeline(hot_windy)
+    hot_request = (
+        sent_messages[0][1]["content"] if sent_messages else ""
+    )
+
+    check(
+        "Hot and windy weather retrieves heat, wind, scales and "
+        "compliance guidance",
+        hot_decision["assessment_status"] == "INCOMPLETE"
+        and set(hot_decision["hazard_screening"])
+        == {"HEAT", "WIND_DUST"}
+        and "Temperature alone is insufficient" in hot_request
+        and "Distinguish sustained wind from short-duration"
+        in hot_request
+        and "Do not invent frost" not in hot_request
+        and "Likelihood (L)" in hot_request
+        and "UAE midday break" in hot_request
+        and "Do not claim that all conditions are safe" in hot_request,
+    )
+
+    sent_messages.clear()
+
+    all_missing = make_weather(
+        current={
+            key: None for key in make_weather()["current"]
+            if key != "time"
+        },
+        today={key: None for key in make_weather()["today_forecast"]},
+        hourly={
+            key: None for key in make_weather()[
+                "hourly_forecast_next_24h"
+            ][0]
+            if key != "time"
+        },
+    )
+
+    gap_pipeline = pipeline(all_missing)
+    gap_request = (
+        sent_messages[0][1]["content"] if sent_messages else ""
+    )
+
+    check(
+        "Missing weather evidence retrieves section 11, flags the gap "
+        "and blocks a monitor-only result",
+        set(gap_pipeline["hazard_screening"])
+        == set(HAZARD_POLICY_TITLES)
+        and "Before producing an assessment, verify" in gap_request
+        and gap_pipeline["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and gap_pipeline["assessment_status"] == "INCOMPLETE"
+        and any(
+            "evidence gaps" in item
+            for item in gap_pipeline["missing_evidence"]
+        ),
+    )
+
+    sent_messages.clear()
+
+    failed_decision = pipeline(
+        hot_windy,
+        MAX_POLICY_CHARS=5000,
+    )
+
+    check(
+        "Policy that cannot fit the budget gives INCOMPLETE without a "
+        "model call",
+        failed_decision["assessment_status"] == "INCOMPLETE"
+        and failed_decision["alert_recommendation"]
+        == "UNABLE_TO_ASSESS"
+        and failed_decision["risk_band"] == "UNASSESSED"
+        and failed_decision["risk_score"] is None
+        and failed_decision["official_warning_status"]
+        == "NOT_CHECKED"
+        and failed_decision["send_alert"] is False
+        and failed_decision["notification_status"] == "NOT_SENT"
+        and "exceed" in failed_decision["reasoning"]
+        and not sent_messages,
+    )
+
+    # Groq response handling with a fake transport (offline).
+    secret_key = "gsk_TEST_SECRET_VALUE_123"
+
+    class FakeResponse:
+        def __init__(self, status_code=200, body=None, text="",
+                     headers=None):
+            self.status_code = status_code
+            self._body = body
+            self.text = text
+            self.headers = headers or {}
+
+        def json(self):
+            if self._body is None:
+                raise ValueError("no json")
+
+            return self._body
+
+    class FakeHttp:
+        def __init__(self, response):
+            self.response = response
+            self.requests = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.requests.append(
+                {"url": url, "headers": headers, "json": json}
+            )
+            return self.response
+
+    def groq_body(content=model_reply, finish="stop", usage="default"):
+        if usage == "default":
+            usage = {
+                "prompt_tokens": 1234,
+                "completion_tokens": 456,
+                "total_tokens": 1690,
+            }
+
+        body = {
+            "choices": [
+                {
+                    "message": {"content": content},
+                    "finish_reason": finish,
+                }
+            ]
+        }
+
+        if usage is not None:
+            body["usage"] = usage
+
+        return body
+
+    def call_groq(response):
+        transport = FakeHttp(response)
+        output = io.StringIO()
+        outcome = {}
+
+        def run():
+            try:
+                with contextlib.redirect_stdout(output):
+                    outcome["content"] = ask_groq(
+                        [{"role": "user", "content": "hello"}]
+                    )
+            except (ValueError, RuntimeError) as exc:
+                outcome["error"] = str(exc)
+
+        with_globals(
+            {"GROQ_API_KEY": secret_key, "HTTP": transport}, run
+        )
+
+        outcome["usage"] = dict(LAST_GROQ_USAGE)
+        outcome["output"] = output.getvalue()
+        outcome["transport"] = transport
+
+        return outcome
+
+    ok = call_groq(FakeResponse(body=groq_body()))
+
+    check(
+        "Groq usage fields are captured and logged",
+        ok.get("content") == model_reply
+        and ok["usage"]["prompt_tokens"] == 1234
+        and ok["usage"]["completion_tokens"] == 456
+        and ok["usage"]["total_tokens"] == 1690
+        and ok["usage"]["finish_reason"] == "stop"
+        and "prompt_tokens: 1234" in ok["output"]
+        and "finish_reason: stop" in ok["output"],
+    )
+
+    sent_payload = ok["transport"].requests[0]["json"]
+
+    check(
+        "gpt-oss reasoning configuration is supported parameters only",
+        "reasoning_format" not in sent_payload
+        and sent_payload["include_reasoning"] is False
+        and sent_payload["reasoning_effort"] == "low"
+        and sent_payload["max_completion_tokens"]
+        == MAX_COMPLETION_TOKENS
+        and sent_payload["model"] == "openai/gpt-oss-20b",
+    )
+
+    check(
+        "API key is sent as a header but never logged or recorded",
+        ok["transport"].requests[0]["headers"]["Authorization"]
+        == "Bearer " + secret_key
+        and secret_key not in ok["output"]
+        and secret_key not in json_text(ok["usage"]),
+    )
+
+    truncated = call_groq(
+        FakeResponse(body=groq_body(content="{\"hazard", finish="length"))
+    )
+
+    check(
+        "Truncated response (finish_reason length) is rejected",
+        "cut off" in truncated.get("error", "")
+        and "content" not in truncated
+        and truncated["usage"]["finish_reason"] == "length"
+        and secret_key not in truncated["error"],
+    )
+
+    check(
+        "Missing finish_reason is rejected",
+        "cut off" in call_groq(
+            FakeResponse(body=groq_body(finish=None))
+        ).get("error", ""),
+    )
+
+    missing_usage = call_groq(FakeResponse(body=groq_body(usage=None)))
+
+    check(
+        "Absent usage data is recorded as null, not invented",
+        missing_usage.get("content") == model_reply
+        and missing_usage["usage"]["prompt_tokens"] is None
+        and missing_usage["usage"]["total_tokens"] is None,
+    )
+
+    too_large = call_groq(
+        FakeResponse(status_code=413, text="Request too large", body={})
+    )
+    limited = call_groq(
+        FakeResponse(
+            status_code=429, text="rate limit",
+            headers={"retry-after": "12"}, body={},
+        )
+    )
+
+    check(
+        "Token-limit errors (413, 429) are explicit and key-free",
+        "HTTP 413" in too_large["error"]
+        and "too large" in too_large["error"]
+        and "HTTP 429" in limited["error"]
+        and "rate or token limit" in limited["error"]
+        and "retry-after 12" in limited["error"]
+        and secret_key not in too_large["error"] + limited["error"]
+        + too_large["output"] + limited["output"],
+    )
+
+    check(
+        "Empty or malformed Groq structures are rejected",
+        "empty" in call_groq(
+            FakeResponse(body=groq_body(content="   "))
+        ).get("error", "")
+        and "unexpected response structure" in call_groq(
+            FakeResponse(body={"nothing": True})
+        ).get("error", ""),
+    )
+
+    def groq_pipeline(response):
+        transport = FakeHttp(response)
+
+        decision = with_globals(
+            {
+                "GROQ_API_KEY": secret_key,
+                "HTTP": transport,
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: make_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            lambda: run_weather_agent()[0],
+        )
+
+        return decision
+
+    for label, response in {
+        "truncated output": FakeResponse(
+            body=groq_body(content="{\"hazard", finish="length")
+        ),
+        "malformed JSON": FakeResponse(
+            body=groq_body(content="{not valid json")
+        ),
+        "non-object JSON": FakeResponse(
+            body=groq_body(content="[1, 2, 3]")
+        ),
+        "token-limit error": FakeResponse(
+            status_code=413, text="too large", body={}
+        ),
+        "rate-limit error": FakeResponse(
+            status_code=429, text="slow down", body={}
+        ),
+    }.items():
+        decision = groq_pipeline(response)
+
+        check(
+            f"Pipeline fails safely to INCOMPLETE on {label}",
+            decision["assessment_status"] == "INCOMPLETE"
+            and decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and decision["risk_band"] == "UNASSESSED"
+            and decision["send_alert"] is False
+            and decision["notification_status"] == "NOT_SENT"
+            and decision["official_warning_status"] == "NOT_CHECKED"
+            and secret_key not in json_text(decision),
+        )
+
+    good = groq_pipeline(FakeResponse(body=groq_body()))
+
+    check(
+        "Pipeline records actual Groq usage on the decision",
+        good["groq_usage"]["prompt_tokens"] == 1234
+        and good["groq_usage"]["finish_reason"] == "stop"
+        and good["assessment_status"] == "INCOMPLETE",
+    )
+
+    # ------------------------------------------------------------
+    # Regression: GitHub Actions run (main @ 587e465) failed with
+    #   ValueError: Required policy headings are missing from
+    #   guidelines.md: Purpose and Safety Principles; ...
+    # That code still required eight legacy headings that the v2.0
+    # guidelines.md does not contain. The scheduled run executed main,
+    # which did not yet have the numbered-section implementation.
+    # ------------------------------------------------------------
+    legacy_headings = (
+        "Purpose and Safety Principles",
+        "Source Authority and Validation",
+        "Risk Assessment and Alert Severity",
+        "Alert Decision Requirements",
+        "Alert Approval and Authorization Policy",
+        "Failure Handling and Safe Operation",
+        "Audit Trail and Compliance Controls",
+        "Final Safety Rule",
+    )
+    legacy_aliases = {name: (name,) for name in legacy_headings}
+    policy_headings = {
+        normalize_heading(title)
+        for title in hazard_policy["sections"]
+    }
+    legacy_missing = [
+        name for name in legacy_headings
+        if normalize_heading(name) not in policy_headings
+    ]
+
+    def legacy_requirement_error():
+        def attempt():
+            return error_of(
+                lambda: search_guidelines(
+                    hazard_policy, "heat", k=1
+                )
+            )
+
+        return with_globals(
+            {"MANDATORY_SECTION_ALIASES": legacy_aliases}, attempt
+        )
+
+    check(
+        "Legacy heading requirement reproduces the exact Actions error",
+        legacy_missing == list(legacy_headings)
+        and legacy_requirement_error()
+        == "Required policy headings are missing from guidelines.md: "
+        + "; ".join(legacy_headings),
+    )
+
+    legacy_normalized = {
+        normalize_heading(name) for name in legacy_headings
+    }
+    required_normalized = {
+        normalize_heading(alias)
+        for aliases in MANDATORY_SECTION_ALIASES.values()
+        for alias in aliases
+    }
+
+    check(
+        "Current mandatory sections contain none of the legacy headings",
+        not required_normalized & legacy_normalized
+        and required_normalized <= policy_headings,
+    )
+
+    def string_constants_outside_tests():
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        found = set()
+
+        for node in tree.body:
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "run_tests"
+            ):
+                continue
+
+            for child in ast.walk(node):
+                if (
+                    isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                ):
+                    found.add(normalize_heading(child.value))
+
+        return found
+
+    production_text = string_constants_outside_tests()
+
+    check(
+        "No production code requires a legacy heading",
+        not any(
+            legacy in text
+            for text in production_text
+            for legacy in legacy_normalized
+        ),
+    )
+
+    # Self-contained: own fixtures, own mocks, the real repository
+    # guidelines.md and the real run_weather_agent() retrieval path.
+    def run_real_retrieval_path():
+        fixture = {
+            "city": CITY,
+            "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-07T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-07T12:00",
+                "temperature_2m": 22, "apparent_temperature": 22,
+                "precipitation": 0, "wind_speed_10m": 5,
+                "wind_gusts_10m": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            },
+            "today_forecast": {
+                "high": 24, "low": 18, "wind": 8,
+                "gust": 15, "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [
+                {
+                    "time": "2026-11-07T13:00",
+                    "temperature": 22, "apparent_temperature": 22,
+                    "precipitation": 0, "wind": 5, "gust": 10,
+                    "visibility": 20000, "weather_code": 0,
+                    "cape": 0,
+                }
+            ],
+            "history_summary": {},
+        }
+        reply = json_text({
+            "hazard_type": "NONE",
+            "likelihood_score": 1, "likelihood_reason": "r",
+            "severity_score": 1, "severity_reason": "r",
+            "exposure_score": 1, "exposure_reason": "r",
+            "duration_score": 1, "duration_reason": "r",
+            "geographic_impact_score": 1,
+            "geographic_impact_reason": "r",
+            "alert_recommendation": "NO_ALERT_RECOMMENDED",
+            "advice": "a", "reasoning": "r",
+            "recommended_actions": [], "limitations": [],
+            "missing_evidence": [],
+            "sources": ["16. Final Decision Rule"],
+        })
+        mocks = {
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: fixture,
+            "tool_get_history": lambda n=3: [],
+            "ask_groq": lambda messages, temperature=0.1: reply,
+        }
+        saved = {name: globals()[name] for name in mocks}
+        printed = io.StringIO()
+        globals().update(mocks)
+
+        try:
+            with contextlib.redirect_stdout(printed):
+                result = run_weather_agent()[0]
+        finally:
+            globals().update(saved)
+
+        return result, printed.getvalue()
+
+    real_decision, real_output = run_real_retrieval_path()
+
+    check(
+        "Real retrieval path never reports missing required headings",
+        "load_guidelines" in real_decision["tools_used"]
+        and "search_guidelines" in real_decision["tools_used"]
+        and real_decision["policy_status"] == "AVAILABLE"
+        and real_decision["policy_path"] == str(GUIDELINES_PATH)
+        and real_decision["policy_hash"] == hashlib.sha256(
+            GUIDELINES_PATH.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        and "ASSESSMENT ERROR" not in real_output
+        and "Required policy headings" not in real_output
+        and "Required policy headings" not in json_text(real_decision),
+    )
+
+    workflow_path = (
+        Path(__file__).resolve().parent
+        / ".github" / "workflows" / "weather.yml"
+    )
+    workflow_commands = [
+        line.strip() for line in
+        workflow_path.read_text(encoding="utf-8").splitlines()
+        if "weather_log.py" in line
+    ] if workflow_path.is_file() else []
+
+    original_directory = os.getcwd()
+
+    with tempfile.TemporaryDirectory() as elsewhere:
+        os.chdir(elsewhere)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                loaded_elsewhere = load_guidelines()
+        finally:
+            # Leave the directory before it is deleted (Windows).
+            os.chdir(original_directory)
+
+    check(
+        "Workflow runs this weather_log.py in dry-run mode only and "
+        "the policy loads from beside the script",
+        workflow_commands == ["- run: python weather_log.py agent-dry"]
+        and Path(loaded_elsewhere["path"]).resolve()
+        == (Path(__file__).resolve().parent / "guidelines.md")
+        and loaded_elsewhere["hash"] == hazard_policy["hash"],
+    )
+
+    # agent-dry must not POST to Sheets or send email.
+    class RecordingHttp:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, **kwargs):
+            self.posts.append(url)
+
+            class Response:
+                status_code = 200
+                text = "OK"
+
+                def raise_for_status(self):
+                    return None
+
+            return Response()
+
+    def run_job(dry):
+        recorder = RecordingHttp()
+
+        with_globals(
+            {
+                "HTTP": recorder,
+                "SHEET_URL": "https://sheet.invalid/exec",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "run_weather_agent": lambda: (
+                    {
+                        **incomplete_assessment("test"),
+                        "city": CITY,
+                        "send_alert": False,
+                    },
+                    [],
+                ),
+            },
+            lambda: run_agent_job(dry=dry),
+        )
+
+        return recorder.posts
+
+    check(
+        "agent-dry makes no HTTP POST (Sheets or otherwise)",
+        run_job(dry=True) == [],
+    )
+
+    check(
+        "Test harness detects a live-mode POST (control)",
+        run_job(dry=False) == ["https://sheet.invalid/exec"],
+    )
+
+    imported_modules = set()
+
+    for node in ast.walk(
+        ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    ):
+        if isinstance(node, ast.Import):
+            imported_modules.update(
+                alias.name.split(".")[0] for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module.split(".")[0])
+
+    check(
+        "No email-sending modules are imported",
+        not imported_modules & {
+            "smtplib", "email", "sendgrid", "yagmail", "mailbox",
+        },
+    )
+
     # Token budget tests.
     check(
         "Token estimator returns positive estimate",
@@ -1683,6 +4021,36 @@ def run_tests():
         check(
             "All mandatory headings exist in guidelines",
             all(title in policy["sections"] for title in mandatory),
+        )
+
+        # The formula and weights in code must match section 5.
+        risk_section = next(
+            (
+                body for title, body in policy["sections"].items()
+                if normalize_heading(title)
+                == "risk calculation model"
+            ),
+            "",
+        )
+        formula = re.search(
+            r"Risk Score = (.+)", risk_section
+        )
+        weights = (
+            re.findall(
+                r"([0-9.]+) × \(([LEDG]) × S\)", formula.group(1)
+            )
+            if formula else []
+        )
+
+        check(
+            "Risk formula weights match guidelines section 5",
+            weights == [
+                ("0.35", "L"),
+                ("0.20", "E"),
+                ("0.15", "D"),
+                ("0.30", "G"),
+            ]
+            and calculate_risk_score(1, 1, 1, 1, 1)[0] == 1.0,
         )
 
         results = search_guidelines(
