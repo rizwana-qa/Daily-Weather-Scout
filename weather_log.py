@@ -470,26 +470,99 @@ def usage_number(usage, key):
     return value if type(value) is int else None
 
 
-def describe_groq_http_error(status_code, response):
-    if status_code == 413:
-        reason = "request too large for the model or account limit"
-    elif status_code == 429:
-        reason = "rate or token limit reached (RPM, TPM, RPD or TPD)"
-    elif status_code == 400:
-        reason = "request rejected as invalid"
-    else:
-        reason = "request failed"
+# Fixed descriptions for the HTTP statuses Groq documents. Provider
+# error bodies are never copied: they can contain free text and partial
+# model output (for example "failed_generation").
+GROQ_STATUS_DESCRIPTIONS = {
+    400: "request rejected as invalid",
+    401: "authentication failed",
+    403: "permission denied",
+    404: "resource not found",
+    413: "request too large for the model or account limit",
+    422: "request could not be processed",
+    424: "a dependent request failed",
+    429: "rate or token limit reached (RPM, TPM, RPD or TPD)",
+    498: "flex tier capacity exceeded",
+    499: "request cancelled",
+    500: "provider internal error",
+    502: "provider gateway error",
+    503: "provider unavailable",
+}
 
-    retry_after = response.headers.get("retry-after") if hasattr(
-        response, "headers"
+# Fixed descriptions for provider error codes observed in practice.
+GROQ_ERROR_CODE_DESCRIPTIONS = {
+    "json_validate_failed": (
+        "the provider reported that the generated output did not "
+        "validate against the response schema"
+    ),
+}
+
+GROQ_GENERIC_ERROR_DESCRIPTION = "provider details withheld"
+
+# Provider identifiers (error.code, error.type) are passed on only when
+# they look like machine identifiers; anything else is withheld.
+_PROVIDER_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_RETRY_AFTER = re.compile(r"\d{1,6}(?:\.\d{1,3})?")
+
+
+def safe_provider_identifier(value):
+    if isinstance(value, str) and _PROVIDER_IDENTIFIER.fullmatch(value):
+        return value
+
+    return None
+
+
+def provider_error_fields(response):
+    """
+    The structured error.code and error.type from a provider error
+    body, each validated as an identifier, else None. The body is
+    parsed defensively; message, failed_generation, any other field and
+    the raw text are never read into the result.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError, AttributeError):
+        return None, None
+
+    error = body.get("error") if isinstance(body, dict) else None
+
+    if not isinstance(error, dict):
+        return None, None
+
+    return (
+        safe_provider_identifier(error.get("code")),
+        safe_provider_identifier(error.get("type")),
+    )
+
+
+def describe_groq_http_error(status_code, response):
+    """
+    Program-generated description of a Groq HTTP error. It contains only
+    the status, a fixed description, validated provider identifiers and
+    a numeric retry-after; never provider-supplied text.
+    """
+    status = status_code if type(status_code) is int else None
+    code, error_type = provider_error_fields(response)
+
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("retry-after") if hasattr(
+        headers, "get"
     ) else None
 
-    message = f"Groq API returned HTTP {status_code} ({reason})"
+    message = (
+        f"Groq API returned HTTP {status} "
+        f"({GROQ_STATUS_DESCRIPTIONS.get(status, 'request failed')})"
+    )
 
-    if retry_after:
-        message += f"; retry-after {compact_text(retry_after, 20)}s"
+    if isinstance(retry_after, str) and _RETRY_AFTER.fullmatch(retry_after):
+        message += f"; retry-after {retry_after}s"
 
-    return message + f": {compact_text(response.text, 400)}"
+    return (
+        message
+        + f"; provider code={code or 'unavailable'}, "
+        f"type={error_type or 'unavailable'}: "
+        + GROQ_ERROR_CODE_DESCRIPTIONS.get(code, GROQ_GENERIC_ERROR_DESCRIPTION)
+    )
 
 
 def ask_groq(messages, temperature=0.1):
@@ -1475,6 +1548,36 @@ def search_guidelines(policy, query, k=1, required_sections=None):
 # 6. GOOGLE SHEETS HISTORY
 # ============================================================
 
+def describe_history_error(exc):
+    """
+    Program-generated description of a history retrieval failure. The
+    exception text is never used: requests includes the full request
+    URL (the secret SHEET_URL and its query string) in its messages.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+
+        if type(status) is int:
+            return f"history service returned HTTP {status}"
+
+        return "history service returned an HTTP error"
+
+    if isinstance(exc, requests.Timeout):
+        return "history request timed out"
+
+    if isinstance(exc, requests.ConnectionError):
+        return "history service could not be reached"
+
+    if isinstance(exc, ValueError):
+        return "history response could not be read as JSON"
+
+    if isinstance(exc, requests.RequestException):
+        return "history request failed"
+
+    return "history retrieval failed"
+
+
 def tool_get_history(n=3):
     if not SHEET_URL:
         return {
@@ -1502,7 +1605,7 @@ def tool_get_history(n=3):
         return data[:MAX_HISTORY_RECORDS]
 
     except (requests.RequestException, ValueError) as exc:
-        return {"error": str(exc)}
+        return {"error": describe_history_error(exc)}
 
 
 def summarize_history(history):
@@ -6560,6 +6663,648 @@ def run_tests():
     check(
         "Request over the character limit is still rejected before Groq",
         "character limit" in error and payloads == [],
+    )
+
+    # ------------------------------------------------------------
+    # Groq HTTP error bodies are never propagated (self-contained,
+    # offline). Each synthetic body carries unique marker strings.
+    # ------------------------------------------------------------
+    def he_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    class HeResponse:
+        def __init__(self, status_code, text, headers=None):
+            self.status_code = status_code
+            self.text = text
+            self.headers = headers or {}
+
+        def json(self):
+            return json.loads(self.text)
+
+        def raise_for_status(self):
+            return None
+
+    class HeTransport:
+        def __init__(self, response):
+            self.response = response
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return self.response
+
+    def he_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 22,
+                "apparent_temperature": 22, "precipitation": 0,
+                "wind_speed_10m": 5, "wind_gusts_10m": 10,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 24, "low": 18, "wind": 8,
+                               "gust": 15, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 22, "apparent_temperature": 22,
+                "humidity": 55, "precipitation": 0, "wind": 6,
+                "gust": 12, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def he_run(response, history=()):
+        """Real pipeline + dry run + live-mode payload, all offline."""
+        groq = HeTransport(response)
+        pipeline_log = io.StringIO()
+
+        def assess():
+            with contextlib.redirect_stdout(pipeline_log):
+                return run_weather_agent()
+
+        decision, used = he_override(
+            {
+                "HTTP": groq,
+                "GROQ_API_KEY": "gsk_he_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: he_weather(),
+                "tool_get_history": lambda n=3: list(history),
+            },
+            assess,
+        )
+
+        dry_log = io.StringIO()
+        sheets = HeTransport(HeResponse(200, "OK"))
+
+        def report(dry):
+            target = dry_log if dry else io.StringIO()
+
+            with contextlib.redirect_stdout(target):
+                run_agent_job(dry=dry)
+
+        common = {
+            "run_weather_agent": lambda: (decision, used),
+            "HTTP": sheets,
+            "SHEET_URL": "https://sheet.invalid/exec",
+            "require_configuration": lambda require_sheet=False: None,
+        }
+        he_override(common, lambda: report(True))
+        he_override(common, lambda: report(False))
+
+        return {
+            "decision": decision,
+            "groq": groq,
+            "pipeline_log": pipeline_log.getvalue(),
+            "dry_log": dry_log.getvalue(),
+            "sheets_payloads": sheets.payloads,
+        }
+
+    he_bodies = {
+        "failed_generation": (400, json.dumps({"error": {
+            "message": "max completion tokens reached HE-MARK-MSG1",
+            "type": "invalid_request_error",
+            "code": "json_validate_failed",
+            "failed_generation": "{\"advice\": \"HE-MARK-FG no official "
+                                 "advisory is in effect\"",
+        }}), {}),
+        "error.message": (400, json.dumps({"error": {
+            "message": "HE-MARK-MSG2 provider supplied text",
+            "type": "invalid_request_error",
+        }}), {}),
+        "unexpected nested fields": (500, json.dumps({
+            "error": {
+                "type": "server_error",
+                "details": {"trace": ["HE-MARK-NEST"]},
+                "param": "HE-MARK-PARAM",
+            },
+            "extra": {"deep": [{"x": "HE-MARK-TOP"}]},
+        }), {}),
+        "malformed JSON": (
+            502, '{"error": {"message": "HE-MARK-BAD", "code": ', {}
+        ),
+        "plain text": (503, "HE-MARK-PLAIN service unavailable", {}),
+        "unsafe identifiers and header": (429, json.dumps({"error": {
+            "code": "HE-MARK-CODE not an identifier",
+            "type": "HE_MARK_" + "t" * 80,
+        }}), {"retry-after": "HE-MARK-RETRY"}),
+    }
+
+    he_results = {
+        label: he_run(HeResponse(status, text, headers))
+        for label, (status, text, headers) in he_bodies.items()
+    }
+
+    for label, result in he_results.items():
+        decision = result["decision"]
+        surfaces = {
+            "logs": result["pipeline_log"] + result["dry_log"],
+            "reasoning": decision["reasoning"],
+            "limitations": json_text(decision["limitations"]),
+            "payloads": json_text(result["sheets_payloads"]),
+        }
+        leaked = [
+            surface for surface, text in surfaces.items()
+            if "HE-MARK" in text or "HE_MARK" in text
+        ]
+
+        check(
+            f"Provider error body never leaks ({label})",
+            leaked == []
+            and len(result["sheets_payloads"]) == 1
+            and "OUTPUT PAYLOAD" in result["dry_log"],
+        )
+
+        check(
+            f"Provider error fails closed ({label})",
+            len(result["groq"].payloads) == 1
+            and decision["assessment_status"] == "INCOMPLETE"
+            and decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and decision["risk_band"] == "UNASSESSED"
+            and decision["send_alert"] is False
+            and decision["notification_status"] == "NOT_SENT"
+            and [r["code"] for r in decision["incomplete_reasons"]]
+            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            and "gsk_he_test_key" not in json_text(result["sheets_payloads"])
+            + result["pipeline_log"] + result["dry_log"],
+        )
+
+    known = he_results["failed_generation"]["decision"]["reasoning"]
+
+    check(
+        "Known provider code stays diagnosable with a fixed description",
+        "HTTP 400" in known
+        and "code=json_validate_failed" in known
+        and "type=invalid_request_error" in known
+        and GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"] in known,
+    )
+
+    check(
+        "Sanitised description is identical in reasoning and limitations",
+        all(
+            result["decision"]["limitations"][0]
+            == result["decision"]["reasoning"]
+            for result in he_results.values()
+        ),
+    )
+
+    def he_describe(status, body, headers=None):
+        return describe_groq_http_error(
+            status, HeResponse(status, body, headers)
+        )
+
+    unknown = he_describe(400, json.dumps({"error": {
+        "code": "some_new_code", "type": "invalid_request_error",
+        "message": "HE-MARK-UNKNOWN",
+    }}))
+
+    check(
+        "Unrecognised but well-formed code is named with the generic text",
+        "code=some_new_code" in unknown
+        and GROQ_GENERIC_ERROR_DESCRIPTION in unknown
+        and "HE-MARK" not in unknown,
+    )
+
+    check(
+        "Malformed, plain-text and unsafe values are withheld",
+        all(
+            "code=unavailable, type=unavailable" in result["decision"][
+                "reasoning"
+            ]
+            for label, result in he_results.items()
+            if label in ("malformed JSON", "plain text",
+                         "unsafe identifiers and header")
+        )
+        and "retry-after" not in he_results[
+            "unsafe identifiers and header"
+        ]["decision"]["reasoning"],
+    )
+
+    check(
+        "Numeric retry-after and documented statuses remain",
+        "retry-after 12s" in he_describe(429, "{}", {"retry-after": "12"})
+        and "rate or token limit" in he_describe(429, "{}")
+        and "request too large" in he_describe(413, "{}")
+        and "provider unavailable" in he_describe(503, "not json")
+        and "(request failed)" in he_describe(418, "{}"),
+    )
+
+    check(
+        "Error description never reads the raw response text",
+        "HE-MARK" not in he_describe(
+            400, json.dumps({"error": {"type": "invalid_request_error"}})
+            + "HE-MARK-TRAILING"
+        ),
+    )
+
+    # History-dependent coverage: a request with worst-case history
+    # still fits (no hazards) and completes a real round trip.
+    he_history = [{
+        "timestamp": "t" * 60, "city": "c" * 60, "advice": "a" * 500,
+        "alert_sent": False, "alert_message": "m" * 500,
+    }] * MAX_HISTORY_RECORDS
+    he_reply = json_text({
+        "hazard_type": "NONE",
+        "likelihood_score": 1, "likelihood_reason": "lr",
+        "severity_score": 1, "severity_reason": "sr",
+        "exposure_score": None, "exposure_reason": "er",
+        "duration_score": None, "duration_reason": "dr",
+        "geographic_impact_score": None,
+        "geographic_impact_reason": "gr",
+        "alert_recommendation": "UNABLE_TO_ASSESS",
+        "advice": "Official warning status was not checked.",
+        "reasoning": "r", "recommended_actions": [], "limitations": [],
+        "missing_evidence": [], "sources": ["16. Final Decision Rule"],
+    })
+
+    class HeOk(HeResponse):
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": he_reply},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    with_history = he_run(HeOk(200, ""), history=he_history)
+    sent_prompt = json_text(with_history["groq"].payloads[0]["messages"]) \
+        if with_history["groq"].payloads else ""
+
+    check(
+        "Worst-case history request reaches Groq and is assessed",
+        len(with_history["groq"].payloads) == 1
+        and with_history["decision"]["history_status"] == "AVAILABLE"
+        and "recent_agent_history" in sent_prompt
+        and "a" * 120 in sent_prompt
+        and with_history["decision"]["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED"
+        in [r["code"] for r in with_history["decision"]["incomplete_reasons"]],
+    )
+
+    # ------------------------------------------------------------
+    # Realistic-history heat assessment and history-error
+    # sanitisation (self-contained, offline).
+    # ------------------------------------------------------------
+    def fz_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def fz_heat_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        hours = []
+
+        for h in range(24):
+            phase = math.cos((h + 1) / 24 * 2 * math.pi)
+            hours.append({
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": round(31.0 + 4.0 * phase, 1),
+                "apparent_temperature": round(33.5 + 4.5 * phase, 1),
+                "humidity": int(60 - 10 * phase),
+                "precipitation": 0.0,
+                "wind": round(12.0 + 5.0 * phase, 1),
+                "gust": round(24.0 + 9.0 * phase, 1),
+                "visibility": 24140.0,
+                "weather_code": 1,
+                "cape": 0.0,
+            })
+
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "interval": 900,
+                "temperature_2m": 33.4, "relative_humidity_2m": 58,
+                "apparent_temperature": 36.1, "precipitation": 0.0,
+                "wind_speed_10m": 14.2, "wind_gusts_10m": 27.0,
+                "visibility": 24140.0, "weather_code": 1, "cape": 0.0,
+            },
+            "today_forecast": {"high": 35.0, "low": 27.2, "wind": 17.0,
+                               "gust": 33.0, "precipitation": 0.0},
+            "previous_days": [
+                {"date": f"2026-11-0{d}", "high": 34.6, "low": 26.9,
+                 "wind": 16.1, "gust": 30.4, "precipitation": 0.0}
+                for d in (5, 6, 7)
+            ],
+            "hourly_forecast_next_24h": hours,
+            "history_summary": {"average_high": 34.5,
+                                "average_low": 26.8, "peak_wind": 17.2},
+        }
+
+    fz_history = [{
+        "timestamp": f"2026-11-0{d}T04:00:12.345Z",
+        "city": "Dubai",
+        "advice": "Limit strenuous outdoor activity at midday and stay "
+                  "hydrated. Official warning status was not checked.",
+        "alert_sent": False,
+        "alert_message": "",
+    } for d in (5, 6, 7)]
+
+    fz_reply = json_text({
+        "hazard_type": "Extreme Heat",
+        "likelihood_score": 3,
+        "likelihood_reason": "Apparent temperature near 38 C forecast.",
+        "severity_score": 3,
+        "severity_reason": "Heat stress for outdoor activity.",
+        "exposure_score": 2,
+        "exposure_reason": "Outdoor workers during the afternoon.",
+        "duration_score": 3,
+        "duration_reason": "About five hours above 35 C apparent.",
+        "geographic_impact_score": 2,
+        "geographic_impact_reason": "City-wide forecast point only.",
+        "alert_recommendation": "MONITOR",
+        "advice": "Limit strenuous outdoor activity in the afternoon. "
+                  "Official warning status was not checked.",
+        "reasoning": "Heat screening triggered by the forecast.",
+        "recommended_actions": ["Schedule outdoor work for mornings"],
+        "limitations": ["Single forecast point for Dubai"],
+        "missing_evidence": ["Population exposure data"],
+        "sources": ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"],
+    })
+
+    class FzResponse:
+        def __init__(self, status_code=200, payload=None, text="",
+                     json_error=None):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+            self.headers = {}
+            self._json_error = json_error
+
+        def json(self):
+            if self._json_error is not None:
+                raise self._json_error
+
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    def fz_groq_ok():
+        return FzResponse(payload={
+            "choices": [{
+                "message": {"content": fz_reply},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 4100, "completion_tokens": 640,
+                      "total_tokens": 4740,
+                      "completion_tokens_details": {"reasoning_tokens": 120}},
+        })
+
+    class FzTransport:
+        """Groq POSTs answered offline; history GETs answered or failed."""
+
+        def __init__(self, history_get=None):
+            self.history_get = history_get
+            self.posts = []
+            self.gets = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append({"url": url, "json": json})
+            return fz_groq_ok()
+
+        def get(self, url, params=None, timeout=None):
+            self.gets.append(url)
+            return self.history_get(url, params)
+
+    def fz_pipeline(transport, sheet_url, history_patch=None):
+        printed = io.StringIO()
+        settings = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_fz_test_key",
+            "SHEET_URL": sheet_url,
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: fz_heat_weather(),
+        }
+
+        if history_patch is not None:
+            settings["tool_get_history"] = history_patch
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = fz_override(settings, run)
+
+        dry_log = io.StringIO()
+        dry_transport = FzTransport()
+
+        def dry_run():
+            with contextlib.redirect_stdout(dry_log):
+                run_agent_job(dry=True)
+
+        fz_override(
+            {
+                "run_weather_agent": lambda: (decision, used),
+                "HTTP": dry_transport,
+                "SHEET_URL": sheet_url,
+            },
+            dry_run,
+        )
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "dry_log": dry_log.getvalue(),
+            "dry_posts": dry_transport.posts,
+        }
+
+    # A. Realistic three-record history + heat: fits, strict request,
+    # validates locally, no external writes or email.
+    fz_ok_transport = FzTransport(
+        history_get=lambda url, params: FzResponse(payload=fz_history)
+    )
+    fz_ok = fz_pipeline(fz_ok_transport, "https://sheet.invalid/exec")
+    fz_decision = fz_ok["decision"]
+    fz_payload = (
+        fz_ok_transport.posts[0]["json"] if fz_ok_transport.posts else {}
+    )
+    fz_request = serialized_request(fz_payload.get("messages", []))
+
+    check(
+        "Realistic-history heat request is within every budget",
+        set(fz_decision["hazard_screening"]) == {"HEAT"}
+        and fz_decision["history_status"] == "AVAILABLE"
+        and len(fz_ok_transport.posts) == 1
+        and len(fz_request) <= MAX_REQUEST_CHARS
+        and estimate_tokens(fz_request) + MAX_COMPLETION_TOKENS
+        <= MAX_ESTIMATED_REQUEST_TOKENS
+        and fz_decision["groq_usage"]["estimated_input_tokens"]
+        + fz_decision["groq_usage"]["completion_allowance"]
+        <= MAX_ESTIMATED_REQUEST_TOKENS,
+    )
+
+    check(
+        "Realistic-history heat request uses the strict schema settings",
+        fz_payload.get("response_format") == RESPONSE_FORMAT
+        and fz_payload["response_format"]["json_schema"]["strict"] is True
+        and fz_payload.get("max_completion_tokens") == 1000
+        and fz_payload.get("reasoning_effort") == "low"
+        and fz_payload.get("include_reasoning") is False
+        and fz_payload.get("model") == MODEL,
+    )
+
+    check(
+        "Realistic-history heat request carries the history evidence",
+        "recent_agent_history" in fz_request
+        and "Limit strenuous outdoor activity at midday" in fz_request
+        and "6.1 Extreme Heat" in fz_request,
+    )
+
+    check(
+        "Realistic-history heat response validates and is scored",
+        fz_decision["risk_score"] == 7.5
+        and fz_decision["risk_band"] == "MODERATE"
+        and fz_decision["response_diagnostics"] == {}
+        and fz_decision["sources"]
+        == ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"]
+        and fz_decision["alert_recommendation"] == "MONITOR"
+        and fz_decision["assessment_status"] == "INCOMPLETE"
+        and [r["code"] for r in fz_decision["incomplete_reasons"]]
+        == ["OFFICIAL_WARNINGS_NOT_VERIFIED"],
+    )
+
+    check(
+        "Realistic-history heat run makes no external write or email",
+        fz_ok["dry_posts"] == []
+        and fz_decision["send_alert"] is False
+        and fz_decision["notification_status"] == "NOT_SENT"
+        and "DRY RUN: No data was sent to Google Sheets." in fz_ok["dry_log"]
+        and "DRY RUN: No email was sent." in fz_ok["dry_log"]
+        and "gsk_fz_test_key" not in fz_ok["log"] + fz_ok["dry_log"],
+    )
+
+    # B. A synthetic secret SHEET_URL inside requests exceptions never
+    # reaches logs or assessment output.
+    fz_secret_url = (
+        "https://script.google.com/macros/s/FZ-SECRET-SHEET-MARKER/exec"
+    )
+    fz_with_query = fz_secret_url + "?action=history&n=3&FZ-QUERY-MARKER=1"
+
+    def fz_http_error():
+        response = FzResponse(status_code=404)
+        return requests.HTTPError(
+            f"404 Client Error: Not Found for url: {fz_with_query}",
+            response=response,
+        )
+
+    fz_failures = {
+        "HTTP error": (lambda: fz_http_error(),
+                       "history service returned HTTP 404"),
+        "connection error": (
+            lambda: requests.ConnectionError(
+                "HTTPSConnectionPool(host='script.google.com', port=443): "
+                f"Max retries exceeded with url: {fz_with_query}"
+            ),
+            "history service could not be reached",
+        ),
+        "timeout": (
+            lambda: requests.Timeout(f"Read timed out: {fz_with_query}"),
+            "history request timed out",
+        ),
+        "generic request error": (
+            lambda: requests.RequestException(f"failed {fz_with_query}"),
+            "history request failed",
+        ),
+    }
+
+    def fz_marker_free(text):
+        return "FZ-SECRET" not in text and "FZ-QUERY" not in text
+
+    for label, (make_error, expected) in fz_failures.items():
+        def failing_get(url, params, make_error=make_error):
+            raise make_error()
+
+        direct = fz_override(
+            {"SHEET_URL": fz_secret_url,
+             "HTTP": FzTransport(history_get=failing_get)},
+            tool_get_history,
+        )
+        run = fz_pipeline(FzTransport(history_get=failing_get),
+                          fz_secret_url)
+        surfaces = (
+            run["log"] + run["dry_log"] + json_text(run["decision"])
+        )
+
+        check(
+            f"History {label}: sanitised description only",
+            direct == {"error": expected},
+        )
+
+        check(
+            f"History {label}: secret URL never reaches logs or output",
+            fz_marker_free(surfaces)
+            and f"History unavailable: {expected}" in run["log"]
+            and run["decision"]["history_status"] == "UNAVAILABLE"
+            and any(
+                "history was unavailable" in item
+                for item in run["decision"]["limitations"]
+            )
+            and run["dry_posts"] == [],
+        )
+
+    def fz_bad_json(url, params):
+        return FzResponse(json_error=ValueError(
+            f"Expecting value near {fz_with_query}"
+        ))
+
+    fz_json = fz_override(
+        {"SHEET_URL": fz_secret_url, "HTTP": FzTransport(fz_bad_json)},
+        tool_get_history,
+    )
+
+    check(
+        "History invalid JSON: sanitised description only",
+        fz_json == {"error": "history response could not be read as JSON"}
+        and fz_marker_free(json_text(fz_json)),
+    )
+
+    check(
+        "History error descriptions never use the exception text",
+        describe_history_error(
+            requests.RequestException(fz_with_query)
+        ) == "history request failed"
+        and describe_history_error(
+            requests.HTTPError(fz_with_query)
+        ) == "history service returned an HTTP error"
+        and fz_marker_free(
+            describe_history_error(ValueError(fz_with_query))
+        ),
+    )
+
+    check(
+        "json_validate_failed description does not infer a cause",
+        "completion" not in GROQ_ERROR_CODE_DESCRIPTIONS[
+            "json_validate_failed"
+        ]
+        and "allowance" not in GROQ_ERROR_CODE_DESCRIPTIONS[
+            "json_validate_failed"
+        ]
+        and "validate against the response schema"
+        in GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"],
     )
 
     # agent-dry must not POST to Sheets or send email.
