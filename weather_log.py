@@ -456,6 +456,11 @@ def summarize_weather(weather):
 # response is received). Never contains credentials or message text.
 LAST_GROQ_USAGE = {}
 
+# Program-generated shape summary of the last model response that
+# failed validation. Holds field identifiers, counts, JSON type names
+# and booleans only, never model-generated values or key names.
+LAST_RESPONSE_DIAGNOSTICS = {}
+
 
 def usage_number(usage, key):
     value = usage.get(key) if isinstance(usage, dict) else None
@@ -490,8 +495,9 @@ def ask_groq(messages, temperature=0.1):
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is missing.")
 
-    serialized_messages = json_text(messages)
-    estimated_input_tokens = estimate_tokens(serialized_messages)
+    # Both guards measure the messages and the response schema.
+    request_text = serialized_request(messages)
+    estimated_input_tokens = estimate_tokens(request_text)
 
     estimated_total = (
         estimated_input_tokens + MAX_COMPLETION_TOKENS
@@ -501,12 +507,14 @@ def ask_groq(messages, temperature=0.1):
     print("Estimated input tokens:", estimated_input_tokens)
     print("Completion token allowance:", MAX_COMPLETION_TOKENS)
     print("Estimated total tokens:", estimated_total)
-    print("Request characters:", len(serialized_messages))
+    print("Request characters:", len(request_text))
+    print("Response schema characters:", len(json_text(RESPONSE_FORMAT)))
 
-    if len(serialized_messages) > MAX_REQUEST_CHARS:
+    if len(request_text) > MAX_REQUEST_CHARS:
         raise ValueError(
-            "Groq request blocked: prompt exceeds the configured "
-            f"{MAX_REQUEST_CHARS}-character limit."
+            "Groq request blocked: request (messages and response "
+            f"schema) exceeds the configured {MAX_REQUEST_CHARS}-"
+            "character limit."
         )
 
     if estimated_total > MAX_ESTIMATED_REQUEST_TOKENS:
@@ -524,7 +532,8 @@ def ask_groq(messages, temperature=0.1):
         # openai/gpt-oss-20b; reasoning_format is not supported there.
         "reasoning_effort": "low",
         "include_reasoning": False,
-        "response_format": {"type": "json_object"},
+        # Strict structured outputs: every field required, no extras.
+        "response_format": RESPONSE_FORMAT,
     }
 
     response = HTTP.post(
@@ -1641,6 +1650,187 @@ RESPONSE_FIELDS = (
     "sources",
 )
 
+SCORE_FIELDS = tuple(
+    field for field in RESPONSE_FIELDS if field.endswith("_score")
+)
+LIST_FIELDS = (
+    "recommended_actions", "limitations", "missing_evidence", "sources",
+)
+
+
+def build_response_schema():
+    """
+    Strict JSON Schema for the model response, built from
+    RESPONSE_FIELDS (Groq structured outputs, strict mode). Every field
+    is required and no other field is allowed. Scores use Groq's
+    documented union-with-null form; the 1-5 range is not expressible in
+    the documented subset and stays enforced by validate_decision.
+    """
+    properties = {}
+
+    for field in RESPONSE_FIELDS:
+        if field in SCORE_FIELDS:
+            properties[field] = {"type": ["integer", "null"]}
+        elif field in LIST_FIELDS:
+            properties[field] = {"type": "array", "items": {"type": "string"}}
+        elif field == "alert_recommendation":
+            properties[field] = {
+                "type": "string",
+                "enum": sorted(VALID_RECOMMENDATIONS),
+            }
+        else:
+            properties[field] = {"type": "string"}
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(RESPONSE_FIELDS),
+        "additionalProperties": False,
+    }
+
+
+RESPONSE_SCHEMA_NAME = "weather_safety_assessment"
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": RESPONSE_SCHEMA_NAME,
+        "strict": True,
+        "schema": build_response_schema(),
+    },
+}
+
+
+def serialized_request(messages):
+    """
+    The text the request guards measure: the messages and the response
+    schema, since both are sent to Groq.
+    """
+    return json_text({"messages": messages, "response_format": RESPONSE_FORMAT})
+
+
+def json_type_name(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "other"
+
+
+def schema_value_matches(field, value):
+    """Whether a value has the type the response schema declares."""
+    if field in SCORE_FIELDS:
+        return value is None or type(value) is int
+    if field in LIST_FIELDS:
+        return isinstance(value, list) and all(
+            isinstance(item, str) for item in value
+        )
+    if field == "alert_recommendation":
+        return isinstance(value, str) and value in VALID_RECOMMENDATIONS
+    return isinstance(value, str)
+
+
+SCHEMA_TYPE_LABELS = {
+    field: (
+        "integer|null" if field in SCORE_FIELDS
+        else "array<string>" if field in LIST_FIELDS
+        else "string(enum)" if field == "alert_recommendation"
+        else "string"
+    )
+    for field in RESPONSE_FIELDS
+}
+
+
+def _normalised_key(text):
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _nested_normalised_keys(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield _normalised_key(key)
+
+            yield from _nested_normalised_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _nested_normalised_keys(item)
+
+
+def response_shape_diagnostics(response):
+    """
+    Program-generated summary of a model response's shape. It reports
+    schema field identifiers, counts, JSON type names and booleans
+    only. Unexpected (model-chosen) key names and all values are never
+    included.
+    """
+    if not isinstance(response, dict):
+        return {"response_type": json_type_name(response)}
+
+    unexpected = [key for key in response if key not in RESPONSE_FIELDS]
+    missing = [field for field in RESPONSE_FIELDS if field not in response]
+
+    unexpected_types = {}
+
+    for key in unexpected:
+        type_name = json_type_name(response[key])
+        unexpected_types[type_name] = unexpected_types.get(type_name, 0) + 1
+
+    unexpected_normalised = [
+        _normalised_key(key) for key in unexpected if isinstance(key, str)
+    ]
+    nested = set()
+
+    for value in response.values():
+        nested.update(_nested_normalised_keys(value))
+
+    variants = {}
+
+    for field in missing:
+        target = _normalised_key(field)
+        variants[field] = {
+            "case_or_separator_variant": target in unexpected_normalised,
+            "prefix_or_suffix_variant": any(
+                key != target and len(key) >= 4
+                and (
+                    key.startswith(target) or key.endswith(target)
+                    or target.startswith(key) or target.endswith(key)
+                )
+                for key in unexpected_normalised
+            ),
+            "found_nested": target in nested,
+        }
+
+    return {
+        "top_level_key_count": len(response),
+        "missing_required_count": len(missing),
+        "missing_required": missing,
+        "unexpected_key_count": len(unexpected),
+        "unexpected_value_types": dict(sorted(unexpected_types.items())),
+        "program_owned_keys": sorted(PROGRAM_OWNED_FIELDS & set(response)),
+        "missing_field_variants": variants,
+        "wrong_type_fields": [
+            {
+                "field": field,
+                "expected": SCHEMA_TYPE_LABELS[field],
+                "received": json_type_name(response[field]),
+            }
+            for field in RESPONSE_FIELDS
+            if field in response
+            and not schema_value_matches(field, response[field])
+        ],
+    }
+
 
 def validate_decision(decision, retrieved_sections):
     if not isinstance(decision, dict):
@@ -1865,6 +2055,7 @@ PROGRAM_OWNED_FIELDS = frozenset({
     "weather_summary", "weather_source", "weather_retrieval_status",
     "weather_data_timestamp", "assessment_timestamp", "city",
     "timezone", "history_checked", "history_status",
+    "response_diagnostics",
 })
 
 
@@ -2028,15 +2219,6 @@ Requirements:
 10. In sources, cite exact policy section titles.
 11. Return a single JSON object only.
 
-Return exactly these 18 keys in one JSON object.
-Plain-text strings (never arrays or objects): hazard_type, advice,
-reasoning, alert_recommendation, likelihood_reason, severity_reason,
-exposure_reason, duration_reason, geographic_impact_reason.
-Integer scores: likelihood_score, severity_score, exposure_score,
-duration_score, geographic_impact_score.
-Arrays of strings: recommended_actions, limitations, missing_evidence,
-sources.
-
 Each score must be an integer from 1 to 5 when evidence supports it.
 If evidence for a dimension is insufficient, return null for that
 score, never a guessed value, and explain why in its rationale and in
@@ -2116,13 +2298,24 @@ def assess_weather(weather, history, policy, retrieved_sections):
         },
     ]
 
+    LAST_RESPONSE_DIAGNOSTICS.clear()
+
     response = ask_groq(messages)
     decision = parse_json_response(response)
 
-    decision = validate_decision(
-        decision,
-        retrieved_sections,
-    )
+    # Computed before validation, which normalises some values.
+    diagnostics = response_shape_diagnostics(decision)
+
+    try:
+        decision = validate_decision(
+            decision,
+            retrieved_sections,
+        )
+    except ValueError:
+        LAST_RESPONSE_DIAGNOSTICS.update(diagnostics)
+        print("\nRESPONSE SHAPE DIAGNOSTICS (program-generated; no model text)")
+        print(json_text(diagnostics))
+        raise
 
     # Checked on the model's own text, before the guard adds ours. The
     # warning status is the program's: no official feed is integrated.
@@ -2189,6 +2382,7 @@ def run_weather_agent():
     # None until screening runs, so a failure before it is not read as
     # "no hazards".
     hazards = None
+    LAST_RESPONSE_DIAGNOSTICS.clear()
 
     history_status = "NOT_CHECKED"
 
@@ -2282,6 +2476,7 @@ def run_weather_agent():
         decision["weather_summary"] = summarize_weather(weather)
         decision["hazard_screening"] = hazards
         decision["groq_usage"] = dict(LAST_GROQ_USAGE)
+        decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
 
         apply_evidence_uncertainty(decision, hazards)
 
@@ -2349,6 +2544,7 @@ def run_weather_agent():
 
         decision["official_warning_status"] = "NOT_CHECKED"
         decision["groq_usage"] = dict(LAST_GROQ_USAGE)
+        decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
         decision["hazard_screening"] = hazards
 
         decision["evidence_quality"] = "E0"
@@ -3486,7 +3682,7 @@ def run_tests():
         sections, messages = build_request(
             {code: ["t"] for code in hazards}
         )
-        serialized = json_text(messages)
+        serialized = serialized_request(messages)
 
         return (
             len(serialized) <= MAX_REQUEST_CHARS
@@ -3510,9 +3706,11 @@ def run_tests():
         fits_all_budgets(["HEAT", "WIND_DUST"]),
     )
 
+    # With the response schema counted, five hazards no longer fit.
     check(
-        "All five hazards together fit every budget",
-        fits_all_budgets(list(HAZARD_POLICY_TITLES)),
+        "All five hazards together are blocked once the schema is "
+        "counted",
+        not fits_all_budgets(list(HAZARD_POLICY_TITLES)),
     )
 
     uncertain_all = {
@@ -3655,7 +3853,7 @@ def run_tests():
         and benign_decision["alert_recommendation"] == "MONITOR"
         and benign_decision["send_alert"] is False
         and len(sent_messages) == 1
-        and len(json_text(sent_messages[0])) <= MAX_REQUEST_CHARS,
+        and len(serialized_request(sent_messages[0])) <= MAX_REQUEST_CHARS,
     )
 
     sent_messages.clear()
@@ -4338,54 +4536,49 @@ def run_tests():
         ),
     )
 
-    # Contract: the prompt, the validator and the payload agree.
-    # Parse the typed key groups; a missing group yields no keys, so
-    # an old or broken prompt fails these checks instead of crashing.
-    contract = re.search(
-        r"Return exactly these 18 keys(.*?)Each score must be",
-        SYSTEM_PROMPT,
-        re.S,
-    )
-    prompt_text = contract.group(1) if contract else ""
-
-    def adv_group_keys(label, following):
-        match = re.search(
-            re.escape(label) + r"[^:]*:(.*?)(?:" + following + r"|\Z)",
-            prompt_text,
-            re.S,
-        )
-        listed = match.group(1) if match else ""
-        return [key for key in re.split(r"[\s,.]+", listed) if key]
-
-    string_keys = adv_group_keys("Plain-text strings", "Integer scores")
-    score_keys = adv_group_keys("Integer scores", "Arrays of strings")
-    array_keys = adv_group_keys("Arrays of strings", r"\Z")
-    prompt_keys = string_keys + score_keys + array_keys
+    # Contract: the response schema (sent with every request and
+    # enforced by Groq strict mode) and the validator agree.
+    adv_schema = build_response_schema()
 
     check(
-        "Prompt lists exactly the keys the validator requires",
-        sorted(prompt_keys) == sorted(adv_keys)
-        and len(set(prompt_keys)) == 18,
+        "Schema lists exactly the keys the validator requires",
+        sorted(adv_schema["required"]) == sorted(adv_keys)
+        and sorted(adv_schema["properties"]) == sorted(adv_keys)
+        and len(set(adv_schema["required"])) == 18,
     )
 
+    adv_string_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == "string"
+    ]
+    adv_score_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == ["integer", "null"]
+    ]
+    adv_array_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == "array"
+    ]
+
     check(
-        "Prompt states the type of every key",
-        "never arrays or objects" in prompt_text
-        and {"hazard_type", "advice", "reasoning",
-             "alert_recommendation"} <= set(string_keys)
-        and set(score_keys)
+        "Schema states the type of every key",
+        {"hazard_type", "advice", "reasoning",
+         "alert_recommendation"} <= set(adv_string_keys)
+        and set(adv_score_keys)
         == {k for k in adv_keys if k.endswith("_score")}
-        and set(array_keys)
+        and set(adv_array_keys)
         == {"recommended_actions", "limitations", "missing_evidence",
             "sources"}
+        and len(adv_string_keys) + len(adv_score_keys)
+        + len(adv_array_keys) == 18
         and all(
-            isinstance(adv_response()[key], str) for key in string_keys
+            isinstance(adv_response()[key], str) for key in adv_string_keys
         )
         and all(
-            type(adv_response()[key]) is int for key in score_keys
+            type(adv_response()[key]) is int for key in adv_score_keys
         )
         and all(
-            isinstance(adv_response()[key], list) for key in array_keys
+            isinstance(adv_response()[key], list) for key in adv_array_keys
         ),
     )
 
@@ -4974,7 +5167,7 @@ def run_tests():
                 pass
 
         abc_override({"ask_groq": capture}, assemble)
-        text = json_text(captured[0])
+        text = serialized_request(captured[0])
 
         return len(text), estimate_tokens(text) + MAX_COMPLETION_TOKENS
 
@@ -5020,12 +5213,19 @@ def run_tests():
         ) == "exposure_score, duration_score, geographic_impact_score",
     )
 
-    uncertain_weather = abc_weather(visibility=None)
+    # No heat here, so the request fits the budgets and reaches
+    # validation, where the evidence-gap reason is recorded.
+    uncertain_weather = abc_weather(
+        visibility=None, temperature_2m=22, apparent_temperature=22
+    )
     for record in uncertain_weather["hourly_forecast_next_24h"]:
         record["visibility"] = None
+        record["temperature"] = 22
+        record["apparent_temperature"] = 22
 
     uncertain_result, _, _ = abc_pipeline(
-        abc_reply(sources=["6.1 Extreme Heat"]), weather=uncertain_weather
+        abc_reply(sources=["9. Official Warning Override"]),
+        weather=uncertain_weather,
     )
 
     check(
@@ -5183,6 +5383,15 @@ def run_tests():
 
         return weather
 
+    def rv_heat_only_weather():
+        weather = rv_heat_wind_weather()
+
+        for record in weather["hourly_forecast_next_24h"]:
+            record["wind"] = 12.0
+            record["gust"] = 25.0
+
+        return weather
+
     rv_history = [{
         "timestamp": "t" * 60, "city": "c" * 60, "advice": "a" * 500,
         "alert_sent": False, "alert_message": "m" * 500,
@@ -5255,7 +5464,7 @@ def run_tests():
                 pass
 
         rv_override({"ask_groq": capture}, assemble)
-        text = json_text(captured[0])
+        text = serialized_request(captured[0])
 
         return (
             len(text) <= MAX_REQUEST_CHARS
@@ -5268,8 +5477,8 @@ def run_tests():
     for label, hazards, expected in (
         ("no hazard", (), True),
         ("heat", ("HEAT",), True),
-        ("heat + wind", ("HEAT", "WIND_DUST"), True),
-        ("heat + wind + rain", ("HEAT", "WIND_DUST", "RAIN_FLOOD"), True),
+        ("heat + wind", ("HEAT", "WIND_DUST"), False),
+        ("heat + wind + rain", ("HEAT", "WIND_DUST", "RAIN_FLOOD"), False),
         ("four hazards", rv_four, False),
         ("five hazards", tuple(HAZARD_POLICY_TITLES), False),
     ):
@@ -5304,7 +5513,7 @@ def run_tests():
             self.posts.append(url)
             return RvResponse()
 
-    rv_overhead = len(json_text([{"role": "user", "content": ""}]))
+    rv_overhead = len(serialized_request([{"role": "user", "content": ""}]))
 
     def rv_message(serialized_length):
         return [{
@@ -5358,7 +5567,7 @@ def run_tests():
     check(
         "Token guard: request at the cap is sent (control)",
         error == "" and len(posts) == 1
-        and estimate_tokens(json_text(rv_message(rv_at_cap)))
+        and estimate_tokens(serialized_request(rv_message(rv_at_cap)))
         + MAX_COMPLETION_TOKENS == MAX_ESTIMATED_REQUEST_TOKENS,
     )
 
@@ -5438,7 +5647,10 @@ def run_tests():
 
     four_decision, four_transport = rv_pipeline(rv_weather())
     five_decision, five_transport = rv_pipeline(rv_weather(low=8.0))
-    fit_decision, fit_transport = rv_pipeline(rv_heat_wind_weather())
+    heat_wind_decision, heat_wind_transport = rv_pipeline(
+        rv_heat_wind_weather()
+    )
+    fit_decision, fit_transport = rv_pipeline(rv_heat_only_weather())
 
     check(
         "Four-hazard request is rejected before Groq (INCOMPLETE)",
@@ -5446,7 +5658,10 @@ def run_tests():
         and four_transport.posts == []
         and four_decision["assessment_status"] == "INCOMPLETE"
         and four_decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
-        and "token budget" in four_decision["reasoning"]
+        and (
+            "token budget" in four_decision["reasoning"]
+            or "character limit" in four_decision["reasoning"]
+        )
         and [r["code"] for r in four_decision["incomplete_reasons"]]
         == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
     )
@@ -5461,8 +5676,19 @@ def run_tests():
     )
 
     check(
-        "Heat + wind request reaches Groq once and is assessed",
-        set(fit_decision["hazard_screening"]) == {"HEAT", "WIND_DUST"}
+        "Heat + wind with worst-case history is rejected before Groq "
+        "once the schema is counted",
+        set(heat_wind_decision["hazard_screening"])
+        == {"HEAT", "WIND_DUST"}
+        and heat_wind_transport.posts == []
+        and heat_wind_decision["assessment_status"] == "INCOMPLETE"
+        and heat_wind_decision["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Heat-only request reaches Groq once and is assessed",
+        set(fit_decision["hazard_screening"]) == {"HEAT"}
         and len(fit_transport.posts) == 1
         and fit_decision["groq_usage"]["prompt_tokens"] == 3239
         and fit_decision["assessment_status"] == "INCOMPLETE"
@@ -5476,14 +5702,14 @@ def run_tests():
         body.update(extra)
         return json_text(body)
 
-    spoofed, _ = rv_pipeline(rv_heat_wind_weather(), rv_reply_with(
+    spoofed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         official_warning_status="VERIFIED",
         advice="No official heat advisory is in effect.",
     ))
-    injected, _ = rv_pipeline(rv_heat_wind_weather(), rv_reply_with(
+    injected, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         incomplete_reasons=[{"code": "NONE", "detail": "all clear"}],
     ))
-    hidden, _ = rv_pipeline(rv_heat_wind_weather(), rv_reply_with(
+    hidden, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
         notes={"extra": ["Fine.", "There are no warnings for Dubai."]},
     ))
 
@@ -5558,7 +5784,7 @@ def run_tests():
         }),
     )
 
-    keyed, _ = rv_pipeline(rv_heat_wind_weather(), rv_reply_with(**{
+    keyed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(**{
         "NCM has not issued any warning": True,
     }))
 
@@ -5572,10 +5798,13 @@ def run_tests():
     )
 
     check(
-        "Response schema constant matches the prompt and validator",
+        "Response schema constant matches the sent schema and validator",
         len(RESPONSE_FIELDS) == 18
         and len(set(RESPONSE_FIELDS)) == 18
-        and all(field in SYSTEM_PROMPT for field in RESPONSE_FIELDS),
+        and list(build_response_schema()["properties"])
+        == list(RESPONSE_FIELDS)
+        and RESPONSE_FORMAT["json_schema"]["schema"]
+        == build_response_schema(),
     )
 
     for text in (
@@ -5622,6 +5851,593 @@ def run_tests():
                 four_decision, five_decision, spoofed, injected, hidden,
             )
         ),
+    )
+
+    # ------------------------------------------------------------
+    # Strict structured outputs and schema-failure diagnostics
+    # (self-contained, offline).
+    # ------------------------------------------------------------
+    def ss_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def ss_copy(value):
+        return json.loads(json_text(value))
+
+    ss_format = RESPONSE_FORMAT
+    ss_schema = ss_format["json_schema"]["schema"]
+
+    check(
+        "Response format is strict json_schema with a name",
+        ss_format["type"] == "json_schema"
+        and ss_format["json_schema"]["strict"] is True
+        and ss_format["json_schema"]["name"] == RESPONSE_SCHEMA_NAME
+        and set(ss_format["json_schema"]) == {"name", "strict", "schema"},
+    )
+
+    check(
+        "Schema requires exactly the 18 RESPONSE_FIELDS, in order",
+        ss_schema["type"] == "object"
+        and list(ss_schema["properties"]) == list(RESPONSE_FIELDS)
+        and ss_schema["required"] == list(RESPONSE_FIELDS)
+        and ss_schema["additionalProperties"] is False,
+    )
+
+    check(
+        "Scores are nullable integers (documented union with null)",
+        len(SCORE_FIELDS) == 5
+        and all(
+            ss_schema["properties"][field] == {"type": ["integer", "null"]}
+            for field in SCORE_FIELDS
+        ),
+    )
+
+    check(
+        "alert_recommendation is limited to the permitted values",
+        ss_schema["properties"]["alert_recommendation"] == {
+            "type": "string", "enum": sorted(VALID_RECOMMENDATIONS),
+        },
+    )
+
+    check(
+        "List fields are arrays of strings; all others are strings",
+        all(
+            ss_schema["properties"][field]
+            == {"type": "array", "items": {"type": "string"}}
+            for field in LIST_FIELDS
+        )
+        and all(
+            ss_schema["properties"][field] == {"type": "string"}
+            for field in RESPONSE_FIELDS
+            if field not in SCORE_FIELDS
+            and field not in LIST_FIELDS
+            and field != "alert_recommendation"
+        ),
+    )
+
+    def ss_keywords(node):
+        found = set()
+
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key != "properties":
+                    found.add(key)
+                    found |= ss_keywords(value)
+                else:
+                    for item in value.values():
+                        found |= ss_keywords(item)
+        elif isinstance(node, list):
+            for item in node:
+                found |= ss_keywords(item)
+
+        return found
+
+    check(
+        "Schema uses only documented strict-mode keywords",
+        ss_keywords(ss_schema) <= {
+            "type", "properties", "required", "additionalProperties",
+            "items", "enum",
+        },
+    )
+
+    # Schema types and the validator's type checks agree, field by field.
+    ss_samples = {
+        "string": "x", "integer": 3, "null": None, "array": ["x"],
+        "object": {"x": "y"},
+    }
+
+    def ss_declared(field):
+        declared = ss_schema["properties"][field]["type"]
+        return declared if isinstance(declared, list) else [declared]
+
+    check(
+        "Every field accepts its schema type and rejects the others",
+        all(
+            schema_value_matches(
+                field,
+                sorted(VALID_RECOMMENDATIONS)[0]
+                if field == "alert_recommendation" and kind == "string"
+                else ss_samples[kind],
+            )
+            == (kind in ss_declared(field))
+            for field in RESPONSE_FIELDS
+            for kind in ss_samples
+        ),
+    )
+
+    # The removed type paragraph is fully covered by the schema; every
+    # semantic instruction remains in the prompt.
+    ss_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Prompt no longer duplicates the schema type paragraph",
+        "Return exactly these 18 keys" not in ss_prompt
+        and "Plain-text strings" not in ss_prompt
+        and "Arrays of strings" not in ss_prompt,
+    )
+
+    for phrase in (
+        "Follow the supplied policy sections",
+        "Never invent weather measurements, official warnings, "
+        "regulatory requirements, thresholds or geographic information",
+        "Assess only the supplied city and evidence",
+        "Identify hazards from actual measurements and forecasts",
+        "using the scale definitions in the supplied policy",
+        "separate evidence-based rationale for each",
+        "Never treat missing evidence as a low score",
+        "Official warning status is NOT_CHECKED",
+        "Never state or imply that any official warning or advisory is, "
+        "or is not, in effect",
+        "Open-Meteo is not an official UAE warning authority",
+        "Distinguish current observations, forecasts and historical "
+        "context",
+        "Do not assume all residents or workers have equal exposure",
+        "Previous alerts must not suppress a new or different hazard",
+        "Do not recommend an alert solely because a value is unusual",
+        "Use only recommendation values defined in the supplied policy",
+        "The assessment is never a completed safety clearance",
+        "In sources, cite exact policy section titles",
+        "Return a single JSON object only",
+        "Each score must be an integer from 1 to 5 when evidence "
+        "supports it",
+        "return null for that score, never a guessed value, and explain "
+        "why in its rationale and in limitations",
+    ):
+        check(
+            f"Prompt keeps instruction: {phrase[:60]}",
+            phrase in ss_prompt,
+        )
+
+    # Independent reference checker for the documented subset.
+    def ss_type_ok(value, type_name):
+        return {
+            "string": isinstance(value, str),
+            "integer": type(value) is int,
+            "null": value is None,
+            "array": isinstance(value, list),
+            "object": isinstance(value, dict),
+        }[type_name]
+
+    def ss_conforms(value, schema):
+        types = schema.get("type")
+        types = types if isinstance(types, list) else [types]
+
+        if not any(ss_type_ok(value, t) for t in types):
+            return False
+
+        if "enum" in schema and value not in schema["enum"]:
+            return False
+
+        if isinstance(value, list) and "items" in schema:
+            return all(ss_conforms(item, schema["items"]) for item in value)
+
+        if isinstance(value, dict) and "properties" in schema:
+            if schema.get("additionalProperties") is False and (
+                set(value) - set(schema["properties"])
+            ):
+                return False
+
+            if any(field not in value for field in schema["required"]):
+                return False
+
+            return all(
+                ss_conforms(value[field], schema["properties"][field])
+                for field in schema["properties"]
+                if field in value
+            )
+
+        return True
+
+    def ss_response(**changes):
+        body = {
+            "hazard_type": "NONE",
+            "likelihood_score": 1, "likelihood_reason": "lr",
+            "severity_score": 1, "severity_reason": "sr",
+            "exposure_score": None, "exposure_reason": "er",
+            "duration_score": None, "duration_reason": "dr",
+            "geographic_impact_score": None,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "UNABLE_TO_ASSESS",
+            "advice": "Official warning status was not checked.",
+            "reasoning": "Three dimensions lack evidence.",
+            "recommended_actions": [], "limitations": [],
+            "missing_evidence": [],
+            "sources": ["16. Final Decision Rule"],
+        }
+        body.update(changes)
+        return body
+
+    ss_sections = [{"section": "16. Final Decision Rule", "text": "x"}]
+
+    def ss_validation_error(body):
+        try:
+            validate_decision(ss_copy(body), ss_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    ss_complete = ss_response()
+
+    check(
+        "Complete fixture conforms to the schema and validates",
+        ss_conforms(ss_complete, ss_schema)
+        and ss_validation_error(ss_complete) == ""
+        and response_shape_diagnostics(ss_complete)["missing_required"]
+        == []
+        and response_shape_diagnostics(ss_complete)["wrong_type_fields"]
+        == [],
+    )
+
+    for field in RESPONSE_FIELDS:
+        omitted = ss_response()
+        del omitted[field]
+        diagnostics = response_shape_diagnostics(omitted)
+
+        check(
+            f"Omitted field is non-conforming, rejected and diagnosed: "
+            f"{field}",
+            not ss_conforms(omitted, ss_schema)
+            and ss_validation_error(omitted)
+            == "Missing assessment fields: " + field
+            and diagnostics["missing_required"] == [field]
+            and diagnostics["missing_required_count"] == 1
+            and diagnostics["unexpected_key_count"] == 0,
+        )
+
+    for label, field, value in (
+        ("advice as array", "advice", ["a"]),
+        ("reasoning as object", "reasoning", {"text": "x"}),
+        ("score as string", "severity_score", "3"),
+        ("score as float", "likelihood_score", 2.5),
+        ("score as boolean", "exposure_score", True),
+        ("recommendation outside enum", "alert_recommendation", "ALERT"),
+        ("list as string", "limitations", "none"),
+        ("list with a number", "sources", [1]),
+    ):
+        body = ss_response(**{field: value})
+        wrong = response_shape_diagnostics(body)["wrong_type_fields"]
+
+        check(
+            f"Wrong type is non-conforming, rejected and diagnosed: "
+            f"{label}",
+            not ss_conforms(body, ss_schema)
+            and ss_validation_error(body) != ""
+            and [item["field"] for item in wrong] == [field],
+        )
+
+    extra = ss_response(notes="x")
+    nested = ss_response(notes={"reasoning": "x"})
+
+    check(
+        "Extra and nested keys are non-conforming",
+        not ss_conforms(extra, ss_schema)
+        and not ss_conforms(nested, ss_schema),
+    )
+
+    check(
+        "Null scores conform and are treated as unassessed",
+        ss_conforms(ss_complete, ss_schema)
+        and validate_decision(ss_copy(ss_complete), ss_sections)[
+            "risk_band"
+        ] == "UNASSESSED",
+    )
+
+    out_of_range = ss_response(likelihood_score=7)
+
+    check(
+        "Schema-conforming out-of-range score is still rejected locally",
+        ss_conforms(out_of_range, ss_schema)
+        and "Invalid risk dimension value" in ss_validation_error(
+            out_of_range
+        ),
+    )
+
+    # Diagnostics distinguish omission, renaming and nesting, and never
+    # contain model-chosen key names or values.
+    def ss_without_reasoning(**extra):
+        body = ss_response(**extra)
+        del body["reasoning"]
+        return body
+
+    ss_cases = {
+        "omitted": ss_without_reasoning(),
+        "case": ss_without_reasoning(Reasoning="SECRET-VALUE-1"),
+        "prefix": ss_without_reasoning(
+            assessment_reasoning="SECRET-VALUE-2"
+        ),
+        "nested": ss_without_reasoning(
+            summary_block={"reasoning": "SECRET-VALUE-3"}
+        ),
+    }
+    ss_diag = {
+        name: response_shape_diagnostics(body)
+        for name, body in ss_cases.items()
+    }
+
+    def ss_flags(name):
+        return ss_diag[name]["missing_field_variants"]["reasoning"]
+
+    check(
+        "Diagnostics: plain omission shows no variant",
+        ss_diag["omitted"]["missing_required"] == ["reasoning"]
+        and ss_diag["omitted"]["unexpected_key_count"] == 0
+        and not any(ss_flags("omitted").values()),
+    )
+
+    check(
+        "Diagnostics: case variant detected",
+        ss_flags("case")["case_or_separator_variant"]
+        and not ss_flags("case")["found_nested"]
+        and ss_diag["case"]["unexpected_value_types"] == {"string": 1},
+    )
+
+    check(
+        "Diagnostics: prefix variant detected",
+        ss_flags("prefix")["prefix_or_suffix_variant"]
+        and not ss_flags("prefix")["case_or_separator_variant"],
+    )
+
+    check(
+        "Diagnostics: nested key detected",
+        ss_flags("nested")["found_nested"]
+        and ss_diag["nested"]["unexpected_value_types"] == {"object": 1},
+    )
+
+    ss_diag_text = json_text(ss_diag)
+
+    check(
+        "Diagnostics never contain model key names or values",
+        not any(
+            marker in ss_diag_text
+            for marker in (
+                "SECRET-VALUE", "Reasoning", "assessment_reasoning",
+                "summary_block",
+            )
+        ),
+    )
+
+    check(
+        "Diagnostics name program-owned keys and non-object responses",
+        response_shape_diagnostics(
+            ss_response(official_warning_status="VERIFIED")
+        )["program_owned_keys"] == ["official_warning_status"]
+        and response_shape_diagnostics([1, 2])
+        == {"response_type": "array"},
+    )
+
+    check(
+        "response_diagnostics is a program-owned field",
+        "response_diagnostics" in PROGRAM_OWNED_FIELDS,
+    )
+
+    # Payload and guards: the schema is sent and counted.
+    class SsResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3898, "completion_tokens": 606,
+                          "total_tokens": 4504,
+                          "completion_tokens_details": {
+                              "reasoning_tokens": 105}},
+            }
+
+    class SsTransport:
+        def __init__(self, content="{}"):
+            self.content = content
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return SsResponse(self.content)
+
+    def ss_send(messages, **limits):
+        transport = SsTransport()
+        settings = {"GROQ_API_KEY": "gsk_ss_test_key", "HTTP": transport}
+        settings.update(limits)
+        outcome = {"error": ""}
+
+        def run():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ask_groq(messages)
+            except (ValueError, RuntimeError) as exc:
+                outcome["error"] = str(exc)
+
+        ss_override(settings, run)
+
+        return outcome["error"], transport.payloads
+
+    _, ss_payloads = ss_send([{"role": "user", "content": "hi"}])
+
+    check(
+        "Payload sends the strict response format, not json_object",
+        len(ss_payloads) == 1
+        and ss_payloads[0]["response_format"] == RESPONSE_FORMAT
+        and "json_object" not in json_text(ss_payloads[0])
+        and ss_payloads[0]["max_completion_tokens"]
+        == MAX_COMPLETION_TOKENS
+        and ss_payloads[0]["reasoning_effort"] == "low",
+    )
+
+    def ss_message_measuring(guard_length):
+        """Message whose guard-measured text has exactly this length."""
+        base = len(serialized_request([{"role": "user", "content": ""}]))
+        return [{"role": "user", "content": "x" * (guard_length - base)}]
+
+    ss_schema_chars = (
+        len(serialized_request([{"role": "user", "content": ""}]))
+        - len(json_text([{"role": "user", "content": ""}]))
+    )
+
+    over_by_schema = ss_message_measuring(MAX_REQUEST_CHARS + 1)
+    error, payloads = ss_send(
+        over_by_schema, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9
+    )
+
+    check(
+        "Character guard counts the schema (fits without it, blocked "
+        "with it, no Groq call)",
+        ss_schema_chars > 1000
+        and len(json_text(over_by_schema)) <= MAX_REQUEST_CHARS
+        and "character limit" in error
+        and payloads == [],
+    )
+
+    ss_token_cap_chars = int(
+        (MAX_ESTIMATED_REQUEST_TOKENS - MAX_COMPLETION_TOKENS) * 2.5
+    )
+    over_tokens = ss_message_measuring(ss_token_cap_chars + 2)
+    error, payloads = ss_send(over_tokens, MAX_REQUEST_CHARS=10 ** 9)
+
+    check(
+        "Token guard counts the schema (fits without it, blocked with "
+        "it, no Groq call)",
+        estimate_tokens(json_text(over_tokens)) + MAX_COMPLETION_TOKENS
+        <= MAX_ESTIMATED_REQUEST_TOKENS
+        and "token budget" in error
+        and payloads == [],
+    )
+
+    at_limit = ss_message_measuring(MAX_REQUEST_CHARS)
+    error, payloads = ss_send(at_limit, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9)
+
+    check(
+        "Request at the character limit including the schema is sent",
+        error == "" and len(payloads) == 1,
+    )
+
+    # Real pipeline: the incident response fails closed with
+    # diagnostics; a complete response records empty diagnostics.
+    def ss_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 22,
+                "apparent_temperature": 22, "precipitation": 0,
+                "wind_speed_10m": 5, "wind_gusts_10m": 10,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 24, "low": 18, "wind": 8,
+                               "gust": 15, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 22, "apparent_temperature": 22,
+                "humidity": 55, "precipitation": 0, "wind": 6,
+                "gust": 12, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def ss_pipeline(content):
+        transport = SsTransport(content)
+        printed = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()[0]
+
+        decision = ss_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_ss_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: ss_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+        return decision, printed.getvalue(), transport
+
+    incident, incident_output, incident_transport = ss_pipeline(
+        json_text(ss_without_reasoning(assessment_reasoning="SECRET-VALUE-9"))
+    )
+
+    check(
+        "Incident response fails closed with diagnostics recorded",
+        len(incident_transport.payloads) == 1
+        and incident["assessment_status"] == "INCOMPLETE"
+        and incident["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and incident["send_alert"] is False
+        and "Missing assessment fields: reasoning" in incident["reasoning"]
+        and incident["response_diagnostics"]["missing_required"]
+        == ["reasoning"]
+        and incident["response_diagnostics"]["missing_field_variants"][
+            "reasoning"
+        ]["prefix_or_suffix_variant"] is True
+        and incident["groq_usage"]["reasoning_tokens"] == 105,
+    )
+
+    check(
+        "Diagnostics are printed without model text or key",
+        "RESPONSE SHAPE DIAGNOSTICS" in incident_output
+        and "SECRET-VALUE" not in incident_output + json_text(incident)
+        and "assessment_reasoning" not in incident_output
+        and "gsk_ss_test_key" not in incident_output,
+    )
+
+    complete_run, complete_output, _ = ss_pipeline(json_text(ss_complete))
+
+    check(
+        "Complete response passes with empty diagnostics",
+        complete_run["response_diagnostics"] == {}
+        and "RESPONSE SHAPE DIAGNOSTICS" not in complete_output
+        and complete_run["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED"
+        in [r["code"] for r in complete_run["incomplete_reasons"]],
+    )
+
+    check(
+        "Claim guard still applies to schema-valid responses",
+        "UNVERIFIED_WARNING_CLAIM" in [
+            r["code"] for r in ss_pipeline(json_text(ss_response(
+                advice="No official heat advisory is in effect."
+            )))[0]["incomplete_reasons"]
+        ],
     )
 
     # agent-dry must not POST to Sheets or send email.
