@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import tempfile
 import json
 import math
 import ast
@@ -3701,6 +3702,210 @@ def run_tests():
         good["groq_usage"]["prompt_tokens"] == 1234
         and good["groq_usage"]["finish_reason"] == "stop"
         and good["assessment_status"] == "INCOMPLETE",
+    )
+
+    # ------------------------------------------------------------
+    # Regression: GitHub Actions run (main @ 587e465) failed with
+    #   ValueError: Required policy headings are missing from
+    #   guidelines.md: Purpose and Safety Principles; ...
+    # That code still required eight legacy headings that the v2.0
+    # guidelines.md does not contain. The scheduled run executed main,
+    # which did not yet have the numbered-section implementation.
+    # ------------------------------------------------------------
+    legacy_headings = (
+        "Purpose and Safety Principles",
+        "Source Authority and Validation",
+        "Risk Assessment and Alert Severity",
+        "Alert Decision Requirements",
+        "Alert Approval and Authorization Policy",
+        "Failure Handling and Safe Operation",
+        "Audit Trail and Compliance Controls",
+        "Final Safety Rule",
+    )
+    legacy_aliases = {name: (name,) for name in legacy_headings}
+    policy_headings = {
+        normalize_heading(title)
+        for title in hazard_policy["sections"]
+    }
+    legacy_missing = [
+        name for name in legacy_headings
+        if normalize_heading(name) not in policy_headings
+    ]
+
+    def legacy_requirement_error():
+        def attempt():
+            return error_of(
+                lambda: search_guidelines(
+                    hazard_policy, "heat", k=1
+                )
+            )
+
+        return with_globals(
+            {"MANDATORY_SECTION_ALIASES": legacy_aliases}, attempt
+        )
+
+    check(
+        "Legacy heading requirement reproduces the exact Actions error",
+        legacy_missing == list(legacy_headings)
+        and legacy_requirement_error()
+        == "Required policy headings are missing from guidelines.md: "
+        + "; ".join(legacy_headings),
+    )
+
+    legacy_normalized = {
+        normalize_heading(name) for name in legacy_headings
+    }
+    required_normalized = {
+        normalize_heading(alias)
+        for aliases in MANDATORY_SECTION_ALIASES.values()
+        for alias in aliases
+    }
+
+    check(
+        "Current mandatory sections contain none of the legacy headings",
+        not required_normalized & legacy_normalized
+        and required_normalized <= policy_headings,
+    )
+
+    def string_constants_outside_tests():
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        found = set()
+
+        for node in tree.body:
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "run_tests"
+            ):
+                continue
+
+            for child in ast.walk(node):
+                if (
+                    isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                ):
+                    found.add(normalize_heading(child.value))
+
+        return found
+
+    production_text = string_constants_outside_tests()
+
+    check(
+        "No production code requires a legacy heading",
+        not any(
+            legacy in text
+            for text in production_text
+            for legacy in legacy_normalized
+        ),
+    )
+
+    # Self-contained: own fixtures, own mocks, the real repository
+    # guidelines.md and the real run_weather_agent() retrieval path.
+    def run_real_retrieval_path():
+        fixture = {
+            "city": CITY,
+            "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-07T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-07T12:00",
+                "temperature_2m": 22, "apparent_temperature": 22,
+                "precipitation": 0, "wind_speed_10m": 5,
+                "wind_gusts_10m": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            },
+            "today_forecast": {
+                "high": 24, "low": 18, "wind": 8,
+                "gust": 15, "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [
+                {
+                    "time": "2026-11-07T13:00",
+                    "temperature": 22, "apparent_temperature": 22,
+                    "precipitation": 0, "wind": 5, "gust": 10,
+                    "visibility": 20000, "weather_code": 0,
+                    "cape": 0,
+                }
+            ],
+            "history_summary": {},
+        }
+        reply = json_text({
+            "hazard_type": "NONE",
+            "likelihood_score": 1, "likelihood_reason": "r",
+            "severity_score": 1, "severity_reason": "r",
+            "exposure_score": 1, "exposure_reason": "r",
+            "duration_score": 1, "duration_reason": "r",
+            "geographic_impact_score": 1,
+            "geographic_impact_reason": "r",
+            "alert_recommendation": "NO_ALERT_RECOMMENDED",
+            "advice": "a", "reasoning": "r",
+            "recommended_actions": [], "limitations": [],
+            "missing_evidence": [],
+            "sources": ["16. Final Decision Rule"],
+        })
+        mocks = {
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: fixture,
+            "tool_get_history": lambda n=3: [],
+            "ask_groq": lambda messages, temperature=0.1: reply,
+        }
+        saved = {name: globals()[name] for name in mocks}
+        printed = io.StringIO()
+        globals().update(mocks)
+
+        try:
+            with contextlib.redirect_stdout(printed):
+                result = run_weather_agent()[0]
+        finally:
+            globals().update(saved)
+
+        return result, printed.getvalue()
+
+    real_decision, real_output = run_real_retrieval_path()
+
+    check(
+        "Real retrieval path never reports missing required headings",
+        "load_guidelines" in real_decision["tools_used"]
+        and "search_guidelines" in real_decision["tools_used"]
+        and real_decision["policy_status"] == "AVAILABLE"
+        and real_decision["policy_path"] == str(GUIDELINES_PATH)
+        and real_decision["policy_hash"] == hashlib.sha256(
+            GUIDELINES_PATH.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        and "ASSESSMENT ERROR" not in real_output
+        and "Required policy headings" not in real_output
+        and "Required policy headings" not in json_text(real_decision),
+    )
+
+    workflow_path = (
+        Path(__file__).resolve().parent
+        / ".github" / "workflows" / "weather.yml"
+    )
+    workflow_commands = [
+        line.strip() for line in
+        workflow_path.read_text(encoding="utf-8").splitlines()
+        if "weather_log.py" in line
+    ] if workflow_path.is_file() else []
+
+    original_directory = os.getcwd()
+
+    with tempfile.TemporaryDirectory() as elsewhere:
+        os.chdir(elsewhere)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                loaded_elsewhere = load_guidelines()
+        finally:
+            # Leave the directory before it is deleted (Windows).
+            os.chdir(original_directory)
+
+    check(
+        "Workflow runs this weather_log.py in dry-run mode only and "
+        "the policy loads from beside the script",
+        workflow_commands == ["- run: python weather_log.py agent-dry"]
+        and Path(loaded_elsewhere["path"]).resolve()
+        == (Path(__file__).resolve().parent / "guidelines.md")
+        and loaded_elsewhere["hash"] == hazard_policy["hash"],
     )
 
     # agent-dry must not POST to Sheets or send email.
