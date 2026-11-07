@@ -1,161 +1,707 @@
+
 # Dubai Weather Safety Guidelines
 
-These guidelines define practical weather-alert rules for Dubai, UAE. They are designed to protect residents, commuters and outdoor workers. Official instructions from the UAE National Center of Meteorology (NCM), NCEMA, Dubai Police and other competent authorities always take priority.
+**Policy name:** Dubai Weather Safety Guidelines  
+**Policy version:** 2.0  
+**Geographic scope:** Dubai, United Arab Emirates  
+**Purpose:** Evidence-based weather risk assessment, public safety guidance and controlled alert recommendations.
 
-## Heat
+---
 
-Heatwave, scorching weather, scorching conditions, extreme heat and very high temperatures are related search terms for this section.
+## 1. Purpose and Governing Principles
 
-Issue a heat alert when NCM publishes a relevant heat warning or an official public-health advisory identifies dangerous heat conditions affecting Dubai.
+These guidelines define how the weather monitoring agent assesses weather-related risks affecting residents, commuters, outdoor workers and other people in Dubai.
 
-During the UAE summer midday-break period, remind residents that outdoor work under direct sunlight and in open areas is prohibited from 12:30 PM to 3:00 PM, from 15 June to 15 September, subject to applicable official rules and exemptions.
+The agent must produce evidence-based, hazard-specific assessments rather than generic weather advice.
 
-Recommend that residents limit strenuous outdoor activity during the hottest hours, drink water regularly, seek shade and check on children, older people and vulnerable individuals.
+The following principles are mandatory:
 
-This occupational midday-break requirement must not be misrepresented as a general requirement for all residents to remain indoors.
+1. Official instructions from the UAE National Center of Meteorology (NCM), NCEMA, Dubai Police, MoHRE and other competent authorities take priority over this document.
+2. Weather measurements must be distinguished from forecasts, observations, warnings and assumptions.
+3. A weather condition must not automatically be classified as dangerous simply because a measurement is elevated.
+4. Every risk assessment must consider the nature of the hazard, affected population, exposure, duration and geographic impact.
+5. Missing information must be reported as missing, not interpreted as evidence of safety.
+6. The AI model must explain assessment results. It must not independently invent thresholds, change calculated risk scores or override official instructions.
+7. A recommendation to issue an alert is not confirmation that an alert has been approved or sent.
+8. The agent must not claim that these guidelines were applied unless the file was successfully retrieved and validated.
 
-Source: UAE Ministry of Human Resources and Emiratisation (MoHRE), Midday Break policy information:
-https://www.dmi.gov.ae/content/dubaione/en-ae/programs/181/MoHREannouncesreturnofMiddayWorkBan.html
+These guidelines are an internal operational framework. They are not an official UAE government warning standard.
 
-## Wind
+## 2. Official Sources and Evidence Hierarchy
 
-Strong winds, high winds, wind gusts and dust storms are related search terms for this section.
+Use the following source hierarchy when evaluating weather and safety conditions.
 
-Issue a wind alert when NCM publishes a relevant warning affecting Dubai.
+### Tier 1: Official authorities
 
-Use the following published UAE adverse-weather safety reference bands for additional risk classification:
+- UAE National Center of Meteorology (NCM): https://www.ncm.gov.ae/
+- National Emergency Crisis and Disaster Management Authority (NCEMA): https://www.ncema.gov.ae/
+- Dubai Police: https://www.dubaipolice.gov.ae/
+- UAE Government Portal: https://u.ae/
+- Ministry of Human Resources and Emiratisation (MoHRE): https://www.mohre.gov.ae/
 
-- Wind gusts above 50 km/h: Strong wind conditions.
-- Wind gusts above 75 km/h: Very strong wind conditions requiring an escalated alert.
+Official warnings, emergency instructions and restrictions must be preserved accurately.
 
-Advise residents to secure balcony furniture, umbrellas, outdoor decorations and other loose objects. Recommend avoiding exposed outdoor locations and taking additional care while driving.
+### Tier 2: Established supporting sources
 
-Drivers should reduce speed, maintain safe distances and avoid unnecessary overtaking. High-sided vehicles should take particular care during strong winds.
+Use reputable meteorological, scientific and public-health sources when official information does not provide sufficient detail.
 
-Advise people to stay away from unstable structures, trees, billboards and temporary installations.
+Examples include established international meteorological organizations and recognized public-health institutions.
 
-Source: Abu Dhabi Public Health Centre, ADOSH-SF Technical Guideline, Dealing with Adverse Weather Conditions, Version 4.0, 15 July 2024, Table Three, page 10:
-https://www.adphc.gov.ae/-/media/Project/ADPHC/ADPHC/PDF/OSHAD-SF/Technical-Guidelines/Dealing-with-Adverse-Weather-Eng.pdf
+### Tier 3: Unverified information
 
-Note: These wind bands are a published UAE safety reference, not official Dubai NCM warning thresholds.
+Social media posts, unverified reports and isolated third-party claims may identify a potential issue but must not independently establish an official warning or confirmed hazard.
 
-## Rain
+### Source requirements
 
-Heavy rain, flooding, flash floods, floodwater and water accumulation are related search terms for this section.
+For every important piece of evidence, record:
 
-Flooding and flash floods can create dangerous conditions, including when the daily rainfall total is relatively low.
+- Source name.
+- Source category.
+- Original publication or observation time, if available.
+- Retrieval time.
+- Geographic coverage.
+- Measurement or warning details.
+- Whether the information is current.
+- Whether it is independently corroborated.
 
-Issue a rain or flooding alert when NCM or another relevant UAE authority publishes a warning affecting Dubai, or when an authoritative source confirms hazardous flooding or water accumulation.
+Do not describe third-party information as an official UAE warning.
 
-Do not rely exclusively on daily rainfall totals. Short-duration heavy rainfall can create dangerous road conditions even when the daily rainfall total is relatively low.
+## 3. Evidence Quality and Confidence
 
-Recommend that residents:
+Classify evidence using the following levels.
 
-- Avoid flooded roads, tunnels, underpasses and low-lying areas.
-- Never drive or walk through moving or standing floodwater.
-- Postpone unnecessary journeys when road conditions are unsafe.
-- Keep mobile phones charged.
-- Follow road closures and instructions from Dubai Police and emergency authorities.
-- Move indoors during thunderstorms and avoid exposed outdoor locations.
+| Level | Classification | Meaning |
+|---|---|---|
+| E1 | Official and verified | Current information from a competent authority |
+| E2 | Reliable and corroborated | Reputable information supported by additional evidence |
+| E3 | Unverified signal | A single source or unconfirmed report |
+| E4 | Stale or conflicting | Outdated, inconsistent or questionable information |
+| E0 | Missing | No usable evidence available |
 
-After rainfall, warn residents about hidden hazards, damaged electrical equipment, debris and slippery surfaces. Never enter flooded areas where electrical hazards may exist.
+Evidence quality and physical risk severity are separate concepts.
 
-Source: Abu Dhabi Public Health Centre, ADOSH-SF Technical Guideline, Dealing with Adverse Weather Conditions, Version 4.0, 15 July 2024, sections 4.4, 4.6 and 6.1:
-https://www.adphc.gov.ae/-/media/Project/ADPHC/ADPHC/PDF/OSHAD-SF/Technical-Guidelines/Dealing-with-Adverse-Weather-Eng.pdf
+A potentially severe hazard supported by weak evidence must not be treated as harmless. It should be reported with appropriate uncertainty and escalated when warranted.
 
-## Cold
+Do not calculate high confidence merely because multiple sources repeat the same original report.
 
-Cold weather, low temperatures, frost and icy roads are related search terms for this section.
+Confidence must reflect:
 
-Issue a cold-weather alert when NCM publishes an official warning about unusually cold conditions, frost or potentially icy surfaces affecting Dubai.
+- Source reliability.
+- Data freshness.
+- Geographic relevance.
+- Measurement completeness.
+- Independent corroboration.
+- Consistency between sources.
 
-Do not invent a routine minimum-temperature threshold without an authoritative Dubai-specific source.
+If essential evidence is missing, mark the assessment incomplete.
 
-Recommend warm clothing during unusually cold mornings and nights. Pay additional attention to infants, older people and individuals without adequate indoor heating.
+## 4. Risk Assessment Dimensions
 
-If authorities warn about frost or icy roads, advise drivers to reduce speed and exercise caution, particularly on bridges and elevated roads.
+Assess each identified hazard using five dimensions.
 
-Do not report frost or icy road conditions unless confirmed by an authoritative source.
+Each dimension uses a scale from 1 to 5.
 
-Source: UAE National Center of Meteorology:
-https://www.ncm.gov.ae
+### 4.1 Likelihood (L)
 
-## Alert Severity and Escalation
+Estimate how likely the hazard is to occur or continue during the assessment period.
 
-Classify alerts according to the official warning level and the expected impact on residents.
+| Score | Classification | Definition |
+|---|---|---|
+| 1 | Very unlikely | No meaningful indication of occurrence |
+| 2 | Unlikely | Limited supporting evidence |
+| 3 | Possible | Some evidence indicates potential occurrence |
+| 4 | Likely | Strong evidence indicates occurrence |
+| 5 | Almost certain | Hazard is already occurring or strongly expected |
 
-- Advisory: Conditions require awareness and basic precautions.
-- Warning: Conditions may create significant safety risks and require protective action.
-- Emergency: Official emergency instructions or imminent serious danger require immediate attention.
+### 4.2 Severity (S)
 
-Never assign an emergency classification based only on an unverified forecast or an unsupported numerical threshold.
+Estimate the potential consequences if the hazard affects people or infrastructure.
 
-When official authorities issue emergency instructions, communicate those instructions clearly and prioritize them over general recommendations.
+| Score | Classification | Definition |
+|---|---|---|
+| 1 | Negligible | Minimal inconvenience or disruption |
+| 2 | Minor | Limited discomfort or minor disruption |
+| 3 | Moderate | Meaningful safety concern or service disruption |
+| 4 | Major | Potential for serious injury, significant disruption or damage |
+| 5 | Critical | Potential for life-threatening consequences or widespread serious damage |
 
-Source: UAE National Center of Meteorology:
-https://www.ncm.gov.ae
+### 4.3 Exposure (E)
 
-## Alert Frequency and Duplicate Prevention
+Estimate the number or vulnerability of people and assets potentially exposed.
 
-Generate alerts only when a qualifying official warning, advisory or verified local hazard meets the conditions defined in these guidelines.
+| Score | Classification | Definition |
+|---|---|---|
+| 1 | Very limited | Few people or assets exposed |
+| 2 | Limited | Small identifiable group exposed |
+| 3 | Moderate | Several groups or locations exposed |
+| 4 | High | Large population or important infrastructure exposed |
+| 5 | Very high | Extensive population, critical infrastructure or highly vulnerable groups exposed |
 
-Do not send repeated notifications about the same weather condition in the same affected area on consecutive days when the severity and recommended actions have not changed.
+Consider:
 
-Send an updated alert when:
+- Residents.
+- Commuters.
+- Outdoor workers.
+- Children and older people.
+- People with mobility limitations.
+- Critical infrastructure.
+- Road users and transport services.
 
-- The official warning level increases.
-- The affected geographical area expands.
-- The expected timing or duration changes significantly.
-- New safety instructions are issued.
-- A previously reported condition develops into a more dangerous situation.
+Do not assume that every person in Dubai has the same exposure.
 
-Close or expire alerts when the official warning is cancelled or the relevant hazard period ends.
+### 4.4 Duration (D)
 
-Never suppress an urgent safety escalation merely to prevent a duplicate notification.
+Estimate how long the hazard is expected to persist.
 
-## Search and Retrieval Guidance
+| Score | Classification | Definition |
+|---|---|---|
+| 1 | Very short | Less than 1 hour |
+| 2 | Short | 1 to less than 3 hours |
+| 3 | Moderate | 3 to less than 6 hours |
+| 4 | Long | 6 to less than 12 hours |
+| 5 | Prolonged | 12 hours or longer |
 
-The section headings are intentional retrieval boundaries. Keep each weather hazard's rules under its own heading so search results can be attributed to the correct condition.
+Use the available forecast or observation period.
 
-Alternative words and phrases in each section help basic keyword search find relevant guidance. They are retrieval terms, not independent alert triggers.
+Do not estimate duration when the source does not support it.
 
-A keyword match does not prove that a weather condition exists or that an alert threshold has been crossed. The application must separately verify current weather data, location, source authority and applicable alert conditions.
+### 4.5 Geographic Impact (G)
 
-Keep weather sections separate:
+Estimate the geographic extent of the affected area.
 
-- Heat-related guidance belongs under `## Heat`.
-- Wind-related guidance belongs under `## Wind`.
-- Rain and flooding guidance belongs under `## Rain`.
-- Cold-related guidance belongs under `## Cold`.
+| Score | Classification | Definition |
+|---|---|---|
+| 1 | Very localized | A single small location |
+| 2 | Localized | A limited local area |
+| 3 | Moderate | Multiple local areas |
+| 4 | Extensive | Multiple districts or substantial parts of Dubai |
+| 5 | Widespread | Widespread or emirate-level impact |
 
-Do not delete or merge these headings during document preparation. Large mixed sections can cause retrieval to return unrelated guidance and lead to incorrect citations.
+Do not infer district-level impact from a single city-wide weather reading.
 
-If no section matches a query, return a clear no-match result. Do not invent guidance or interpret missing search results as proof that no weather hazard exists.
+## 5. Risk Calculation Model
 
-## Source Validation and Authority
+The following is a provisional internal scoring model. It is not an official UAE government risk formula.
 
-Use authoritative information before generating weather alerts.
+Calculate the score using:
 
-Primary source:
-UAE National Center of Meteorology (NCM):
-https://www.ncm.gov.ae
+Risk Score = 0.35 × (L × S) + 0.20 × (E × S) + 0.15 × (D × S) + 0.30 × (G × S)
 
-Additional official sources:
+Where:
 
-- UAE Government weather and environmental information: https://u.ae/en/information-and-services/environment-and-energy/weather-conditions-and-environmental-status
-- UAE Ministry of Human Resources and Emiratisation: https://www.mohre.gov.ae/
-- Abu Dhabi Public Health Centre adverse-weather safety guidance: https://www.adphc.gov.ae/
+- L = Likelihood
+- S = Severity
+- E = Exposure
+- D = Duration
+- G = Geographic impact
 
-Every numerical threshold must have a traceable source. Distinguish UAE-wide safety guidance from Dubai-specific weather warnings.
+The resulting score ranges from 1 to 25.
 
-Do not invent weather measurements, authority warnings, alert levels or safety instructions.
+### Risk bands
 
-## General Safety and Public Protection
+| Score | Risk band | Interpretation |
+|---|---|---|
+| 1 to 5 | LOW | Limited potential impact |
+| Greater than 5 to 10 | MODERATE | Conditions require attention or monitoring |
+| Greater than 10 to 15 | HIGH | Significant potential impact; review and precautionary action may be required |
+| Greater than 15 to 25 | CRITICAL | Potentially severe impact requiring urgent assessment and escalation |
 
-Protecting people takes priority over alert frequency and automated reporting.
+Use the unrounded score for classification. Round only the displayed value.
 
-Weather alerts must be clear, factual, location-aware and actionable.
+### Mandatory calculation rules
 
-Each alert should include the affected location, weather hazard, expected timing when available, official source and recommended precautions.
+1. Every dimension must have an evidence-based score and a short rationale.
+2. Do not assign scores based on intuition alone.
+3. Do not treat missing evidence as a score of 0 or 1.
+4. If an essential dimension cannot be assessed, return `UNASSESSED` rather than calculating a misleading complete score.
+5. Record the evidence supporting each dimension.
+6. Keep the numerical risk score separate from evidence confidence.
+7. The same inputs and policy version must produce the same calculated result.
+8. Official warnings and emergency instructions take precedence over the calculated risk band.
 
-When reliable information is unavailable, do not manufacture an alert. State that the condition could not be verified and defer to official authority updates.
+The scoring formula and bands must be validated against historical Dubai weather events and reviewed before being used for automated public notifications.
+
+## 6. Weather Hazard Assessment
+
+Assess each hazard independently. Multiple hazards may exist at the same time.
+
+### 6.1 Extreme Heat
+
+Evaluate:
+
+- Maximum and current temperature.
+- Feels-like or apparent temperature, where available.
+- Relative humidity.
+- Dew point, where available.
+- Direct sunlight and solar exposure, where relevant.
+- Wind conditions.
+- Time of day.
+- Expected duration.
+- Outdoor activity and worker exposure.
+- Relevant official heat advisories.
+
+Temperature alone is insufficient to determine the full heat-related risk.
+
+Higher humidity can reduce the body's ability to cool itself. Prolonged outdoor exposure can increase risk even when temperatures are below an extreme threshold.
+
+Advice should be specific to the conditions and affected population.
+
+Examples:
+
+- Reduce strenuous outdoor activity during the hottest period.
+- Take appropriate rest breaks.
+- Use shaded or cooled areas.
+- Maintain adequate hydration.
+- Follow applicable workplace heat-safety requirements.
+- Seek appropriate medical assistance when serious heat-illness symptoms occur.
+
+### 6.2 Wind and Dust
+
+Evaluate:
+
+- Sustained wind speed.
+- Wind gust speed.
+- Wind direction.
+- Expected duration.
+- Dust or sandstorm observations.
+- Visibility.
+- Impact on roads, transport and outdoor activities.
+- Relevant official warnings.
+
+Distinguish sustained wind from short-duration gusts.
+
+Do not apply an unsupported generic wind threshold as an official Dubai safety threshold.
+
+If visibility is reduced, assess the potential impact on driving and outdoor activities.
+
+Do not claim a road closure or transport disruption without authoritative supporting information.
+
+### 6.3 Rain, Thunderstorms and Flooding
+
+Evaluate:
+
+- Expected rainfall intensity.
+- Hourly rainfall, where available.
+- Total rainfall.
+- Expected duration.
+- Thunderstorm warnings.
+- Lightning risk.
+- Drainage and geographic vulnerability, where known.
+- Official flood or emergency instructions.
+- Relevant road and transport information.
+
+Daily rainfall totals alone do not establish the likelihood of localized flooding.
+
+A city-wide weather forecast does not confirm that a particular road, tunnel or neighborhood is flooded.
+
+Do not claim that flooding has occurred at a specific location without supporting evidence.
+
+When an official warning is active, preserve its instructions and recommend appropriate precautions.
+
+### 6.4 Low Temperatures and Cold Conditions
+
+Evaluate:
+
+- Minimum temperature.
+- Feels-like temperature, where available.
+- Wind conditions.
+- Exposure duration.
+- Vulnerable populations.
+- Relevant official advisories.
+
+Do not invent frost, freezing or cold-weather thresholds for Dubai.
+
+Do not classify ordinary seasonal temperature variation as a significant safety hazard without supporting evidence.
+
+### 6.5 Lightning and Thunderstorms
+
+Evaluate:
+
+- Official thunderstorm warnings.
+- Lightning observations, where available.
+- Rainfall intensity.
+- Wind gusts.
+- Outdoor exposure.
+- Expected duration and geographic coverage.
+
+If an official lightning or thunderstorm warning is issued, follow the authority's instructions.
+
+Do not claim lightning is occurring at a specific location based only on a general forecast.
+
+## 7. Regulatory and Workplace Compliance
+
+Official regulatory requirements must be checked against the latest applicable government guidance.
+
+For outdoor work in direct sunlight and open areas, consider the UAE midday break requirements.
+
+The established midday break period generally applies from 12:30 PM to 3:00 PM between 15 June and 15 September, subject to the current applicable rules and exemptions.
+
+The agent must:
+
+1. Verify current requirements through MoHRE or another competent authority.
+2. Distinguish workplace regulatory obligations from general public safety recommendations.
+3. Avoid presenting workplace restrictions as a universal requirement for all residents.
+4. Never invent exemptions or regulatory penalties.
+5. Record the source and date of any compliance-related information.
+
+Official regulatory instructions take priority over this document.
+
+## 8. Alert Decision Framework
+
+The agent must distinguish a risk assessment from an alert recommendation.
+
+Use one of the following recommendation values:
+
+- `NO_ALERT_RECOMMENDED`
+- `MONITOR`
+- `ADVISORY_RECOMMENDED`
+- `ESCALATE_FOR_REVIEW`
+- `OFFICIAL_WARNING_PASS_THROUGH`
+- `UNABLE_TO_ASSESS`
+
+### NO_ALERT_RECOMMENDED
+
+Use only when:
+
+- The required policy was successfully loaded.
+- Relevant weather evidence is available.
+- Essential risk dimensions are assessable.
+- No relevant official warning or significant hazard requires escalation.
+- The assessment is sufficiently complete.
+
+This does not mean that weather conditions are guaranteed to be safe.
+
+### MONITOR
+
+Use when:
+
+- A developing hazard is possible.
+- Evidence indicates a changing condition.
+- Further observation or verification is appropriate.
+- No immediate advisory recommendation is justified by the available evidence.
+
+### ADVISORY_RECOMMENDED
+
+Use when:
+
+- Evidence supports a meaningful safety concern.
+- Practical precautionary advice is justified.
+- The recommendation is proportionate to the hazard and exposure.
+
+An advisory recommendation does not authorize external notification.
+
+### ESCALATE_FOR_REVIEW
+
+Use when:
+
+- Potential consequences are serious.
+- Evidence is conflicting or incomplete.
+- A significant hazard may be developing.
+- Human review or an authoritative source check is necessary.
+
+### OFFICIAL_WARNING_PASS_THROUGH
+
+Use when a current, relevant official warning or emergency instruction has been verified.
+
+Preserve its original meaning, geographic coverage, validity period and issuing authority.
+
+Do not rewrite official instructions in a way that changes their meaning.
+
+### UNABLE_TO_ASSESS
+
+Use when essential information is unavailable, invalid, stale or insufficient.
+
+Examples include:
+
+- Guidelines file unavailable.
+- Weather API failure.
+- Missing essential measurements.
+- Unverified geographic coverage.
+- Invalid or stale warning information.
+- Incomplete evidence required for scoring.
+
+Do not silently convert an incomplete assessment into a low-risk result.
+
+## 9. Official Warning Override
+
+Official warnings and emergency instructions must be treated as authoritative inputs.
+
+If a competent authority issues a relevant warning:
+
+1. Preserve the warning status.
+2. Record the issuing authority.
+3. Record the issue time and validity period when available.
+4. Identify the geographic area covered.
+5. Preserve the recommended safety actions.
+6. Ensure the numerical risk model does not suppress the official warning.
+7. Escalate where required by the configured notification and approval process.
+
+An official warning may justify immediate precautionary communication even when the internal numerical risk score is incomplete or low.
+
+The agent must never downgrade, dismiss or contradict an official emergency instruction.
+
+## 10. Policy Retrieval and Validation
+
+The agent must retrieve this document before performing a policy-based risk assessment.
+
+Expected filename:
+
+`guidelines.md`
+
+The retrieval process must verify:
+
+- The file exists.
+- The file is readable.
+- The file is not empty.
+- The content can be parsed.
+- The policy name and version are available.
+- The content hash or equivalent version identifier is recorded.
+- The retrieval time is recorded.
+
+### If the guidelines file is unavailable
+
+Set:
+
+- `policy_status = UNAVAILABLE`
+- `assessment_status = INCOMPLETE`
+- `alert_recommendation = UNABLE_TO_ASSESS`
+
+Record the exact retrieval error.
+
+The agent must not:
+
+- Claim that these guidelines were applied.
+- Substitute generic AI knowledge for the missing policy.
+- Produce a definitive policy-based low-risk conclusion.
+- Hide the retrieval failure.
+- Claim a successful risk assessment.
+
+A separately implemented and verified official-warning pass-through mechanism may still preserve an authoritative emergency instruction. It must not be represented as a completed policy assessment.
+
+### If the guidelines file is available
+
+Set:
+
+- `policy_status = AVAILABLE`
+
+Record the policy version, retrieval timestamp and content hash.
+
+If the content is invalid or incomplete, report the validation failure rather than assuming that the policy is valid.
+
+## 11. Data Quality and Assessment Completeness
+
+Before producing an assessment, verify:
+
+### Weather data
+
+- City and geographic scope are correct.
+- Coordinates or location configuration are valid.
+- Units are identified.
+- Measurements have timestamps.
+- Forecast and observation values are distinguished.
+- Data covers the assessment period.
+- Unexpected or invalid values are rejected.
+- Source retrieval errors are recorded.
+
+### Risk data
+
+- Each required dimension has a score or an explicit missing-data reason.
+- Each score has a rationale.
+- Evidence references are available.
+- Conflicting information is disclosed.
+- Risk calculation is reproducible.
+- Confidence is not confused with severity.
+
+### Assessment status
+
+Use:
+
+- `COMPLETE`
+- `INCOMPLETE`
+- `INVALID`
+- `UNAVAILABLE`
+
+A complete assessment requires the relevant policy, valid weather evidence and all essential dimensions for the hazard being evaluated.
+
+An incomplete assessment must not be presented as a completed low-risk decision.
+
+## 12. Required Structured Assessment Output
+
+The agent should return a structured result with the following fields.
+
+### Identification
+
+- `assessment_id`
+- `city`
+- `geographic_scope`
+- `assessment_timestamp`
+- `timezone`
+- `assessment_period`
+
+### Policy and evidence
+
+- `policy_status`
+- `policy_version`
+- `policy_hash`
+- `policy_retrieval_error`
+- `weather_source`
+- `weather_retrieval_status`
+- `weather_data_timestamp`
+- `evidence_quality`
+- `evidence_confidence`
+- `evidence_references`
+- `official_warning_status`
+- `official_warning_authority`
+- `official_warning_validity`
+
+### Hazard assessment
+
+- `hazard_type`
+- `temperature_max_c`
+- `temperature_min_c`
+- `apparent_temperature_c`
+- `relative_humidity_percent`
+- `wind_speed_kmh`
+- `wind_gust_kmh`
+- `precipitation_mm`
+- `visibility_km`
+
+Include only measurements actually retrieved. Do not invent missing values.
+
+### Risk dimensions
+
+- `likelihood_score`
+- `likelihood_reason`
+- `severity_score`
+- `severity_reason`
+- `exposure_score`
+- `exposure_reason`
+- `duration_score`
+- `duration_reason`
+- `geographic_impact_score`
+- `geographic_impact_reason`
+
+### Decision
+
+- `risk_score`
+- `risk_band`
+- `assessment_status`
+- `alert_recommendation`
+- `assessment_reasoning`
+- `recommended_actions`
+- `limitations`
+- `missing_evidence`
+
+### Notification control
+
+- `approval_status`
+- `notification_status`
+- `notification_timestamp`
+- `notification_error`
+
+### Tool execution
+
+- `tools_used`
+- `tool_errors`
+
+Use explicit null values or documented missing-data indicators where information is unavailable. Do not substitute invented values.
+
+## 13. Advice and Communication Requirements
+
+Advice must be:
+
+- Specific to the identified hazard.
+- Appropriate for the affected population.
+- Proportionate to the assessed risk.
+- Supported by available evidence.
+- Consistent with official instructions.
+- Clear about uncertainty and limitations.
+
+Avoid generic advice that is unrelated to the identified hazard.
+
+For example, a moderate wind assessment should explain the wind-related concern rather than automatically recommending hydration.
+
+A heat assessment should explain the relevance of temperature, humidity, duration and exposure rather than relying only on a generic temperature statement.
+
+When no significant hazard is identified, state what was assessed and why no alert is recommended.
+
+Do not claim that all conditions are safe.
+
+Do not claim that an alert has been sent unless the notification system confirms successful delivery.
+
+## 14. Human Approval and Notification Governance
+
+The agent may generate an assessment and recommend an alert.
+
+External notification must follow the configured approval and authorization process.
+
+Use these approval values:
+
+- `PENDING_REVIEW`
+- `APPROVED`
+- `REJECTED`
+- `NOT_AUTHORIZED`
+- `NOT_REQUIRED`
+
+Use these notification values:
+
+- `NOT_SENT`
+- `SENT`
+- `FAILED`
+- `NOT_APPLICABLE`
+
+Rules:
+
+1. Assessment generation does not equal approval.
+2. Approval does not equal successful delivery.
+3. Notification status must be based on the actual delivery result.
+4. Failed notification attempts must be recorded.
+5. Duplicate notifications must be controlled without suppressing a materially different hazard.
+6. Official emergency instructions must follow the separately configured emergency communication procedure.
+7. The AI model must not bypass approval or authorization controls.
+
+## 15. Assessment Quality and Consistency Rules
+
+Every assessment must pass the following checks:
+
+- Correct city and geographic scope.
+- Correct local timestamp and timezone.
+- Valid and current weather evidence.
+- Verified policy retrieval.
+- Correct distinction between forecasts and observations.
+- Hazard-specific analysis.
+- Evidence-based scores.
+- Reproducible risk calculation.
+- Appropriate risk band.
+- Official warning override respected.
+- Missing information disclosed.
+- Appropriate recommendation.
+- No unsupported claims.
+- No false notification confirmation.
+
+The agent must not produce the same generic response for materially different weather conditions.
+
+When conditions change, the assessment must explain which measurements, hazards, risk dimensions or recommendations changed.
+
+When conditions remain similar, it may explain that the assessment is unchanged and identify the evidence supporting that conclusion.
+
+## 16. Final Decision Rule
+
+Before returning a result, answer these questions:
+
+1. Was the correct guidelines file successfully loaded?
+2. Is the weather data valid, current and relevant to Dubai?
+3. Are the identified hazards supported by evidence?
+4. Have all essential risk dimensions been evaluated?
+5. Is the risk score reproducible?
+6. Has evidence confidence been assessed separately?
+7. Have official warnings and regulatory instructions been respected?
+8. Is the recommendation proportionate to the evidence?
+9. Are missing information and limitations disclosed?
+10. Does the notification status reflect an actual system result?
+
+If any essential requirement fails, return an incomplete assessment or escalate it.
+
+Never fabricate evidence, risk scores, official warnings, approvals or notification results.
+
+**End of policy.**
