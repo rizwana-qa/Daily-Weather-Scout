@@ -14,7 +14,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests
-      - run: python weather_log.py agent
+      # Dry run: no Google Sheets write and no email. Switch back to
+      # "agent" only after the output has been reviewed.
+      - run: python weather_log.py agent-dry
         env:
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
