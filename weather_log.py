@@ -2535,11 +2535,10 @@ Requirements:
    definitions in the supplied policy, with a separate evidence-based
    rationale for each.
 3. Never treat missing evidence as a low score.
-4. Official warning status is NOT_CHECKED; if mentioned, use exactly:
-   "Official warning status was not checked." Never claim or imply an
-   official warning or advisory is active or inactive; use no other
-   wording that could confirm its presence or absence. Open-Meteo is
-   not an official UAE warning authority.
+4. Official warning status is NOT_CHECKED and is reported by the
+   program. Do not mention official warnings or advisories in any
+   model-generated field. Open-Meteo is not an official UAE warning
+   authority.
 5. Distinguish current observations, forecasts and historical context.
 6. Do not assume all residents or workers have equal exposure.
 7. Previous alerts must not suppress a new or different hazard. Do not
@@ -2597,10 +2596,7 @@ def assess_weather(weather, history, policy, retrieved_sections):
         "weather": compact_weather,
         "recent_agent_history": compact_history,
         "policy_version": policy["version"],
-        "official_warning_status": (
-            "NOT_CHECKED. No NCM or other official warning feed "
-            "is integrated."
-        ),
+        "official_warning_status": "NOT_CHECKED (program-reported)",
         "risk_score_notice": (
             "Any risk score is an internal provisional calculation made "
             "by the program, not an official UAE or NCM classification, "
@@ -5436,9 +5432,9 @@ def run_tests():
     )
 
     check(
-        "Prompt forbids stating any official warning state",
-        "Never claim or imply an official warning or advisory "
-        "is active or inactive" in " ".join(SYSTEM_PROMPT.split()),
+        "Prompt forbids mentioning official warnings in model fields",
+        "Do not mention official warnings or advisories in any "
+        "model-generated field" in " ".join(SYSTEM_PROMPT.split()),
     )
 
     # A3. Real path: the incident's contradictory advice fails closed.
@@ -5584,16 +5580,10 @@ def run_tests():
         abc_fits({}),
     )
 
-    # With the clarified official-warning rule in the system prompt,
-    # heat alone with worst-case (cap-sized) history is 8,020 estimated
-    # tokens against the 8,000 cap and fails closed. Realistic history
-    # still fits (see the realistic-history heat checks).
     for code in HAZARD_POLICY_TITLES:
         check(
-            f"24-hour series: single hazard "
-            f"{'is blocked with worst-case history' if code == 'HEAT' else 'fits every budget'}"
-            f": {code}",
-            abc_fits({code: ["t"]}) is (code != "HEAT"),
+            f"24-hour series: single hazard fits every budget: {code}",
+            abc_fits({code: ["t"]}),
         )
 
     # With the 1,000-token completion allowance, heat + wind with
@@ -6420,8 +6410,8 @@ def run_tests():
         "separate evidence-based rationale for each",
         "Never treat missing evidence as a low score",
         "Official warning status is NOT_CHECKED",
-        "Never claim or imply an official warning or advisory is "
-        "active or inactive",
+        "Do not mention official warnings or advisories in any "
+        "model-generated field",
         "Open-Meteo is not an official UAE warning authority",
         "Distinguish current observations, forecasts and historical "
         "context",
@@ -8704,15 +8694,16 @@ def run_tests():
     cl_prompt = " ".join(SYSTEM_PROMPT.split())
 
     check(
-        "Prompt carries the approved warning sentence and rules once",
-        cl_prompt.count('"Official warning status was not checked."') == 1
-        and cl_prompt.count("Official warning status is NOT_CHECKED") == 1
-        and "Never claim or imply an official warning or advisory is "
-        "active or inactive" in cl_prompt
-        and "use no other wording that could confirm its presence or "
-        "absence" in cl_prompt
-        and "Open-Meteo is not an official UAE warning authority"
-        in cl_prompt,
+        "Prompt carries the warning-mention ban and status rule once",
+        cl_prompt.count("Official warning status is NOT_CHECKED and is "
+                        "reported by the program") == 1
+        and cl_prompt.count("Do not mention official warnings or "
+                            "advisories in any model-generated field") == 1
+        and cl_prompt.count("Open-Meteo is not an official UAE warning "
+                            "authority") == 1
+        and "Official warning status was not checked" not in cl_prompt
+        and "if mentioned" not in cl_prompt
+        and "active or inactive" not in cl_prompt,
     )
 
     # 7. Budgets: the limits are unchanged. The revised prompt's fit is
@@ -8720,6 +8711,285 @@ def run_tests():
     # their request with this SYSTEM_PROMPT.
     check(
         "Request and token budgets are unchanged by the prompt revision",
+        MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500
+        and MAX_COMPLETION_TOKENS == 1000,
+    )
+
+    # ------------------------------------------------------------
+    # Variant B: the model is told not to discuss official warnings;
+    # the program reports the status (self-contained, offline).
+    # ------------------------------------------------------------
+    def vb_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def vb_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    vb_sent = []
+
+    def vb_capture(messages, temperature=0.1):
+        vb_sent.append(messages)
+        raise RuntimeError("captured")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        vb_policy = load_guidelines()
+        vb_required = select_hazard_guidance(vb_policy, {"HEAT": ["t"]})
+        vb_required += select_conditional_sections(
+            vb_policy, {"HEAT": ["t"]},
+            {"current": {"time": "2026-11-08T12:00"}},
+        )
+        vb_sections = search_guidelines(
+            vb_policy, "x", k=0, required_sections=vb_required
+        )
+
+    try:
+        vb_override(
+            {"ask_groq": vb_capture},
+            lambda: assess_weather(vb_weather(), [], vb_policy, vb_sections),
+        )
+    except RuntimeError:
+        pass
+
+    vb_user = vb_sent[0][1]["content"] if vb_sent else ""
+    vb_lead_in = vb_user.split("\n\n=== POLICY SECTION")[0]
+    vb_evidence = json.loads(vb_user.split("EVIDENCE AND STATUS (JSON):\n")[1])
+    vb_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    # Prompt instruction validation.
+    check(
+        "Rule 4 wording is exactly the approved text",
+        "4. Official warning status is NOT_CHECKED and is reported by "
+        "the program. Do not mention official warnings or advisories in "
+        "any model-generated field. Open-Meteo is not an official UAE "
+        "warning authority. 5. " in vb_prompt,
+    )
+
+    # Evidence status validation.
+    check(
+        "Evidence status is the short program-reported value",
+        vb_evidence["official_warning_status"]
+        == "NOT_CHECKED (program-reported)"
+        and "feed" not in json_text(vb_evidence["official_warning_status"])
+        and "No NCM" not in vb_user,
+    )
+
+    # Nothing the model is shown trips the unchanged guard.
+    vb_fixed_text = " ".join(
+        [SYSTEM_PROMPT, vb_lead_in]
+        + [json_text({
+            key: value for key, value in vb_evidence.items()
+            if key not in ("weather", "recent_agent_history")
+        })]
+    )
+    vb_sentences = re.split(r"(?<=[.!?])\s+", " ".join(vb_fixed_text.split()))
+
+    check(
+        "No fixed prompt or evidence sentence is flagged by the guard",
+        [s for s in vb_sentences
+         if find_unverified_warning_claim_pattern(s)] == [],
+    )
+
+    check(
+        "No retrieved policy line or canonical title is flagged",
+        [
+            line for section in vb_sections
+            for line in section["text"].splitlines()
+            if find_unverified_warning_claim_pattern(line)
+        ] == []
+        and [
+            section["section"] for section in vb_sections
+            if find_unverified_warning_claim_pattern(section["section"])
+        ] == [],
+    )
+
+    # Known false-positive paraphrases stay flagged (guard unchanged).
+    vb_known = (
+        ("No official warning information is integrated.", 3),
+        ("No official warnings are integrated.", 3),
+        ("No official warning is integrated, so status is unknown.", 3),
+        ("Official warning status is NOT_CHECKED, so no official "
+         "warnings are claimed.", 3),
+        ("No official heat advisories were available for review.", 3),
+        ("No official heat advisory information was retrieved.", 3),
+        ("No official emergency instructions were retrieved.", 3),
+        ("We do not claim any official warning is active or inactive.", 4),
+    )
+
+    for text, number in vb_known:
+        check(
+            f"Known paraphrase stays flagged (pattern {number}): "
+            f"{text[:46]}",
+            find_unverified_warning_claim_pattern(text) == number,
+        )
+
+    for text in (
+        "No official warning feed is integrated.",
+        "Official warning status is unknown.",
+        "Warnings have not been verified by this program.",
+    ):
+        check(
+            f"Wording outside the patterns still passes: {text[:46]}",
+            find_unverified_warning_claim_pattern(text) is None,
+        )
+
+    # Genuine warning claims remain blocked.
+    for text in (
+        "No official heat advisory is in effect.",
+        "There are no active warnings.",
+        "A heat warning is currently in effect.",
+        "NCM has not issued any warning.",
+    ):
+        check(
+            f"Genuine claim stays blocked: {text}",
+            find_unverified_warning_claim(text),
+        )
+
+    # Program-generated status survives a response with no warning
+    # wording, and the unchanged guard still rejects wording about it.
+    class VbResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class VbTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return VbResponse(self.content)
+
+    def vb_reply(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 3, "exposure_reason": "er",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 3,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity in the afternoon.",
+            "reasoning": "Apparent temperature reaches the heat "
+                         "screening value.",
+            "recommended_actions": ["Schedule outdoor work in the morning"],
+            "limitations": ["Single forecast point for Dubai"],
+            "missing_evidence": ["Population exposure data"],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return json_text(body)
+
+    def vb_run(content):
+        transport = VbTransport(content)
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                return run_weather_agent()[0]
+
+        return vb_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_vb_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: vb_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+    vb_ok = vb_run(vb_reply())
+
+    check(
+        "Program-generated warning status is kept without model wording",
+        vb_ok["official_warning_status"] == "NOT_CHECKED"
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
+        in [r["code"] for r in vb_ok["incomplete_reasons"]]
+        and any(
+            "warnings were not retrieved or verified" in item
+            for item in vb_ok["limitations"]
+        )
+        and any(
+            "warning status has not been retrieved and verified" in item
+            for item in vb_ok["missing_evidence"]
+        )
+        and vb_ok["assessment_status"] == "INCOMPLETE"
+        and vb_ok["send_alert"] is False
+        and vb_ok["response_diagnostics"] == {},
+    )
+
+    check(
+        "Response with no warning wording passes the guard",
+        "UNVERIFIED_WARNING_CLAIM"
+        not in [r["code"] for r in vb_ok["incomplete_reasons"]]
+        and vb_ok["advice"]
+        == "Limit strenuous outdoor activity in the afternoon.",
+    )
+
+    vb_bad = vb_run(vb_reply(
+        reasoning="No official warnings are integrated, so none apply."
+    ))
+
+    check(
+        "Warning wording in reasoning still fails closed with a diagnostic",
+        vb_bad.get("warning_claim_diagnostic") == "field=reasoning;pattern=3"
+        and vb_bad["assessment_status"] == "INCOMPLETE"
+        and vb_bad["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and vb_bad["risk_score"] is None
+        and vb_bad["send_alert"] is False,
+    )
+
+    # Budgets with the revised prompt.
+    check(
+        "Budget limits are unchanged by Variant B",
         MAX_ESTIMATED_REQUEST_TOKENS == 8000
         and MAX_REQUEST_CHARS == 19000
         and MAX_POLICY_CHARS == 13500
