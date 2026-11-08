@@ -2266,10 +2266,14 @@ class UnverifiedWarningClaim(ValueError):
     evidence-gate override names. Never the matched text.
     """
 
-    def __init__(self, message, field_label="unknown", pattern_number=None):
+    def __init__(
+        self, message, field_label="unknown", pattern_number=None,
+        shape=None,
+    ):
         super().__init__(message)
         self.field_label = field_label
         self.pattern_number = pattern_number
+        self.shape = shape
         self.sources = []
         self.gate_overrides = []
 
@@ -2290,6 +2294,41 @@ class UnverifiedWarningClaim(ValueError):
         )
 
         return f"field={label};pattern={number}"
+
+    def shape_diagnostic(self):
+        """
+        Fixed-vocabulary shape of a pattern 3 match, else None. Every
+        value is checked against the fixed sets; anything else becomes
+        "unknown" (words between: None).
+        """
+        if self.pattern_number != 3:
+            return None
+
+        shape = self.shape if isinstance(self.shape, dict) else {}
+        between = shape.get("words_between")
+
+        return {
+            "qualifier": (
+                shape.get("qualifier")
+                if shape.get("qualifier") in _CLAIM_QUALIFIERS
+                else "unknown"
+            ),
+            "term_class": (
+                shape.get("term_class")
+                if shape.get("term_class") in _CLAIM_TERM_CLASSES
+                else "unknown"
+            ),
+            "words_between": (
+                between
+                if type(between) is int and 0 <= between <= 2
+                else None
+            ),
+            "following_word_class": (
+                shape.get("following_word_class")
+                if shape.get("following_word_class") in _CLAIM_FOLLOW_CLASSES
+                else "unknown"
+            ),
+        }
 
 
 _WARNING_TERMS = r"(?:warnings?|advisor(?:y|ies)|emergency\s+instructions?)"
@@ -2396,6 +2435,102 @@ def find_unverified_warning_claim(text):
     return find_unverified_warning_claim_pattern(text) is not None
 
 
+# Fixed vocabularies for the pattern 3 shape diagnostic.
+_CLAIM_QUALIFIERS = ("active", "current", "official", "existing")
+_CLAIM_TERM_CLASSES = ("warning", "advisory", "emergency_instruction")
+_CLAIM_FOLLOW_CLASSES = (
+    "end", "punctuation", "auxiliary", "preposition", "conjunction",
+    "other_word", "unknown",
+)
+_CLAIM_AUXILIARIES = frozenset({
+    "is", "are", "was", "were", "be", "been", "being", "has", "have",
+    "had", "will", "would", "can", "could", "should", "may", "might",
+    "must", "do", "does", "did",
+})
+_CLAIM_PREPOSITIONS = frozenset({
+    "for", "at", "in", "on", "of", "by", "to", "from", "during",
+    "within", "across", "over", "under", "with", "without", "as",
+    "today", "tonight", "now",
+})
+_CLAIM_CONJUNCTIONS = frozenset({
+    "and", "or", "but", "so", "because", "since", "while", "although",
+    "though", "if", "unless", "when", "that", "which",
+})
+
+# Applied only to the text already matched by pattern 3.
+_CLAIM_SHAPE_PARTS = re.compile(
+    r"no\s+(active|current|official|existing)\s+((?:[a-z-]+\s+){0,2})"
+    r"(warnings?|advisor(?:y|ies)|emergency\s+instructions?)",
+    re.I,
+)
+_CLAIM_NEXT_WORD = re.compile(r"\s*([A-Za-z][A-Za-z'\u2019-]*|\S)?")
+
+
+def _claim_follow_class(rest):
+    """Class of the text after a match, from the fixed vocabulary."""
+    found = _CLAIM_NEXT_WORD.match(rest).group(1)
+
+    if found is None:
+        return "end"
+
+    if not found[0].isalpha():
+        return "punctuation"
+
+    word = found.lower().replace("\u2019", "'")
+
+    if word in _CLAIM_AUXILIARIES:
+        return "auxiliary"
+
+    if word in _CLAIM_PREPOSITIONS:
+        return "preposition"
+
+    if word in _CLAIM_CONJUNCTIONS:
+        return "conjunction"
+
+    return "other_word"
+
+
+def find_unverified_warning_claim_shape(text):
+    """
+    Fixed-vocabulary shape of the first non-conditional pattern 3 match
+    in text, else None. Returns only values from the fixed sets above
+    and a count of 0-2; never the matched text or its surroundings.
+    """
+    text = text.translate(_INVISIBLE)
+    unknown = {
+        "qualifier": "unknown", "term_class": "unknown",
+        "words_between": None, "following_word_class": "unknown",
+    }
+
+    for match in UNVERIFIED_WARNING_CLAIM_PATTERNS[2].finditer(text):
+        lead = text[max(0, match.start() - 40):match.start()]
+
+        if _CONDITIONAL_LEAD.search(lead):
+            continue
+
+        parts = _CLAIM_SHAPE_PARTS.fullmatch(match.group(0))
+
+        if parts is None:
+            return unknown
+
+        term = parts.group(3).lower()
+
+        return {
+            "qualifier": parts.group(1).lower(),
+            "term_class": (
+                "warning" if term.startswith("warning")
+                else "advisory" if term.startswith("advis")
+                else "emergency_instruction"
+            ),
+            "words_between": len(parts.group(2).split()),
+            "following_word_class": _claim_follow_class(
+                text[match.end():]
+            ),
+        }
+
+    return None
+
+
 def model_strings(value):
     """
     Every string inside a model value, however deeply nested,
@@ -2448,6 +2583,10 @@ def reject_unverified_warning_claims(decision, official_warning_status):
                         else "outside_schema"
                     ),
                     pattern_number=pattern_number,
+                    shape=(
+                        find_unverified_warning_claim_shape(text)
+                        if pattern_number == 3 else None
+                    ),
                 )
 
     return decision
@@ -2667,6 +2806,16 @@ def assess_weather(weather, history, policy, retrieved_sections):
         # titles and the override names are fixed program values.
         claim.sources = list(decision["sources"])
         claim.gate_overrides = list(gate_overrides)
+
+        claim_diagnostics = dict(diagnostics)
+        shape = claim.shape_diagnostic()
+
+        if shape is not None:
+            claim_diagnostics["warning_claim_shape"] = shape
+
+        LAST_RESPONSE_DIAGNOSTICS.update(claim_diagnostics)
+        print("\nRESPONSE SHAPE DIAGNOSTICS (program-generated; no model text)")
+        print(json_text(claim_diagnostics))
         raise
 
     decision = apply_official_warning_guard(decision)
@@ -8688,6 +8837,280 @@ def run_tests():
             ).encode("utf-8")
         ).hexdigest()
         == "faf42abf70960e9c7116daae877fb39a37d224d44d65268889a9bf9c9519cd87",
+    )
+
+    # ------------------------------------------------------------
+    # Text-free shape diagnostic for pattern 3 matches.
+    # ------------------------------------------------------------
+    def cl_shape(qualifier, term, between, following):
+        return {
+            "qualifier": qualifier, "term_class": term,
+            "words_between": between, "following_word_class": following,
+        }
+
+    cl_shape_cases = (
+        ("No current advisory is warranted.",
+         cl_shape("current", "advisory", 0, "auxiliary")),
+        ("No existing warnings.",
+         cl_shape("existing", "warning", 0, "punctuation")),
+        ("No official heat advisories were considered.",
+         cl_shape("official", "advisory", 1, "auxiliary")),
+        ("No current alert or advisory is justified.",
+         cl_shape("current", "advisory", 2, "auxiliary")),
+        ("No official emergency instructions for Dubai.",
+         cl_shape("official", "emergency_instruction", 0, "preposition")),
+        ("NO ACTIVE WARNING and monitoring continues.",
+         cl_shape("active", "warning", 0, "conjunction")),
+        ("No official warning information was retrieved.",
+         cl_shape("official", "warning", 0, "other_word")),
+        ("Heat is high; no active advisory",
+         cl_shape("active", "advisory", 0, "end")),
+        ("No active warning-level hazard is indicated.",
+         cl_shape("active", "warning", 0, "punctuation")),
+        ("No\u200b active warning \u2019s",
+         cl_shape("active", "warning", 0, "punctuation")),
+    )
+
+    for text, expected_shape in cl_shape_cases:
+        check(
+            f"Pattern 3 shape classified: {expected_shape['qualifier']}/"
+            f"{expected_shape['term_class']}/"
+            f"{expected_shape['words_between']}/"
+            f"{expected_shape['following_word_class']}",
+            find_unverified_warning_claim_pattern(text) == 3
+            and find_unverified_warning_claim_shape(text) == expected_shape,
+        )
+
+    check(
+        "No shape for conditional, non-matching or empty text",
+        find_unverified_warning_claim_shape(
+            "Verify whether no active warning exists later."
+        ) is None
+        and find_unverified_warning_claim_shape("") is None
+        and find_unverified_warning_claim_shape(
+            "Official warning status was not checked."
+        ) is None,
+    )
+
+    # Unknown or malformed shape values fail safely.
+    cl_unknown = cl_shape("unknown", "unknown", None, "unknown")
+
+    for label, bad in (
+        ("missing", None),
+        ("not a dict", "CL-MARK-SHAPE"),
+        ("empty", {}),
+        ("free text", cl_shape("CL-MARK-Q", "CL-MARK-T", 1, "CL-MARK-F")),
+        ("bad counts", cl_shape("active", "warning", 99, "end")),
+    ):
+        got = UnverifiedWarningClaim(
+            "m", field_label="reasoning", pattern_number=3, shape=bad
+        ).shape_diagnostic()
+        want = {
+            "bad counts": cl_shape("active", "warning", None, "end"),
+            "free text": cl_shape("unknown", "unknown", 1, "unknown"),
+        }.get(label, cl_unknown)
+
+        check(
+            f"Malformed shape fails safely: {label}",
+            got == want and "CL-MARK" not in json_text(got),
+        )
+
+    for bad_count in (True, "2", -1, 3, 1.0):
+        check(
+            f"Words-between value rejected: {bad_count!r}",
+            UnverifiedWarningClaim(
+                "m", "reasoning", 3, cl_shape("active", "warning", bad_count,
+                                              "end")
+            ).shape_diagnostic()["words_between"] is None,
+        )
+
+    check(
+        "Shape is only reported for pattern 3",
+        all(
+            UnverifiedWarningClaim(
+                "m", "reasoning", number,
+                cl_shape("active", "warning", 0, "end"),
+            ).shape_diagnostic() is None
+            for number in (1, 2, 4, 5, None)
+        ),
+    )
+
+    # End to end: marker phrase in reasoning never reaches any output.
+    cl_marker = "CL-SHAPE-MARK-4417"
+    cl_leak = cl_run(cl_body(
+        reasoning=f"{cl_marker} says no current advisory is warranted today."
+    ))
+    cl_leak_dec = cl_leak["decision"]
+    cl_shape_out = cl_leak_dec["response_diagnostics"].get(
+        "warning_claim_shape"
+    )
+    cl_everything = (
+        json_text(cl_leak_dec) + json.dumps(cl_leak["summary"])
+        + cl_leak["log"] + cl_leak["report"]
+    )
+
+    try:
+        reject_unverified_warning_claims(
+            {"reasoning": f"{cl_marker} no current advisory is warranted."},
+            "NOT_CHECKED",
+        )
+        cl_exc = None
+    except UnverifiedWarningClaim as claim:
+        cl_exc = claim
+
+    check(
+        "Claim failure populates response_diagnostics with the shape",
+        cl_shape_out == cl_shape("current", "advisory", 0, "auxiliary")
+        and cl_leak_dec["warning_claim_diagnostic"]
+        == "field=reasoning;pattern=3"
+        and "RESPONSE SHAPE DIAGNOSTICS" in cl_leak["log"]
+        and "warning_claim_shape" in cl_leak["log"],
+    )
+
+    check(
+        "Shape diagnostic holds only fixed-vocabulary values",
+        isinstance(cl_shape_out, dict)
+        and cl_shape_out["qualifier"] in _CLAIM_QUALIFIERS
+        and cl_shape_out["term_class"] in _CLAIM_TERM_CLASSES
+        and cl_shape_out["following_word_class"] in _CLAIM_FOLLOW_CLASSES
+        and cl_shape_out["words_between"] in (0, 1, 2)
+        and set(cl_shape_out) == {
+            "qualifier", "term_class", "words_between",
+            "following_word_class",
+        },
+    )
+
+    check(
+        "Marker phrase never appears in outputs, logs or the exception",
+        cl_marker not in cl_everything
+        and cl_exc is not None
+        and cl_marker not in str(cl_exc) + repr(cl_exc)
+        + json_text(cl_exc.shape_diagnostic())
+        + cl_exc.diagnostic()
+        and "advisory is warranted" not in cl_everything
+        and "today" not in json_text(cl_shape_out),
+    )
+
+    check(
+        "Fail-closed behaviour is unchanged by the shape diagnostic",
+        cl_leak_dec["assessment_status"] == "INCOMPLETE"
+        and cl_leak_dec["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and cl_leak_dec["send_alert"] is False
+        and cl_leak_dec["approval_status"] == "NOT_AUTHORIZED"
+        and cl_leak_dec["risk_score"] is None
+        and cl_leak["summary"]["assessment_status"] == "INCOMPLETE"
+        and cl_leak["summary"]["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and "UNVERIFIED_WARNING_CLAIM"
+        in [r["code"] for r in cl_leak_dec["incomplete_reasons"]],
+    )
+
+    cl_other_dec = cl_run(cl_body(
+        advice="There are no active warnings."
+    ))["decision"]
+
+    check(
+        "Other patterns fill response_diagnostics without a shape",
+        "warning_claim_shape" not in cl_other_dec["response_diagnostics"]
+        and cl_other_dec["response_diagnostics"].get("missing_required")
+        == []
+        and cl_other_dec["warning_claim_diagnostic"]
+        == "field=advice;pattern=2",
+    )
+
+    # Shape diagnostics belong to pattern 3 alone: patterns 1, 2, 4 and
+    # 5 never carry one, at the guard, at the exception and end to end.
+    # Patterns 1 and 2 are the dangerous cases: their sample texts also
+    # match pattern 3, so a shape would be available to attach.
+    for number, (field, value) in cl_samples.items():
+        text = value if isinstance(value, str) else value[0]
+
+        try:
+            reject_unverified_warning_claims({field: value}, "NOT_CHECKED")
+            cl_claim = None
+        except UnverifiedWarningClaim as claim:
+            cl_claim = claim
+
+        cl_end = cl_run(cl_body(**{field: value}))
+        cl_end_diag = cl_end["decision"]["response_diagnostics"]
+        cl_has_shape = number == 3
+
+        check(
+            f"Pattern {number}: shape attached only for pattern 3",
+            cl_claim is not None
+            and cl_claim.pattern_number == number
+            and (cl_claim.shape is not None) is cl_has_shape
+            and (cl_claim.shape_diagnostic() is not None) is cl_has_shape
+            and ("warning_claim_shape" in cl_end_diag) is cl_has_shape
+            and ("warning_claim_shape" in cl_end["log"]) is cl_has_shape
+            and (
+                find_unverified_warning_claim_shape(text) is not None
+            ) is (number in (1, 2, 3)),
+        )
+
+    # The shape finder follows the pattern 3 guard exactly, including
+    # its exclusion list and the whether/if exemption.
+    def cl_p3_hit(text):
+        text = text.translate(_INVISIBLE)
+
+        for match in UNVERIFIED_WARNING_CLAIM_PATTERNS[2].finditer(text):
+            lead = text[max(0, match.start() - 40):match.start()]
+
+            if not _CONDITIONAL_LEAD.search(lead):
+                return True
+
+        return False
+
+    cl_corpus_total = 0
+    cl_corpus_bad = []
+
+    for lead_in in ("", "Verify whether ", "If ", "Note: ", "Heat is high. "):
+        for no_word in ("no", "No", "NO"):
+            for qualifier in ("active", "Current", "official", "existing",
+                              "heat", "immediate"):
+                for between in ("", "heat ", "alert or ", "emergency ",
+                                "very heat alert ", "a b c "):
+                    for term in ("warning", "warnings", "advisory",
+                                 "advisories", "emergency instruction",
+                                 "Emergency  Instructions"):
+                        for tail in ("", " is in effect", " feed", " level",
+                                     " thresholds apply", ".", " for Dubai",
+                                     " and", "-level", " data source",
+                                     " was issued"):
+                            text = (
+                                f"{lead_in}{no_word} {qualifier} "
+                                f"{between}{term}{tail}"
+                            )
+                            number = find_unverified_warning_claim_pattern(
+                                text
+                            )
+                            found = find_unverified_warning_claim_shape(text)
+                            hit = cl_p3_hit(text)
+                            cl_corpus_total += 1
+
+                            if (found is not None) is not hit or (
+                                number == 3 and found is None
+                            ) or (
+                                number in (4, 5, None) and found is not None
+                            ) or (
+                                found is not None
+                                and (
+                                    "unknown" in found.values()
+                                    or found["words_between"]
+                                    not in (0, 1, 2)
+                                    or found["qualifier"]
+                                    not in _CLAIM_QUALIFIERS
+                                    or found["term_class"]
+                                    not in _CLAIM_TERM_CLASSES
+                                    or found["following_word_class"]
+                                    not in _CLAIM_FOLLOW_CLASSES
+                                )
+                            ):
+                                cl_corpus_bad.append(len(cl_corpus_bad))
+
+    check(
+        f"Shape finder matches the pattern 3 guard on {cl_corpus_total} "
+        "generated phrases",
+        cl_corpus_total > 10000 and cl_corpus_bad == [],
     )
 
     # Prompt: approved sentence and rules present exactly once.
