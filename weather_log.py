@@ -1938,6 +1938,132 @@ def response_shape_diagnostics(response):
     }
 
 
+# ------------------------------------------------------------
+# Policy source citations. A citation counts only when it resolves to
+# exactly one retrieved section; the stored value is always that
+# section's canonical title. Nothing outside the retrieved sections can
+# be accepted.
+# ------------------------------------------------------------
+_SECTION_NUMBER = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(.+)$")
+
+
+def normalise_citation(text):
+    """Remove fixed wrappers, case and spacing differences."""
+    text = re.sub(r"\s+", " ", text).strip().strip("\"'`").strip()
+    text = re.sub(r"^=+\s*", "", text)
+    text = re.sub(r"\s*=+$", "", text)
+    text = re.sub(r"^policy section\s*:\s*", "", text, flags=re.I)
+    text = re.sub(r"^(?:#+|\u00a7|section)\s*", "", text, flags=re.I)
+    return text.strip().lower()
+
+
+def _citation_keys(heading):
+    """Full heading, number alone and heading text alone."""
+    full = normalise_citation(heading)
+    keys = {full: "normalised_title"}
+    match = _SECTION_NUMBER.match(full)
+
+    if match:
+        keys[match.group(1)] = "number"
+        keys[match.group(1) + "."] = "number"
+        keys[match.group(2)] = "heading"
+
+    return keys
+
+
+def citation_index(retrieved_sections):
+    """{normalised key: {(canonical title, rule), ...}}"""
+    index = {}
+
+    def add(heading, title, sub_heading=False):
+        for key, rule in _citation_keys(heading).items():
+            # A sub-heading is citable only with its number: "4.1
+            # Likelihood (L)" or "4.1", never "Likelihood (L)" alone.
+            if sub_heading and rule == "heading":
+                continue
+
+            index.setdefault(key, set()).add(
+                (title, "sub_heading" if sub_heading else rule)
+            )
+
+    for section in retrieved_sections:
+        title = section["section"]
+        add(title, title)
+
+        # Numbered sub-headings inside the retrieved text map to it.
+        for line in section["text"].splitlines():
+            if line.startswith("### "):
+                heading = line[4:].strip()
+
+                if _SECTION_NUMBER.match(heading):
+                    add(heading, title, sub_heading=True)
+
+    return index
+
+
+def resolve_citation(citation, retrieved_sections, index=None):
+    """(canonical title or None, rule) for one citation."""
+    titles = [section["section"] for section in retrieved_sections]
+
+    if not isinstance(citation, str):
+        return None, "unmatched"
+
+    if citation in titles:
+        return citation, "exact"
+
+    index = citation_index(retrieved_sections) if index is None else index
+    matches = index.get(normalise_citation(citation), set())
+    resolved = {title for title, _ in matches}
+
+    if len(resolved) == 1:
+        title = resolved.pop()
+        rules = sorted({rule for t, rule in matches if t == title})
+        return title, rules[0]
+
+    if len(resolved) > 1:
+        return None, "ambiguous"
+
+    if _SECTION_NUMBER.match(normalise_citation(citation)):
+        return None, "unretrieved_section_reference"
+
+    return None, "unmatched"
+
+
+def resolve_policy_sources(citations, retrieved_sections):
+    """Canonical titles for every resolvable citation, in order, once."""
+    index = citation_index(retrieved_sections)
+    resolved = []
+
+    for citation in citations:
+        title, _ = resolve_citation(citation, retrieved_sections, index)
+
+        if title is not None and title not in resolved:
+            resolved.append(title)
+
+    return resolved
+
+
+def source_resolution_diagnostics(citations, retrieved_sections):
+    """
+    Program-generated counts per resolution rule. Never includes the
+    model's citation text.
+    """
+    if not isinstance(citations, list):
+        return {"sources_type": json_type_name(citations)}
+
+    index = citation_index(retrieved_sections)
+    counts = {}
+
+    for citation in citations:
+        _, rule = resolve_citation(citation, retrieved_sections, index)
+        counts[rule] = counts.get(rule, 0) + 1
+
+    return {
+        "source_count": len(citations),
+        "resolution_counts": dict(sorted(counts.items())),
+    }
+
+
 def validate_decision(decision, retrieved_sections):
     if not isinstance(decision, dict):
         raise ValueError("AI returned an invalid assessment.")
@@ -2026,16 +2152,11 @@ def validate_decision(decision, retrieved_sections):
             field,
         )
 
-    available_titles = {
-        section["section"]
-        for section in retrieved_sections
-    }
-
-    valid_sources = [
-        source
-        for source in decision["sources"]
-        if source in available_titles
-    ]
+    # Only citations that resolve to exactly one retrieved section are
+    # kept, as canonical titles; anything else is dropped.
+    valid_sources = resolve_policy_sources(
+        decision["sources"], retrieved_sections
+    )
 
     if not valid_sources:
         raise ValueError(
@@ -2386,8 +2507,10 @@ def assess_weather(weather, history, policy, retrieved_sections):
     user_prompt = (
         "Assess the supplied weather situation using the policy "
         "sections below. Do not infer official warning status. "
-        "Do not claim the assessment is complete. Cite section "
-        "titles exactly as written in the section headers.\n\n"
+        "Do not claim the assessment is complete. In sources, give "
+        "each title exactly as it appears after 'POLICY SECTION:' in a "
+        "block header (for example '6.1 Extreme Heat'), without the "
+        "prefix or the '===' markers.\n\n"
         + format_policy_text(retrieved_sections)
         + "\n\nEVIDENCE AND STATUS (JSON):\n"
         + json_text(context)
@@ -2411,6 +2534,11 @@ def assess_weather(weather, history, policy, retrieved_sections):
 
     # Computed before validation, which normalises some values.
     diagnostics = response_shape_diagnostics(decision)
+
+    if isinstance(decision, dict) and "sources" in decision:
+        diagnostics["source_resolution"] = source_resolution_diagnostics(
+            decision["sources"], retrieved_sections
+        )
 
     try:
         decision = validate_decision(
@@ -7305,6 +7433,371 @@ def run_tests():
         ]
         and "validate against the response schema"
         in GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"],
+    )
+
+    # ------------------------------------------------------------
+    # Policy source citations resolve only to retrieved sections
+    # (self-contained, offline).
+    # ------------------------------------------------------------
+    with contextlib.redirect_stdout(io.StringIO()):
+        sr_policy = load_guidelines()
+        sr_hazards = {"HEAT": ["t"]}
+        sr_required = select_hazard_guidance(sr_policy, sr_hazards)
+        sr_required += select_conditional_sections(
+            sr_policy, sr_hazards, {"current": {"time": "2026-11-08T12:00"}}
+        )
+        sr_sections = search_guidelines(
+            sr_policy, "x", k=0, required_sections=sr_required
+        )
+
+    sr_titles = [section["section"] for section in sr_sections]
+
+    check(
+        "Source fixture matches the failing run's nine sections",
+        sr_titles == [
+            "4. Risk Assessment Dimensions",
+            "13. Advice and Communication Requirements",
+            "8. Alert Decision Framework",
+            "9. Official Warning Override",
+            "14. Human Approval and Notification Governance",
+            "16. Final Decision Rule",
+            "6. Weather Hazard Assessment",
+            "6.1 Extreme Heat",
+            "7. Regulatory and Workplace Compliance",
+        ],
+    )
+
+    for label, citation, expected in (
+        ("exact title", "6.1 Extreme Heat", "6.1 Extreme Heat"),
+        ("header prefix", "POLICY SECTION: 6.1 Extreme Heat",
+         "6.1 Extreme Heat"),
+        ("whole header line", "=== POLICY SECTION: 6.1 Extreme Heat ===",
+         "6.1 Extreme Heat"),
+        ("heading without number", "Extreme Heat", "6.1 Extreme Heat"),
+        ("number only", "6.1", "6.1 Extreme Heat"),
+        ("number with dot", "8.", "8. Alert Decision Framework"),
+        ("Section prefix", "Section 6.1 Extreme Heat", "6.1 Extreme Heat"),
+        ("section sign", "§ 9. Official Warning Override",
+         "9. Official Warning Override"),
+        ("markdown heading", "## 4. Risk Assessment Dimensions",
+         "4. Risk Assessment Dimensions"),
+        ("different case", "6.1 extreme heat", "6.1 Extreme Heat"),
+        ("quoted", "'16. Final Decision Rule'", "16. Final Decision Rule"),
+        ("numbered sub-heading", "4.1 Likelihood (L)",
+         "4. Risk Assessment Dimensions"),
+        ("parent of hazard subsection", "Weather Hazard Assessment",
+         "6. Weather Hazard Assessment"),
+    ):
+        check(
+            f"Citation resolves to its canonical title: {label}",
+            resolve_policy_sources([citation], sr_sections) == [expected],
+        )
+
+    for label, citation in (
+        ("section not retrieved", "5. Risk Calculation Model"),
+        ("unretrieved number", "5"),
+        ("unnumbered enum sub-heading", "MONITOR"),
+        ("policy name", "Dubai Weather Safety Guidelines"),
+        ("arbitrary text", "NCM website"),
+        ("partial heading", "Heat"),
+        ("empty string", ""),
+    ):
+        check(
+            f"Citation stays rejected: {label}",
+            resolve_policy_sources([citation], sr_sections) == [],
+        )
+
+    for label, citation in (
+        ("numbered sub-heading", "4.1 Likelihood (L)"),
+        ("numbered sub-heading as markdown", "### 4.4 Duration (D)"),
+        ("sub-heading number only", "4.3"),
+    ):
+        check(
+            f"Numbered sub-heading resolves to its parent: {label}",
+            resolve_policy_sources([citation], sr_sections)
+            == ["4. Risk Assessment Dimensions"],
+        )
+
+    for label, citation in (
+        ("enum sub-heading", "MONITOR"),
+        ("enum sub-heading as markdown", "### ADVISORY_RECOMMENDED"),
+        ("enum sub-heading lower case", "escalate_for_review"),
+        ("numbered sub-heading without its number", "Likelihood (L)"),
+        ("another unnumbered form", "Duration (D)"),
+        ("unnumbered parent-section sub-heading", "Risk bands"),
+    ):
+        check(
+            f"Unnumbered sub-heading is rejected: {label}",
+            resolve_policy_sources([citation], sr_sections) == []
+            and resolve_citation(citation, sr_sections)[0] is None,
+        )
+
+    check(
+        "Unnumbered sub-headings alone cannot make sources valid",
+        resolve_policy_sources(
+            ["MONITOR", "Likelihood (L)", "### ESCALATE_FOR_REVIEW"],
+            sr_sections,
+        ) == [],
+    )
+
+    check(
+        "Ambiguous numbered sub-heading is rejected",
+        resolve_policy_sources(["2.1 Shared"], [
+            {"section": "1. A", "text": "### 2.1 Shared\nx"},
+            {"section": "3. B", "text": "### 2.1 Shared\ny"},
+        ]) == [],
+    )
+
+    sr_prompt_messages = []
+
+    def sr_capture(messages, temperature=0.1):
+        sr_prompt_messages.append(messages)
+        raise RuntimeError("captured")
+
+    sr_saved_ask = globals()["ask_groq"]
+    globals()["ask_groq"] = sr_capture
+
+    try:
+        assess_weather(
+            {"city": CITY, "source": "Open-Meteo", "retrieved_at": "x",
+             "current": {}, "hourly_forecast_next_24h": []},
+            [], sr_policy, sr_sections,
+        )
+    except RuntimeError:
+        pass
+    finally:
+        globals()["ask_groq"] = sr_saved_ask
+
+    sr_user_prompt = (
+        sr_prompt_messages[0][1]["content"] if sr_prompt_messages else ""
+    )
+    sr_clarification = (
+        "In sources, give each title exactly as it appears after "
+        "'POLICY SECTION:' in a block header (for example '6.1 Extreme "
+        "Heat'), without the prefix or the '===' markers."
+    )
+
+    check(
+        "Prompt carries the source-citation clarification exactly once",
+        sr_user_prompt.count(sr_clarification) == 1
+        and "Cite section titles exactly as written in the section "
+        "headers" not in sr_user_prompt
+        and "In sources, cite exact policy section titles"
+        in " ".join(SYSTEM_PROMPT.split()),
+    )
+
+    sr_ambiguous = [
+        {"section": "1. Heat Advice", "text": "x"},
+        {"section": "2. Heat Advice", "text": "y"},
+    ]
+
+    check(
+        "Ambiguous citation stays rejected",
+        resolve_policy_sources(["Heat Advice"], sr_ambiguous) == []
+        and resolve_citation("Heat Advice", sr_ambiguous)
+        == (None, "ambiguous"),
+    )
+
+    check(
+        "Mixed citations keep only resolved canonical titles, once",
+        resolve_policy_sources(
+            ["Extreme Heat", "MONITOR", "6.1", "8. Alert Decision Framework",
+             "5. Risk Calculation Model", "6.1 Extreme Heat"],
+            sr_sections,
+        ) == ["6.1 Extreme Heat", "8. Alert Decision Framework"],
+    )
+
+    def sr_response(sources):
+        return {
+            "hazard_type": "HEAT",
+            "likelihood_score": 2, "likelihood_reason": "r",
+            "severity_score": 2, "severity_reason": "r",
+            "exposure_score": None, "exposure_reason": "r",
+            "duration_score": None, "duration_reason": "r",
+            "geographic_impact_score": None,
+            "geographic_impact_reason": "r",
+            "alert_recommendation": "UNABLE_TO_ASSESS",
+            "advice": "Official warning status was not checked.",
+            "reasoning": "r", "recommended_actions": [],
+            "limitations": [], "missing_evidence": [],
+            "sources": sources,
+        }
+
+    def sr_validate_error_only(sources):
+        try:
+            validate_decision(sr_response(sources), sr_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    def sr_validate(sources):
+        try:
+            return validate_decision(sr_response(sources), sr_sections)
+        except ValueError as exc:
+            return str(exc)
+
+    sr_near_miss = sr_validate(
+        ["POLICY SECTION: 6.1 Extreme Heat", "Extreme Heat"]
+    )
+
+    check(
+        "Validator stores canonical titles for near-miss citations",
+        isinstance(sr_near_miss, dict)
+        and sr_near_miss["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    check(
+        "Validator fails closed when only unnumbered sub-headings are cited",
+        sr_validate_error_only(["MONITOR", "Likelihood (L)"])
+        == "Assessment did not identify a valid retrieved policy section.",
+    )
+
+    check(
+        "No resolvable citation still fails closed with the same error",
+        sr_validate(["5. Risk Calculation Model", "MONITOR", "NCM"])
+        == "Assessment did not identify a valid retrieved policy section."
+        and sr_validate([])
+        == "Assessment did not identify a valid retrieved policy section.",
+    )
+
+    sr_diag = source_resolution_diagnostics(
+        ["6.1 Extreme Heat", "Extreme Heat", "SR-MARKER-TEXT",
+         "5. Risk Calculation Model", "4.1 Likelihood (L)"],
+        sr_sections,
+    )
+
+    check(
+        "Source diagnostics are counts per rule, never citation text",
+        sr_diag == {
+            "source_count": 5,
+            "resolution_counts": {
+                "exact": 1, "heading": 1, "sub_heading": 1,
+                "unmatched": 1, "unretrieved_section_reference": 1,
+            },
+        }
+        and "SR-MARKER" not in json_text(sr_diag),
+    )
+
+    # Real pipeline: an unresolvable response fails closed and records
+    # the counts; a near-miss response is accepted canonically.
+    def sr_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    class SrResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class SrTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return SrResponse(self.content)
+
+    def sr_pipeline(sources):
+        transport = SrTransport(json_text(sr_response(sources)))
+        printed = io.StringIO()
+        saved = {name: globals()[name] for name in (
+            "HTTP", "GROQ_API_KEY", "require_configuration",
+            "get_weather", "tool_get_history",
+        )}
+        globals().update({
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_sr_test_key",
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: sr_weather(),
+            "tool_get_history": lambda n=3: [],
+        })
+
+        try:
+            with contextlib.redirect_stdout(printed):
+                decision = run_weather_agent()[0]
+        finally:
+            globals().update(saved)
+
+        return decision, printed.getvalue(), transport
+
+    sr_bad, sr_bad_log, sr_bad_transport = sr_pipeline(
+        ["SR-MARKER-ONE", "5. Risk Calculation Model"]
+    )
+
+    check(
+        "Real path: unresolvable sources fail closed with counts only",
+        len(sr_bad_transport.posts) == 1
+        and sr_bad["assessment_status"] == "INCOMPLETE"
+        and sr_bad["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and sr_bad["send_alert"] is False
+        and "did not identify a valid retrieved policy section"
+        in sr_bad["reasoning"]
+        and sr_bad["response_diagnostics"]["source_resolution"] == {
+            "source_count": 2,
+            "resolution_counts": {
+                "unmatched": 1, "unretrieved_section_reference": 1,
+            },
+        }
+        and "SR-MARKER" not in sr_bad_log + json_text(sr_bad),
+    )
+
+    sr_good, _, _ = sr_pipeline(
+        ["=== POLICY SECTION: 6.1 Extreme Heat ===", "4.4 Duration (D)"]
+    )
+
+    check(
+        "Real path: near-miss citations are accepted as canonical titles",
+        sr_good["sources"]
+        == ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"]
+        and sr_good["response_diagnostics"] == {}
+        and sr_good["assessment_status"] == "INCOMPLETE",
+    )
+
+    sr_claim, _, _ = sr_pipeline(
+        ["6.1 Extreme Heat", "No official heat advisory is in effect"]
+    )
+
+    check(
+        "Claim text in an unresolvable source never reaches the output",
+        "advisory is in effect" not in json_text(sr_claim)
+        and sr_claim["sources"] == ["6.1 Extreme Heat"],
     )
 
     # agent-dry must not POST to Sheets or send email.
