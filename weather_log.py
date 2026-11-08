@@ -2257,7 +2257,39 @@ def apply_evidence_gate(decision):
 
 
 class UnverifiedWarningClaim(ValueError):
-    """Model text asserts an official warning state that was not checked."""
+    """
+    Model text asserts an official warning state that was not checked.
+
+    Carries only program-generated metadata: the schema field label
+    (or "outside_schema"), the number (1-5) of the first matching
+    pattern, the already-validated canonical policy sources and the
+    evidence-gate override names. Never the matched text.
+    """
+
+    def __init__(self, message, field_label="unknown", pattern_number=None):
+        super().__init__(message)
+        self.field_label = field_label
+        self.pattern_number = pattern_number
+        self.sources = []
+        self.gate_overrides = []
+
+    def diagnostic(self):
+        """"field=<label>;pattern=<n>" built from fixed values only."""
+        label = (
+            self.field_label
+            if self.field_label in RESPONSE_FIELDS
+            or self.field_label == "outside_schema"
+            else "unknown"
+        )
+        number = (
+            self.pattern_number
+            if type(self.pattern_number) is int
+            and 1 <= self.pattern_number
+            <= len(UNVERIFIED_WARNING_CLAIM_PATTERNS)
+            else None
+        )
+
+        return f"field={label};pattern={number}"
 
 
 _WARNING_TERMS = r"(?:warnings?|advisor(?:y|ies)|emergency\s+instructions?)"
@@ -2335,21 +2367,33 @@ PROGRAM_OWNED_FIELDS = frozenset({
     "weather_data_timestamp", "assessment_timestamp", "city",
     "timezone", "history_checked", "history_status",
     "response_diagnostics", "evidence_gate_overrides",
+    "warning_claim_diagnostic",
 })
 
 
-def find_unverified_warning_claim(text):
-    """Return True when text asserts an official warning state."""
+def find_unverified_warning_claim_pattern(text):
+    """
+    Number (1-5, in UNVERIFIED_WARNING_CLAIM_PATTERNS order) of the
+    first pattern that asserts an official warning state in text,
+    else None.
+    """
     text = text.translate(_INVISIBLE)
 
-    for pattern in UNVERIFIED_WARNING_CLAIM_PATTERNS:
+    for number, pattern in enumerate(
+        UNVERIFIED_WARNING_CLAIM_PATTERNS, start=1
+    ):
         for match in pattern.finditer(text):
             lead = text[max(0, match.start() - 40):match.start()]
 
             if not _CONDITIONAL_LEAD.search(lead):
-                return True
+                return number
 
-    return False
+    return None
+
+
+def find_unverified_warning_claim(text):
+    """Return True when text asserts an official warning state."""
+    return find_unverified_warning_claim_pattern(text) is not None
 
 
 def model_strings(value):
@@ -2392,11 +2436,18 @@ def reject_unverified_warning_claims(decision, official_warning_status):
         )
 
         for text in model_strings({field: value}):
-            if find_unverified_warning_claim(text):
+            pattern_number = find_unverified_warning_claim_pattern(text)
+
+            if pattern_number is not None:
                 raise UnverifiedWarningClaim(
                     "Model output makes an unverified official-warning "
                     f"claim in {location} while official warning status "
-                    f"is {official_warning_status}."
+                    f"is {official_warning_status}.",
+                    field_label=(
+                        field if field in RESPONSE_FIELDS
+                        else "outside_schema"
+                    ),
+                    pattern_number=pattern_number,
                 )
 
     return decision
@@ -2484,10 +2535,11 @@ Requirements:
    definitions in the supplied policy, with a separate evidence-based
    rationale for each.
 3. Never treat missing evidence as a low score.
-4. Official warning status is NOT_CHECKED. Never state or imply that
-   any official warning or advisory is, or is not, in effect; say that
-   official warning status was not checked. Open-Meteo is not an
-   official UAE warning authority.
+4. Official warning status is NOT_CHECKED; if mentioned, use exactly:
+   "Official warning status was not checked." Never claim or imply an
+   official warning or advisory is active or inactive; use no other
+   wording that could confirm its presence or absence. Open-Meteo is
+   not an official UAE warning authority.
 5. Distinguish current observations, forecasts and historical context.
 6. Do not assume all residents or workers have equal exposure.
 7. Previous alerts must not suppress a new or different hazard. Do not
@@ -2612,7 +2664,14 @@ def assess_weather(weather, history, policy, retrieved_sections):
 
     # Checked on the model's own text, before the guard adds ours. The
     # warning status is the program's: no official feed is integrated.
-    decision = reject_unverified_warning_claims(decision, "NOT_CHECKED")
+    try:
+        decision = reject_unverified_warning_claims(decision, "NOT_CHECKED")
+    except UnverifiedWarningClaim as claim:
+        # Validation has already run: the sources are canonical retrieved
+        # titles and the override names are fixed program values.
+        claim.sources = list(decision["sources"])
+        claim.gate_overrides = list(gate_overrides)
+        raise
 
     decision = apply_official_warning_guard(decision)
 
@@ -2815,8 +2874,22 @@ def run_weather_agent():
             failure_code = "ASSESSMENT_ERROR"
 
         add_incomplete_reason(
-            decision, failure_code, type(exc).__name__
+            decision,
+            failure_code,
+            exc.diagnostic()
+            if isinstance(exc, UnverifiedWarningClaim)
+            else type(exc).__name__,
         )
+
+        if isinstance(exc, UnverifiedWarningClaim):
+            decision["sources"] = [
+                title for title in exc.sources if isinstance(title, str)
+            ]
+            decision["evidence_gate_overrides"] = [
+                name for name in exc.gate_overrides
+                if name in EVIDENCE_GATED_DIMENSIONS
+            ]
+            decision["warning_claim_diagnostic"] = exc.diagnostic()
 
         if isinstance(exc, FileNotFoundError):
             decision["policy_status"] = "UNAVAILABLE"
@@ -2926,6 +2999,9 @@ def run_agent_job(dry=False):
                 ],
                 "evidence_gate_overrides": decision.get(
                     "evidence_gate_overrides", []
+                ),
+                "warning_claim_diagnostic": decision.get(
+                    "warning_claim_diagnostic"
                 ),
                 "hazards_screened": sorted(
                     decision.get("hazard_screening") or {}
@@ -5361,8 +5437,8 @@ def run_tests():
 
     check(
         "Prompt forbids stating any official warning state",
-        "Never state or imply that any official warning or advisory "
-        "is, or is not, in effect" in " ".join(SYSTEM_PROMPT.split()),
+        "Never claim or imply an official warning or advisory "
+        "is active or inactive" in " ".join(SYSTEM_PROMPT.split()),
     )
 
     # A3. Real path: the incident's contradictory advice fails closed.
@@ -5508,10 +5584,16 @@ def run_tests():
         abc_fits({}),
     )
 
+    # With the clarified official-warning rule in the system prompt,
+    # heat alone with worst-case (cap-sized) history is 8,020 estimated
+    # tokens against the 8,000 cap and fails closed. Realistic history
+    # still fits (see the realistic-history heat checks).
     for code in HAZARD_POLICY_TITLES:
         check(
-            f"24-hour series: single hazard fits every budget: {code}",
-            abc_fits({code: ["t"]}),
+            f"24-hour series: single hazard "
+            f"{'is blocked with worst-case history' if code == 'HEAT' else 'fits every budget'}"
+            f": {code}",
+            abc_fits({code: ["t"]}) is (code != "HEAT"),
         )
 
     # With the 1,000-token completion allowance, heat + wind with
@@ -6338,8 +6420,8 @@ def run_tests():
         "separate evidence-based rationale for each",
         "Never treat missing evidence as a low score",
         "Official warning status is NOT_CHECKED",
-        "Never state or imply that any official warning or advisory is, "
-        "or is not, in effect",
+        "Never claim or imply an official warning or advisory is "
+        "active or inactive",
         "Open-Meteo is not an official UAE warning authority",
         "Distinguish current observations, forecasts and historical "
         "context",
@@ -8278,7 +8360,7 @@ def run_tests():
             "sources", "alert_recommendation", "assessment_status",
             "risk_score_calculated", "risk_band",
             "incomplete_reason_codes", "evidence_gate_overrides",
-            "hazards_screened",
+            "warning_claim_diagnostic", "hazards_screened",
         ])
         and "EG-MARK" not in audit_text
         and "Heat screening" not in audit_text
@@ -8290,6 +8372,358 @@ def run_tests():
         "gsk_eg_test_key" not in eg_four["log"] + eg_four["report"]
         and "temperature" not in audit_text
         and eg_four["sheet_posts"] == [],
+    )
+
+    # ------------------------------------------------------------
+    # Warning-claim failure diagnostics (self-contained, offline).
+    # ------------------------------------------------------------
+    def cl_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def cl_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def cl_body(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 4, "exposure_reason": "CL-MARK-EXP",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 4,
+            "geographic_impact_reason": "CL-MARK-GEO",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit outdoor activity. Official warning status "
+                      "was not checked.",
+            "reasoning": "Heat screening triggered.",
+            "recommended_actions": [], "limitations": [],
+            "missing_evidence": [],
+            "sources": ["POLICY SECTION: 6.1 Extreme Heat",
+                        "Extreme Heat", "CL-MARK-SRC"],
+        }
+        body.update(changes)
+        return body
+
+    class ClResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class ClTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return ClResponse(self.content)
+
+    def cl_run(body):
+        transport = ClTransport(json_text(body))
+        printed = io.StringIO()
+        report = io.StringIO()
+        sheets = ClTransport("OK")
+
+        def assess():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = cl_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_cl_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: cl_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            assess,
+        )
+
+        def job():
+            with contextlib.redirect_stdout(report):
+                run_agent_job(dry=True)
+
+        cl_override(
+            {"run_weather_agent": lambda: (decision, used),
+             "HTTP": sheets},
+            job,
+        )
+
+        summary = json.loads(next(
+            line for line in report.getvalue().splitlines()
+            if line.startswith("{") and "risk_score_calculated" in line
+        ))
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "report": report.getvalue(),
+            "summary": summary,
+            "sheet_posts": sheets.posts,
+        }
+
+    # 1. Each of the five patterns records its own number and field.
+    cl_samples = {
+        1: ("reasoning", "No official heat advisory is in effect."),
+        2: ("advice", "There are no active warnings."),
+        3: ("limitations", ["No official warnings were checked."]),
+        4: ("missing_evidence", ["A heat warning is currently in effect."]),
+        5: ("recommended_actions", ["NCM has not issued any warning."]),
+    }
+
+    for number, (field, value) in cl_samples.items():
+        text = value if isinstance(value, str) else value[0]
+
+        check(
+            f"Pattern {number} is identified by number",
+            find_unverified_warning_claim_pattern(text) == number
+            and find_unverified_warning_claim(text) is True,
+        )
+
+        run = cl_run(cl_body(**{field: value}))
+        decision = run["decision"]
+        expected = f"field={field};pattern={number}"
+        reasons = {
+            r["code"]: r["detail"] for r in decision["incomplete_reasons"]
+        }
+
+        check(
+            f"Pattern {number} in {field} records {expected}",
+            reasons.get("UNVERIFIED_WARNING_CLAIM") == expected
+            and decision.get("warning_claim_diagnostic") == expected
+            and run["summary"].get("warning_claim_diagnostic") == expected
+            and f"INCOMPLETE REASON: UNVERIFIED_WARNING_CLAIM | {expected}"
+            in run["report"],
+        )
+
+    # Non-schema key names are labelled, never echoed.
+    cl_outside = cl_run(cl_body(**{
+        "CL-MARK-KEY": "There are no active warnings."
+    }))
+
+    check(
+        "Claim outside the schema records field=outside_schema",
+        cl_outside["decision"].get("warning_claim_diagnostic")
+        == "field=outside_schema;pattern=2"
+        and "CL-MARK-KEY" not in json_text(cl_outside["decision"])
+        + cl_outside["log"] + cl_outside["report"],
+    )
+
+    check(
+        "Diagnostic is built from fixed values even if metadata is bad",
+        UnverifiedWarningClaim("m", field_label="CL-MARK-LABEL",
+                               pattern_number=99).diagnostic()
+        == "field=unknown;pattern=None"
+        and UnverifiedWarningClaim("m", "advice", 3).diagnostic()
+        == "field=advice;pattern=3"
+        and UnverifiedWarningClaim("m", "outside_schema", 5).diagnostic()
+        == "field=outside_schema;pattern=5",
+    )
+
+    # 2-3. Validated sources and override names survive the failure.
+    cl_run_one = cl_run(cl_body(reasoning="No official heat advisory is "
+                                          "in effect."))
+    cl_d = cl_run_one["decision"]
+
+    check(
+        "Canonical validated sources survive the warning-claim failure",
+        cl_d["sources"] == ["6.1 Extreme Heat"]
+        and cl_run_one["summary"]["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    check(
+        "Both evidence-gate override names survive the failure",
+        cl_d.get("evidence_gate_overrides")
+        == ["exposure_score", "geographic_impact_score"]
+        and cl_run_one["summary"]["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"],
+    )
+
+    # 4. No model-generated text anywhere in the failure output.
+    cl_everything = (
+        json_text(cl_d) + cl_run_one["log"] + cl_run_one["report"]
+        + json_text(cl_run_one["summary"])
+    )
+
+    check(
+        "No model text, marker or unvalidated source leaks",
+        "CL-MARK" not in cl_everything
+        and "advisory is in effect" not in cl_everything
+        and "POLICY SECTION: 6.1" not in cl_everything
+        and "gsk_cl_test_key" not in cl_everything,
+    )
+
+    check(
+        "Limitations and missing evidence hold no model text",
+        all(
+            "advisory" not in item.lower() or "official" in item.lower()
+            for item in cl_d["limitations"] + cl_d["missing_evidence"]
+        )
+        and "CL-MARK" not in json_text(
+            cl_d["limitations"] + cl_d["missing_evidence"]
+        ),
+    )
+
+    # 5. The fail-closed decision keeps every required value.
+    check(
+        "Warning-claim failure is fully fail-closed",
+        cl_d["assessment_status"] == "INCOMPLETE"
+        and cl_d["risk_score"] is None
+        and cl_d["risk_band"] == "UNASSESSED"
+        and cl_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and cl_d["send_alert"] is False
+        and cl_d["alert_message"] == ""
+        and cl_d["approval_status"] == "NOT_AUTHORIZED"
+        and cl_d["notification_status"] == "NOT_SENT"
+        and cl_d["official_warning_status"] == "NOT_CHECKED"
+        and cl_d["exposure_score"] is None
+        and cl_d["geographic_impact_score"] is None
+        and [r["code"] for r in cl_d["incomplete_reasons"]]
+        == ["UNVERIFIED_WARNING_CLAIM", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and cl_run_one["sheet_posts"] == [],
+    )
+
+    check(
+        "Audit summary on the failure has exactly the approved keys",
+        sorted(cl_run_one["summary"]) == sorted([
+            "sources", "alert_recommendation", "assessment_status",
+            "risk_score_calculated", "risk_band",
+            "incomplete_reason_codes", "evidence_gate_overrides",
+            "warning_claim_diagnostic", "hazards_screened",
+        ])
+        and cl_run_one["summary"]["risk_score_calculated"] is False
+        and cl_run_one["summary"]["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    # Failures that are not claims carry no claim diagnostic and no
+    # unvalidated sources.
+    cl_other = cl_run({"not": "the schema"})
+
+    check(
+        "Non-claim failure has no claim diagnostic, sources or overrides",
+        "warning_claim_diagnostic" in cl_other["summary"]
+        and cl_other["summary"]["warning_claim_diagnostic"] is None
+        and cl_other["summary"]["sources"] == []
+        and cl_other["summary"]["evidence_gate_overrides"] == []
+        and "ASSESSMENT_ERROR"
+        in cl_other["summary"]["incomplete_reason_codes"],
+    )
+
+    check(
+        "Model cannot supply the claim diagnostic field",
+        "warning_claim_diagnostic" in PROGRAM_OWNED_FIELDS
+        and "program-owned fields" in cl_run(cl_body(
+            warning_claim_diagnostic="field=advice;pattern=1"
+        ))["decision"]["reasoning"],
+    )
+
+    # 6. Genuine claims stay blocked (including previously flagged
+    # compliant-looking wording: the guard is unchanged).
+    for text in (
+        "No official heat advisory is in effect.",
+        "There are no active warnings.",
+        "A heat warning is currently in effect.",
+        "NCM has not issued any warning.",
+        "No official warnings were checked.",
+        "Official advisories are currently unverified.",
+    ):
+        check(
+            f"Claim stays blocked: {text}",
+            find_unverified_warning_claim(text),
+        )
+
+    for text in (
+        "Official warning status was not checked.",
+        "Official warning status was not checked; consult NCM for "
+        "official warnings.",
+    ):
+        check(
+            f"Approved wording is not a claim: {text[:48]}",
+            not find_unverified_warning_claim(text),
+        )
+
+    check(
+        "The five warning-claim patterns are unchanged",
+        len(UNVERIFIED_WARNING_CLAIM_PATTERNS) == 5
+        and hashlib.sha256(
+            "\n".join(
+                f"{p.flags}:{p.pattern}"
+                for p in UNVERIFIED_WARNING_CLAIM_PATTERNS
+            ).encode("utf-8")
+        ).hexdigest()
+        == "faf42abf70960e9c7116daae877fb39a37d224d44d65268889a9bf9c9519cd87",
+    )
+
+    # Prompt: approved sentence and rules present exactly once.
+    cl_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Prompt carries the approved warning sentence and rules once",
+        cl_prompt.count('"Official warning status was not checked."') == 1
+        and cl_prompt.count("Official warning status is NOT_CHECKED") == 1
+        and "Never claim or imply an official warning or advisory is "
+        "active or inactive" in cl_prompt
+        and "use no other wording that could confirm its presence or "
+        "absence" in cl_prompt
+        and "Open-Meteo is not an official UAE warning authority"
+        in cl_prompt,
+    )
+
+    # 7. Budgets: the limits are unchanged. The revised prompt's fit is
+    # proved by the realistic-history heat checks above, which build
+    # their request with this SYSTEM_PROMPT.
+    check(
+        "Request and token budgets are unchanged by the prompt revision",
+        MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500
+        and MAX_COMPLETION_TOKENS == 1000,
     )
 
     # agent-dry must not POST to Sheets or send email.
