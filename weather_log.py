@@ -2674,10 +2674,7 @@ Requirements:
    definitions in the supplied policy, with a separate evidence-based
    rationale for each.
 3. Never treat missing evidence as a low score.
-4. Official warning status is NOT_CHECKED and is reported by the
-   program. Do not mention official warnings or advisories in any
-   model-generated field. Open-Meteo is not an official UAE warning
-   authority.
+4. Official warning status is NOT_CHECKED (program-reported). Free text must not use warning, warnings, advisory or advisories, or claim their existence, absence, availability or status; describe evidence limits without that. Follow the schema. Open-Meteo is not an official UAE warning authority.
 5. Distinguish current observations, forecasts and historical context.
 6. Do not assume all residents or workers have equal exposure.
 7. Previous alerts must not suppress a new or different hazard. Do not
@@ -5581,9 +5578,10 @@ def run_tests():
     )
 
     check(
-        "Prompt forbids mentioning official warnings in model fields",
-        "Do not mention official warnings or advisories in any "
-        "model-generated field" in " ".join(SYSTEM_PROMPT.split()),
+        "Prompt forbids the terms warning and advisory in free text",
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability "
+        "or status" in " ".join(SYSTEM_PROMPT.split()),
     )
 
     # A3. Real path: the incident's contradictory advice fails closed.
@@ -6559,8 +6557,9 @@ def run_tests():
         "separate evidence-based rationale for each",
         "Never treat missing evidence as a low score",
         "Official warning status is NOT_CHECKED",
-        "Do not mention official warnings or advisories in any "
-        "model-generated field",
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability "
+        "or status",
         "Open-Meteo is not an official UAE warning authority",
         "Distinguish current observations, forecasts and historical "
         "context",
@@ -9118,10 +9117,14 @@ def run_tests():
 
     check(
         "Prompt carries the warning-mention ban and status rule once",
-        cl_prompt.count("Official warning status is NOT_CHECKED and is "
-                        "reported by the program") == 1
-        and cl_prompt.count("Do not mention official warnings or "
-                            "advisories in any model-generated field") == 1
+        cl_prompt.count("Official warning status is NOT_CHECKED "
+                        "(program-reported)") == 1
+        and cl_prompt.count("Free text must not use warning, warnings, "
+                            "advisory or advisories, or claim their "
+                            "existence, absence, availability or "
+                            "status") == 1
+        and "Do not mention official warnings" not in cl_prompt
+        and "Never write the words" not in cl_prompt
         and cl_prompt.count("Open-Meteo is not an official UAE warning "
                             "authority") == 1
         and "Official warning status was not checked" not in cl_prompt
@@ -9213,10 +9216,12 @@ def run_tests():
     # Prompt instruction validation.
     check(
         "Rule 4 wording is exactly the approved text",
-        "4. Official warning status is NOT_CHECKED and is reported by "
-        "the program. Do not mention official warnings or advisories in "
-        "any model-generated field. Open-Meteo is not an official UAE "
-        "warning authority. 5. " in vb_prompt,
+        "4. Official warning status is NOT_CHECKED (program-reported). "
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability or "
+        "status; describe evidence limits without that. Follow the "
+        "schema. Open-Meteo is not an official UAE warning authority. "
+        "5. " in vb_prompt,
     )
 
     # Evidence status validation.
