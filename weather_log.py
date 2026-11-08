@@ -1734,7 +1734,8 @@ def validate_string_list(value, field_name):
     ]
 
 
-# The 18 keys the model must return (the prompt states the same set).
+# The 16 keys the model must return. limitations and missing_evidence
+# are program-owned and never requested from the model.
 RESPONSE_FIELDS = (
     "hazard_type",
     "likelihood_score",
@@ -1751,17 +1752,13 @@ RESPONSE_FIELDS = (
     "advice",
     "reasoning",
     "recommended_actions",
-    "limitations",
-    "missing_evidence",
     "sources",
 )
 
 SCORE_FIELDS = tuple(
     field for field in RESPONSE_FIELDS if field.endswith("_score")
 )
-LIST_FIELDS = (
-    "recommended_actions", "limitations", "missing_evidence", "sources",
-)
+LIST_FIELDS = ("recommended_actions", "sources")
 
 
 def build_response_schema():
@@ -2143,8 +2140,6 @@ def validate_decision(decision, retrieved_sections):
 
     for field in (
         "recommended_actions",
-        "limitations",
-        "missing_evidence",
         "sources",
     ):
         decision[field] = validate_string_list(
@@ -2164,6 +2159,11 @@ def validate_decision(decision, retrieved_sections):
         )
 
     decision["sources"] = valid_sources
+
+    # Program-owned: filled only from validation outcomes and, later, the
+    # program's own evidence and status checks. Never from model text.
+    decision["limitations"] = []
+    decision["missing_evidence"] = []
 
     score, band = calculate_risk_score(
         decision["likelihood_score"],
@@ -2406,7 +2406,7 @@ PROGRAM_OWNED_FIELDS = frozenset({
     "weather_data_timestamp", "assessment_timestamp", "city",
     "timezone", "history_checked", "history_status",
     "response_diagnostics", "evidence_gate_overrides",
-    "warning_claim_diagnostic",
+    "warning_claim_diagnostic", "limitations", "missing_evidence",
 })
 
 
@@ -2680,15 +2680,14 @@ Requirements:
 7. Previous alerts must not suppress a new or different hazard. Do not
    recommend an alert solely because a value is unusual.
 8. Use only recommendation values defined in the supplied policy.
-9. Explain missing evidence and limitations. The assessment is never a
+9. Explain missing evidence. The assessment is never a
    completed safety clearance.
 10. In sources, cite exact policy section titles.
 11. Return a single JSON object only.
 
 Each score must be an integer from 1 to 5 when evidence supports it.
 If evidence for a dimension is insufficient, return null for that
-score, never a guessed value, and explain why in its rationale and in
-limitations.
+score, never a guessed value, and explain why in its rationale.
 """
 
 
@@ -3428,8 +3427,6 @@ def run_tests():
             "advice": "a",
             "reasoning": "r",
             "recommended_actions": [],
-            "limitations": [],
-            "missing_evidence": [],
             "sources": ["Final Decision Rule"],
         }
         base.update(changes)
@@ -4362,8 +4359,7 @@ def run_tests():
         "geographic_impact_reason": "r",
         "alert_recommendation": "NO_ALERT_RECOMMENDED",
         "advice": "a", "reasoning": "r",
-        "recommended_actions": [], "limitations": [],
-        "missing_evidence": [],
+        "recommended_actions": [],
         "sources": ["16. Final Decision Rule"],
     })
 
@@ -4839,8 +4835,7 @@ def run_tests():
             "geographic_impact_reason": "r",
             "alert_recommendation": "NO_ALERT_RECOMMENDED",
             "advice": "a", "reasoning": "r",
-            "recommended_actions": [], "limitations": [],
-            "missing_evidence": [],
+            "recommended_actions": [],
             "sources": ["16. Final Decision Rule"],
         })
         mocks = {
@@ -4929,8 +4924,6 @@ def run_tests():
             "advice": "Limit strenuous outdoor activity at midday.",
             "reasoning": "Temperature reaches the screening value.",
             "recommended_actions": ["Drink water"],
-            "limitations": ["Official warnings not checked"],
-            "missing_evidence": [],
             "sources": ["6.1 Extreme Heat"],
         }
         body.update(changes)
@@ -5018,8 +5011,8 @@ def run_tests():
     adv_keys = list(adv_response())
 
     check(
-        "Eighteen response keys are required",
-        len(adv_keys) == 18,
+        "Sixteen response keys are required",
+        len(adv_keys) == 16,
     )
 
     for key in adv_keys:
@@ -5084,7 +5077,7 @@ def run_tests():
         "Schema lists exactly the keys the validator requires",
         sorted(adv_schema["required"]) == sorted(adv_keys)
         and sorted(adv_schema["properties"]) == sorted(adv_keys)
-        and len(set(adv_schema["required"])) == 18,
+        and len(set(adv_schema["required"])) == 16,
     )
 
     adv_string_keys = [
@@ -5107,10 +5100,9 @@ def run_tests():
         and set(adv_score_keys)
         == {k for k in adv_keys if k.endswith("_score")}
         and set(adv_array_keys)
-        == {"recommended_actions", "limitations", "missing_evidence",
-            "sources"}
+        == {"recommended_actions", "sources"}
         and len(adv_string_keys) + len(adv_score_keys)
-        + len(adv_array_keys) == 18
+        + len(adv_array_keys) == 16
         and all(
             isinstance(adv_response()[key], str) for key in adv_string_keys
         )
@@ -5425,8 +5417,6 @@ def run_tests():
             "reasoning": "Apparent temperature reaches the heat "
                          "screening value.",
             "recommended_actions": ["Check NCM warnings before work"],
-            "limitations": ["Official warning status was not checked"],
-            "missing_evidence": ["Exposure data"],
             "sources": ["6.1 Extreme Heat"],
         }
         body.update(changes)
@@ -5545,15 +5535,13 @@ def run_tests():
         "hazard_type", "advice", "reasoning",
         "likelihood_reason", "severity_reason", "exposure_reason",
         "duration_reason", "geographic_impact_reason",
-        "recommended_actions", "limitations", "missing_evidence",
-        "unexpected_notes",
+        "recommended_actions", "unexpected_notes",
     )
 
     for field in abc_text_fields:
         value = (
             ["No official heat advisory is in effect."]
-            if field in ("recommended_actions", "limitations",
-                         "missing_evidence")
+            if field == "recommended_actions"
             else "No official heat advisory is in effect."
         )
         message = abc_claim_error(field, value)
@@ -6148,7 +6136,6 @@ def run_tests():
         "advice": "Limit outdoor activity. Official warning status "
                   "was not checked.",
         "reasoning": "r", "recommended_actions": [],
-        "limitations": [], "missing_evidence": [],
         "sources": ["6.1 Extreme Heat"],
     })
 
@@ -6345,8 +6332,8 @@ def run_tests():
         "claim in advice" in rv_direct_claim_error({
             "advice": "No official heat advisory is in effect.",
         })
-        and "claim in limitations" in rv_direct_claim_error({
-            "limitations": ["There are no warnings."],
+        and "claim in recommended_actions" in rv_direct_claim_error({
+            "recommended_actions": ["There are no warnings."],
         }),
     )
 
@@ -6365,8 +6352,8 @@ def run_tests():
 
     check(
         "Response schema constant matches the sent schema and validator",
-        len(RESPONSE_FIELDS) == 18
-        and len(set(RESPONSE_FIELDS)) == 18
+        len(RESPONSE_FIELDS) == 16
+        and len(set(RESPONSE_FIELDS)) == 16
         and list(build_response_schema()["properties"])
         == list(RESPONSE_FIELDS)
         and RESPONSE_FORMAT["json_schema"]["schema"]
@@ -6573,7 +6560,7 @@ def run_tests():
         "Each score must be an integer from 1 to 5 when evidence "
         "supports it",
         "return null for that score, never a guessed value, and explain "
-        "why in its rationale and in limitations",
+        "why in its rationale",
     ):
         check(
             f"Prompt keeps instruction: {phrase[:60]}",
@@ -6632,8 +6619,7 @@ def run_tests():
             "alert_recommendation": "UNABLE_TO_ASSESS",
             "advice": "Official warning status was not checked.",
             "reasoning": "Three dimensions lack evidence.",
-            "recommended_actions": [], "limitations": [],
-            "missing_evidence": [],
+            "recommended_actions": [],
             "sources": ["16. Final Decision Rule"],
         }
         body.update(changes)
@@ -6683,7 +6669,7 @@ def run_tests():
         ("score as float", "likelihood_score", 2.5),
         ("score as boolean", "exposure_score", True),
         ("recommendation outside enum", "alert_recommendation", "ALERT"),
-        ("list as string", "limitations", "none"),
+        ("list as string", "recommended_actions", "none"),
         ("list with a number", "sources", [1]),
     ):
         body = ss_response(**{field: value})
@@ -7366,8 +7352,8 @@ def run_tests():
         "geographic_impact_reason": "gr",
         "alert_recommendation": "UNABLE_TO_ASSESS",
         "advice": "Official warning status was not checked.",
-        "reasoning": "r", "recommended_actions": [], "limitations": [],
-        "missing_evidence": [], "sources": ["16. Final Decision Rule"],
+        "reasoning": "r", "recommended_actions": [],
+        "sources": ["16. Final Decision Rule"],
     })
 
     class HeOk(HeResponse):
@@ -7479,8 +7465,6 @@ def run_tests():
                   "Official warning status was not checked.",
         "reasoning": "Heat screening triggered by the forecast.",
         "recommended_actions": ["Schedule outdoor work for mornings"],
-        "limitations": ["Single forecast point for Dubai"],
-        "missing_evidence": ["Population exposure data"],
         "sources": ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"],
     })
 
@@ -7931,7 +7915,6 @@ def run_tests():
             "alert_recommendation": "UNABLE_TO_ASSESS",
             "advice": "Official warning status was not checked.",
             "reasoning": "r", "recommended_actions": [],
-            "limitations": [], "missing_evidence": [],
             "sources": sources,
         }
 
@@ -8167,8 +8150,7 @@ def run_tests():
             "advice": "Limit strenuous outdoor activity. Official "
                       "warning status was not checked.",
             "reasoning": "Heat screening triggered. EG-MARK-REASONING",
-            "recommended_actions": [], "limitations": [],
-            "missing_evidence": [],
+            "recommended_actions": [],
             "sources": ["6.1 Extreme Heat"],
         }
         body.update(changes)
@@ -8564,8 +8546,7 @@ def run_tests():
             "advice": "Limit outdoor activity. Official warning status "
                       "was not checked.",
             "reasoning": "Heat screening triggered.",
-            "recommended_actions": [], "limitations": [],
-            "missing_evidence": [],
+            "recommended_actions": [],
             "sources": ["POLICY SECTION: 6.1 Extreme Heat",
                         "Extreme Heat", "CL-MARK-SRC"],
         }
@@ -8649,8 +8630,8 @@ def run_tests():
     cl_samples = {
         1: ("reasoning", "No official heat advisory is in effect."),
         2: ("advice", "There are no active warnings."),
-        3: ("limitations", ["No official warnings were checked."]),
-        4: ("missing_evidence", ["A heat warning is currently in effect."]),
+        3: ("duration_reason", "No official warnings were checked."),
+        4: ("likelihood_reason", "A heat warning is currently in effect."),
         5: ("recommended_actions", ["NCM has not issued any warning."]),
     }
 
@@ -9112,6 +9093,180 @@ def run_tests():
         cl_corpus_total > 10000 and cl_corpus_bad == [],
     )
 
+    # ------------------------------------------------------------
+    # limitations and missing_evidence are program-owned.
+    # ------------------------------------------------------------
+    po_fields = ("limitations", "missing_evidence")
+    po_schema = RESPONSE_FORMAT["json_schema"]["schema"]
+    po_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Model schema no longer requests either program-owned field",
+        all(
+            field not in RESPONSE_FIELDS
+            and field not in LIST_FIELDS
+            and field not in po_schema["properties"]
+            and field not in po_schema["required"]
+            and f'"{field}"' not in json_text(RESPONSE_FORMAT)
+            for field in po_fields
+        )
+        and len(RESPONSE_FIELDS) == 16
+        and sorted(po_schema["properties"]) == sorted(RESPONSE_FIELDS)
+        and po_schema["additionalProperties"] is False,
+    )
+
+    check(
+        "Both fields are program-owned and the prompt no longer asks "
+        "for them",
+        all(field in PROGRAM_OWNED_FIELDS for field in po_fields)
+        and "and limitations" not in po_prompt
+        and "in limitations" not in po_prompt
+        and "9. Explain missing evidence. The assessment is never a "
+        "completed safety clearance." in po_prompt
+        and "explain why in its rationale." in po_prompt,
+    )
+
+    # Model-supplied versions are rejected as unexpected fields.
+    po_mark = "PO-MARK-5521"
+
+    for field in po_fields:
+        po_direct = adv_error({**adv_response(), field: [po_mark]})
+        po_bad = cl_run(cl_body(**{field: [po_mark]}))
+        po_bad_d = po_bad["decision"]
+
+        check(
+            f"Model-supplied {field} is rejected as program-owned",
+            po_direct
+            == f"Model output sets program-owned fields: {field}"
+            and [r["code"] for r in po_bad_d["incomplete_reasons"]]
+            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            and f"program-owned fields: {field}" in po_bad_d["reasoning"]
+            and po_bad_d["assessment_status"] == "INCOMPLETE"
+            and po_bad_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and po_bad_d["send_alert"] is False
+            and po_mark not in json_text(po_bad_d) + po_bad["log"]
+            + po_bad["report"],
+        )
+
+    # The program fills both lists deterministically.
+    po_expected_limitations = [
+        "Risk score not calculated because these dimensions could not "
+        "be assessed: exposure_score, geographic_impact_score.",
+        "The five-dimension risk score is the provisional internal "
+        "model in guidelines.md section 5. It is not an official "
+        "UAE/NCM classification.",
+        "Official NCM and emergency authority warnings were not "
+        "retrieved or verified by this implementation.",
+    ]
+    po_expected_missing = [
+        "Evidence required to score: exposure_score, "
+        "geographic_impact_score.",
+        "Current official NCM and relevant UAE emergency authority "
+        "warning status has not been retrieved and verified.",
+    ]
+    po_run_a = cl_run(cl_body())
+    po_run_b = cl_run(cl_body(
+        advice="Avoid outdoor work at midday.",
+        reasoning="PO-MARK-REASON " + "Heat screening triggered.",
+        recommended_actions=["PO-MARK-ACTION"],
+    ))
+    po_a, po_b = po_run_a["decision"], po_run_b["decision"]
+
+    check(
+        "Program populates both lists deterministically from evidence "
+        "and validation results",
+        po_a["limitations"] == po_expected_limitations
+        and po_a["missing_evidence"] == po_expected_missing
+        and po_b["limitations"] == po_a["limitations"]
+        and po_b["missing_evidence"] == po_a["missing_evidence"]
+        and "PO-MARK" not in json_text(
+            po_b["limitations"] + po_b["missing_evidence"]
+        )
+        and po_a["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and [r["code"] for r in po_a["incomplete_reasons"]]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
+    )
+
+    # Present and correctly typed in every kind of assessment.
+    po_claim = cl_run(cl_body(reasoning="There are no active warnings."))
+    po_error = cl_run(cl_body(**{"limitations": ["x"]}))
+    po_incomplete = incomplete_assessment("Assessment could not run.")
+
+    for label, assessment in (
+        ("assessment", po_a),
+        ("claim failure", po_claim["decision"]),
+        ("rejected response", po_error["decision"]),
+        ("incomplete_assessment()", po_incomplete),
+    ):
+        check(
+            f"Program-owned lists are present and typed: {label}",
+            all(
+                type(assessment.get(field)) is list
+                and all(type(item) is str for item in assessment[field])
+                for field in po_fields
+            )
+            and assessment["limitations"] != [],
+        )
+
+    check(
+        "Existing program explanations survive a claim failure",
+        po_claim["decision"]["official_warning_status"] == "NOT_CHECKED"
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
+        in [r["code"] for r in po_claim["decision"]["incomplete_reasons"]]
+        and any(
+            "unverified official-warning claim in reasoning" in item
+            for item in po_claim["decision"]["limitations"]
+        )
+        and po_claim["decision"]["warning_claim_diagnostic"]
+        == "field=reasoning;pattern=2",
+    )
+
+    # Both lists reach the console report and the Sheets payload.
+    po_payload = json.loads(
+        po_run_a["report"].split("OUTPUT PAYLOAD:", 1)[1].strip()
+    )
+    po_report = po_run_a["report"]
+
+    check(
+        "Both lists reach the console report and the Sheets payload",
+        json.loads(po_payload["limitations"]) == po_expected_limitations
+        and json.loads(po_payload["missing_evidence"])
+        == po_expected_missing
+        and "LIMITATIONS:" in po_report
+        and "MISSING EVIDENCE:" in po_report
+        and all(
+            f"- {item}" in po_report
+            for item in po_expected_limitations + po_expected_missing
+        ),
+    )
+
+    # The guard still scans every remaining model free-text field.
+    for field, value in (
+        ("hazard_type", "No official warning is in effect"),
+        ("advice", "There are no active warnings."),
+        ("reasoning", "No official heat advisory is in effect."),
+        ("likelihood_reason", "A heat warning is currently in effect."),
+        ("severity_reason", "NCM has not issued any warning."),
+        ("duration_reason", "No official warnings were checked."),
+        ("recommended_actions", ["There are no warnings."]),
+    ):
+        po_g = cl_run(cl_body(**{field: value}))["decision"]
+
+        check(
+            f"Claim in remaining model field still fails closed: {field}",
+            po_g["warning_claim_diagnostic"] is not None
+            and po_g["warning_claim_diagnostic"].startswith(
+                f"field={field};"
+            )
+            and "UNVERIFIED_WARNING_CLAIM"
+            in [r["code"] for r in po_g["incomplete_reasons"]]
+            and po_g["assessment_status"] == "INCOMPLETE"
+            and po_g["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and po_g["send_alert"] is False
+            and po_g["approval_status"] == "NOT_AUTHORIZED",
+        )
+
     # Prompt: approved sentence and rules present exactly once.
     cl_prompt = " ".join(SYSTEM_PROMPT.split())
 
@@ -9347,8 +9502,6 @@ def run_tests():
             "reasoning": "Apparent temperature reaches the heat "
                          "screening value.",
             "recommended_actions": ["Schedule outdoor work in the morning"],
-            "limitations": ["Single forecast point for Dubai"],
-            "missing_evidence": ["Population exposure data"],
             "sources": ["6.1 Extreme Heat"],
         }
         body.update(changes)
