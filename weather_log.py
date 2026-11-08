@@ -2204,6 +2204,58 @@ def validate_decision(decision, retrieved_sections):
     return decision
 
 
+# Dimensions whose required evidence this program does not have.
+# guidelines.md 4.3: exposure needs population, workforce, vulnerable-
+# group and infrastructure evidence; 4.5: geographic impact must not be
+# inferred "from a single city-wide weather reading". The pipeline has
+# neither, so the model's scores are never accepted: the score is set
+# to null (UNASSESSED, section 5 rule 4) with a fixed reason. Remove an
+# entry only when a real evidence source for that dimension exists.
+# (score field -> (reason field, fixed program-generated reason))
+EVIDENCE_GATED_DIMENSIONS = {
+    "exposure_score": (
+        "exposure_reason",
+        "Not assessed: no population, workforce, vulnerable-group or "
+        "infrastructure exposure evidence is available to this program.",
+    ),
+    "geographic_impact_score": (
+        "geographic_impact_reason",
+        "Not assessed: only one Dubai forecast point is available, and "
+        "geographic extent cannot be inferred from a single reading.",
+    ),
+}
+
+
+def apply_evidence_gate(decision):
+    """
+    Replace model-supplied scores for evidence-gated dimensions with
+    null and a fixed reason, before validation and risk calculation.
+    Only keys the model actually returned are touched, so a missing key
+    still fails validation. Returns the names of fields where the model
+    supplied a non-null value (names only, never the values).
+    """
+    if not isinstance(decision, dict):
+        return []
+
+    overridden = []
+
+    for score_field, (reason_field, reason) in (
+        EVIDENCE_GATED_DIMENSIONS.items()
+    ):
+        if score_field not in decision:
+            continue
+
+        if decision[score_field] is not None:
+            overridden.append(score_field)
+
+        decision[score_field] = None
+
+        if reason_field in decision:
+            decision[reason_field] = reason
+
+    return overridden
+
+
 class UnverifiedWarningClaim(ValueError):
     """Model text asserts an official warning state that was not checked."""
 
@@ -2282,7 +2334,7 @@ PROGRAM_OWNED_FIELDS = frozenset({
     "weather_summary", "weather_source", "weather_retrieval_status",
     "weather_data_timestamp", "assessment_timestamp", "city",
     "timezone", "history_checked", "history_status",
-    "response_diagnostics",
+    "response_diagnostics", "evidence_gate_overrides",
 })
 
 
@@ -2498,9 +2550,10 @@ def assess_weather(weather, history, policy, retrieved_sections):
             "is integrated."
         ),
         "risk_score_notice": (
-            "Any calculated risk score is the provisional internal "
-            "model in guidelines.md section 5, not an official "
-            "UAE/NCM classification."
+            "Any risk score is an internal provisional calculation made "
+            "by the program, not an official UAE or NCM classification, "
+            "and must not be treated as validated for automated public "
+            "notifications."
         ),
     }
 
@@ -2540,6 +2593,10 @@ def assess_weather(weather, history, policy, retrieved_sections):
             decision["sources"], retrieved_sections
         )
 
+    # Evidence gate: model scores for exposure and geographic impact
+    # are discarded and replaced by null plus a fixed reason.
+    gate_overrides = apply_evidence_gate(decision)
+
     try:
         decision = validate_decision(
             decision,
@@ -2550,6 +2607,8 @@ def assess_weather(weather, history, policy, retrieved_sections):
         print("\nRESPONSE SHAPE DIAGNOSTICS (program-generated; no model text)")
         print(json_text(diagnostics))
         raise
+
+    decision["evidence_gate_overrides"] = gate_overrides
 
     # Checked on the model's own text, before the guard adds ours. The
     # warning status is the program's: no official feed is integrated.
@@ -2847,6 +2906,33 @@ def run_agent_job(dry=False):
             "|",
             decision.get(dimension + "_reason"),
         )
+
+    print("\nAUDIT SUMMARY (program-generated)")
+    print(
+        json_text(
+            {
+                "sources": decision.get("sources", []),
+                "alert_recommendation": decision.get(
+                    "alert_recommendation"
+                ),
+                "assessment_status": decision.get("assessment_status"),
+                "risk_score_calculated": (
+                    decision.get("risk_score") is not None
+                ),
+                "risk_band": decision.get("risk_band"),
+                "incomplete_reason_codes": [
+                    reason["code"]
+                    for reason in decision.get("incomplete_reasons", [])
+                ],
+                "evidence_gate_overrides": decision.get(
+                    "evidence_gate_overrides", []
+                ),
+                "hazards_screened": sorted(
+                    decision.get("hazard_screening") or {}
+                ),
+            }
+        )
+    )
 
     print("\nSOURCES:", decision.get("sources"))
     print(
@@ -4078,7 +4164,9 @@ def run_tests():
 
         return with_globals(settings, lambda: run_weather_agent()[0])
 
-    benign_decision = pipeline(make_weather())
+    benign_decision = pipeline(
+        make_weather(), EVIDENCE_GATED_DIMENSIONS={}
+    )
 
     check(
         "Benign weather completes retrieval and stays INCOMPLETE",
@@ -4860,7 +4948,10 @@ def run_tests():
 
     def adv_assess(reply):
         return adv_override(
-            {"ask_groq": lambda messages, temperature=0.1: reply},
+            {
+                "ask_groq": lambda messages, temperature=0.1: reply,
+                "EVIDENCE_GATED_DIMENSIONS": {},
+            },
             lambda: assess_weather(
                 adv_weather(), [], load_guidelines_quietly(),
                 adv_sections,
@@ -7226,6 +7317,7 @@ def run_tests():
             "SHEET_URL": sheet_url,
             "require_configuration": lambda require_sheet=False: None,
             "get_weather": lambda city: fz_heat_weather(),
+            "EVIDENCE_GATED_DIMENSIONS": {},
         }
 
         if history_patch is not None:
@@ -7798,6 +7890,406 @@ def run_tests():
         "Claim text in an unresolvable source never reaches the output",
         "advisory is in effect" not in json_text(sr_claim)
         and sr_claim["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    # ------------------------------------------------------------
+    # Evidence gate (exposure, geographic impact), risk-score notice
+    # and dry-run audit summary (self-contained, offline).
+    # ------------------------------------------------------------
+    def eg_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def eg_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def eg_reply(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 4,
+            "exposure_reason": "EG-MARK-EXP large population and "
+                               "outdoor workforce",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 4,
+            "geographic_impact_reason": "EG-MARK-GEO city-wide",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity. Official "
+                      "warning status was not checked.",
+            "reasoning": "Heat screening triggered. EG-MARK-REASONING",
+            "recommended_actions": [], "limitations": [],
+            "missing_evidence": [],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return json_text(body)
+
+    class EgResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class EgTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return EgResponse(self.content)
+
+    def eg_run(content, gate=None, dry=True):
+        transport = EgTransport(content)
+        printed = io.StringIO()
+        settings = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_eg_test_key",
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: eg_weather(),
+            "tool_get_history": lambda n=3: [],
+        }
+
+        if gate is not None:
+            settings["EVIDENCE_GATED_DIMENSIONS"] = gate
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = eg_override(settings, run)
+        report = io.StringIO()
+        sheets = EgTransport("OK")
+
+        def job():
+            with contextlib.redirect_stdout(report):
+                run_agent_job(dry=True)
+
+        eg_override(
+            {"run_weather_agent": lambda: (decision, used),
+             "HTTP": sheets},
+            job,
+        )
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "report": report.getvalue(),
+            "sheet_posts": sheets.posts,
+        }
+
+    # P1-1: Exposure 4 and Geographic Impact 4 are overridden.
+    eg_four = eg_run(eg_reply())
+    eg_d = eg_four["decision"]
+
+    check(
+        "Model Exposure 4 and Geographic Impact 4 are both overridden",
+        eg_d["exposure_score"] is None
+        and eg_d["geographic_impact_score"] is None
+        and eg_d["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and eg_d["likelihood_score"] == 3
+        and eg_d["severity_score"] == 3
+        and eg_d["duration_score"] == 3,
+    )
+
+    check(
+        "Overridden dimensions carry fixed program reasons, not model text",
+        eg_d["exposure_reason"]
+        == EVIDENCE_GATED_DIMENSIONS.get("exposure_score", (None, None))[1]
+        and eg_d["geographic_impact_reason"]
+        == EVIDENCE_GATED_DIMENSIONS.get(
+            "geographic_impact_score", (None, None)
+        )[1]
+        and eg_d["exposure_reason"] is not None
+        and "EG-MARK-EXP" not in json_text(eg_d)
+        and "EG-MARK-GEO" not in json_text(eg_d)
+        and "EG-MARK-EXP" not in eg_four["log"] + eg_four["report"]
+        and "EG-MARK-GEO" not in eg_four["log"] + eg_four["report"],
+    )
+
+    # P1-3: no numerical classification or HIGH band.
+    check(
+        "Missing dimensions give no risk score and no band (not HIGH)",
+        eg_d["risk_score"] is None
+        and eg_d["risk_band"] == "UNASSESSED"
+        and "10.5" not in eg_four["report"]
+        and "HIGH" not in eg_four["report"].split("RISK BAND:")[1][:12]
+        and eg_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and eg_d["assessment_status"] == "INCOMPLETE"
+        and eg_d["send_alert"] is False,
+    )
+
+    check(
+        "Missing dimensions are recorded with the supported reason code",
+        [r["code"] for r in eg_d["incomplete_reasons"]]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and eg_d["incomplete_reasons"][0]["detail"]
+        == "exposure_score, geographic_impact_score"
+        and any(
+            "exposure_score" in item and "geographic_impact_score" in item
+            for item in eg_d["missing_evidence"]
+        ),
+    )
+
+    # P1-2: other numerical values are overridden too.
+    for exposure, geographic in ((1, 1), (2, 3), (5, 5)):
+        run = eg_run(eg_reply(
+            exposure_score=exposure, geographic_impact_score=geographic
+        ))
+
+        check(
+            f"Model values ({exposure}, {geographic}) are overridden "
+            "and no band results",
+            run["decision"]["exposure_score"] is None
+            and run["decision"]["geographic_impact_score"] is None
+            and run["decision"]["risk_band"] == "UNASSESSED"
+            and run["decision"]["risk_score"] is None,
+        )
+
+    only_null = eg_run(eg_reply(
+        exposure_score=None, geographic_impact_score=None
+    ))
+
+    check(
+        "Model nulls need no override and stay unassessed",
+        only_null["decision"]["evidence_gate_overrides"] == []
+        and only_null["decision"]["risk_band"] == "UNASSESSED",
+    )
+
+    # Strictness is preserved: the gate never creates missing keys.
+    def eg_without(key):
+        body = json.loads(eg_reply())
+        del body[key]
+        return json_text(body)
+
+    for key in ("exposure_score", "geographic_impact_score",
+                "exposure_reason"):
+        run = eg_run(eg_without(key))
+
+        check(
+            f"Gate does not mask a missing key: {key}",
+            "Missing assessment fields: " + key
+            in run["decision"]["reasoning"]
+            and run["decision"]["assessment_status"] == "INCOMPLETE",
+        )
+
+    # P1-4: the model cannot supply program-owned gate fields.
+    for label, extra in (
+        ("overrides list", {"evidence_gate_overrides": []}),
+        ("incomplete reasons", {"incomplete_reasons": [
+            {"code": "NONE", "detail": "all clear"}]}),
+        ("risk score", {"risk_score": 10.5}),
+        ("risk band", {"risk_band": "HIGH"}),
+    ):
+        run = eg_run(eg_reply(**extra))
+
+        check(
+            f"Model cannot inject program-owned values: {label}",
+            "program-owned fields" in run["decision"]["reasoning"]
+            and run["decision"]["risk_band"] == "UNASSESSED"
+            and all(
+                r["code"] != "NONE"
+                for r in run["decision"]["incomplete_reasons"]
+            ),
+        )
+
+    # The gate cannot be bypassed by wrong types in gated fields.
+    garbage = eg_run(eg_reply(
+        exposure_score="4", geographic_impact_score=99
+    ))
+
+    check(
+        "Malformed gated values are discarded, never scored",
+        garbage["decision"]["exposure_score"] is None
+        and garbage["decision"]["geographic_impact_score"] is None
+        and garbage["decision"]["risk_band"] == "UNASSESSED",
+    )
+
+    # P1-5: fully assessed calculations are unchanged.
+    check(
+        "With no gated dimension the formula still scores and bands",
+        eg_run(eg_reply(), gate={})["decision"]["risk_score"] == 10.5
+        and eg_run(eg_reply(), gate={})["decision"]["risk_band"] == "HIGH",
+    )
+
+    check(
+        "Gate covers exactly exposure and geographic impact",
+        set(EVIDENCE_GATED_DIMENSIONS)
+        == {"exposure_score", "geographic_impact_score"}
+        and all(
+            reason_field.endswith("_reason") and len(text) > 40
+            for reason_field, text in EVIDENCE_GATED_DIMENSIONS.values()
+        ),
+    )
+
+    check(
+        "evidence_gate_overrides is a program-owned field",
+        "evidence_gate_overrides" in PROGRAM_OWNED_FIELDS,
+    )
+
+    check(
+        "Apply-gate is a no-op for non-dict output and for absent keys",
+        apply_evidence_gate([1, 2]) == []
+        and apply_evidence_gate({"likelihood_score": 3}) == []
+        and apply_evidence_gate({"exposure_score": 3})
+        == ["exposure_score"],
+    )
+
+    # P2: the notice no longer points at an unsent section.
+    eg_sent = []
+
+    def eg_capture(messages, temperature=0.1):
+        eg_sent.append(messages)
+        raise RuntimeError("captured")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        eg_policy = load_guidelines()
+
+    try:
+        eg_override(
+            {"ask_groq": eg_capture},
+            lambda: assess_weather(
+                eg_weather(), [], eg_policy,
+                [{"section": "6.1 Extreme Heat", "text": "x"}],
+            ),
+        )
+    except RuntimeError:
+        pass
+
+    eg_user = eg_sent[0][1]["content"] if eg_sent else ""
+
+    check(
+        "Risk-score notice no longer references guidelines.md section 5",
+        "risk_score_notice" in eg_user
+        and "guidelines.md" not in eg_user.split("EVIDENCE AND STATUS")[1]
+        and "section 5" not in eg_user.split("EVIDENCE AND STATUS")[1]
+        and "internal provisional calculation made by the program"
+        in eg_user
+        and "not an official UAE or NCM classification" in eg_user
+        and "must not be treated as validated for automated public "
+        "notifications" in eg_user,
+    )
+
+    # P3: audit summary appears in the dry-run output.
+    eg_summary = None
+
+    for line in eg_four["report"].splitlines():
+        if line.startswith("{") and "risk_score_calculated" in line:
+            eg_summary = json.loads(line)
+
+    check(
+        "Dry-run audit summary lists the safe audit fields",
+        eg_summary is not None
+        and "AUDIT SUMMARY (program-generated)" in eg_four["report"]
+        and eg_summary["sources"] == ["6.1 Extreme Heat"]
+        and eg_summary["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and eg_summary["assessment_status"] == "INCOMPLETE"
+        and eg_summary["risk_score_calculated"] is False
+        and eg_summary["risk_band"] == "UNASSESSED"
+        and eg_summary["incomplete_reason_codes"]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and eg_summary["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and eg_summary["hazards_screened"] == ["HEAT"],
+    )
+
+    eg_scored = eg_run(eg_reply(), gate={})
+    eg_scored_summary = json.loads(next(
+        line for line in eg_scored["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    ))
+
+    check(
+        "Audit summary reports when a score was calculated",
+        eg_scored_summary["risk_score_calculated"] is True
+        and eg_scored_summary["risk_band"] == "HIGH"
+        and eg_scored_summary["alert_recommendation"] == "MONITOR",
+    )
+
+    eg_failed = eg_run(
+        json_text({"not": "the schema"})
+    )
+    eg_failed_summary = json.loads(next(
+        line for line in eg_failed["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    ))
+
+    check(
+        "Audit summary on a failed assessment holds no model text",
+        eg_failed_summary["sources"] == []
+        and eg_failed_summary["risk_score_calculated"] is False
+        and eg_failed_summary["assessment_status"] == "INCOMPLETE"
+        and eg_failed_summary["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and "ASSESSMENT_ERROR"
+        in eg_failed_summary["incomplete_reason_codes"],
+    )
+
+    audit_text = "".join(
+        line for line in eg_four["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    )
+
+    check(
+        "Audit summary has exactly the approved keys and no model text",
+        sorted(eg_summary or {}) == sorted([
+            "sources", "alert_recommendation", "assessment_status",
+            "risk_score_calculated", "risk_band",
+            "incomplete_reason_codes", "evidence_gate_overrides",
+            "hazards_screened",
+        ])
+        and "EG-MARK" not in audit_text
+        and "Heat screening" not in audit_text
+        and "Limit strenuous" not in audit_text,
+    )
+
+    check(
+        "Audit output contains no weather payload, secret or Sheets write",
+        "gsk_eg_test_key" not in eg_four["log"] + eg_four["report"]
+        and "temperature" not in audit_text
+        and eg_four["sheet_posts"] == [],
     )
 
     # agent-dry must not POST to Sheets or send email.
