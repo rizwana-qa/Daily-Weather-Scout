@@ -39,17 +39,20 @@ WEATHER_TIMEOUT = 30
 GROQ_TIMEOUT = 90
 SHEET_TIMEOUT = 30
 
-# Request budgets, sized from measured requests (see the budget tests):
-# every single hazard, heat with wind, and all five hazards together
-# with the conditional compliance section fit. Anything larger fails
-# closed (INCOMPLETE) before a request is sent.
+# Request budgets. Which hazard combinations fit is pinned by the budget
+# tests; anything larger fails closed (INCOMPLETE) before a request is
+# sent. The guards measure the messages plus the response schema.
 # The token figure uses the conservative estimator below (2.5
 # characters per token), not a provider tokenizer. 8,000 is the
 # documented base tokens-per-minute limit for openai/gpt-oss-20b; the
 # account's own limit is unverified, and Groq's 413/429 responses are
-# handled as safe failures. Revisit all three after a dry run reports
-# Groq's actual usage.
-MAX_COMPLETION_TOKENS = 700
+# handled as safe failures.
+# The completion allowance covers hidden reasoning tokens plus the full
+# strict-schema response: observed completions were 606 and 694 tokens,
+# and 700 was exceeded once (json_validate_failed). 1,000 is capped by
+# the "conservative" test and keeps that failing request (6,890
+# estimated input tokens) within the 8,000 total.
+MAX_COMPLETION_TOKENS = 1000
 MAX_ESTIMATED_REQUEST_TOKENS = 8000
 MAX_REQUEST_CHARS = 19000
 MAX_POLICY_CHARS = 13500
@@ -359,6 +362,65 @@ def get_weather(city):
     }
 
 
+# Hourly series sent to the model so duration can be judged from the
+# forecast period (guidelines section 4.4). Each column keeps the
+# precision Open-Meteo reports (0.1 for temperature, precipitation and
+# wind; whole units for humidity, visibility in metres and weather
+# codes), so no value is altered. (name, source key, decimals)
+HOURLY_SERIES_FIELDS = (
+    ("temp_c", "temperature", 1),
+    ("apparent_c", "apparent_temperature", 1),
+    ("humidity_pct", "humidity", 0),
+    ("precip_mm", "precipitation", 1),
+    ("wind_kmh", "wind", 1),
+    ("gust_kmh", "gust", 1),
+    ("visibility_m", "visibility", 0),
+    ("weather_code", "weather_code", 0),
+)
+
+
+def hourly_series(hourly):
+    """
+    Compact, ordered next-24-hour series. Consecutive hourly records
+    are described by a start time and a one-hour step; otherwise every
+    timestamp is listed. Missing values stay null.
+    """
+    records = [record for record in hourly if isinstance(record, dict)]
+
+    if not records:
+        return None
+
+    times = [record.get("time") for record in records]
+    parsed = [local_datetime(value) for value in times]
+
+    consecutive = all(parsed) and all(
+        later - earlier == timedelta(hours=1)
+        for earlier, later in zip(parsed, parsed[1:])
+    )
+
+    series = (
+        {"start": times[0], "step_hours": 1}
+        if consecutive else {"times": times}
+    )
+
+    for name, key, digits in HOURLY_SERIES_FIELDS:
+        column = []
+
+        for record in records:
+            number = safe_number(record.get(key))
+
+            if number is None:
+                column.append(None)
+                continue
+
+            value = round(number, digits)
+            column.append(int(value) if digits == 0 else value)
+
+        series[name] = column
+
+    return series
+
+
 def summarize_weather(weather):
     hourly = weather.get("hourly_forecast_next_24h", [])
 
@@ -369,36 +431,9 @@ def summarize_weather(weather):
             if safe_number(record.get(field)) is not None
         ]
 
-    temperatures = values_for("temperature")
-    apparent = values_for("apparent_temperature")
-    winds = values_for("wind")
-    gusts = values_for("gust")
-    precipitation = values_for("precipitation")
-    visibility = values_for("visibility")
+    # The hourly series carries every value the former min/max summary
+    # was derived from; only CAPE, which the series omits, is kept here.
     cape = values_for("cape")
-    weather_codes = sorted({
-        int(code) for code in values_for("weather_code")
-    })
-
-    hourly_summary = {
-        "forecast_hours_available": len(hourly),
-        "temperature_min": min(temperatures, default=None),
-        "temperature_max": max(temperatures, default=None),
-        "apparent_temperature_max": max(apparent, default=None),
-        "wind_max": max(winds, default=None),
-        "gust_max": max(gusts, default=None),
-        "precipitation_total": (
-            round(sum(precipitation), 2)
-            if precipitation else None
-        ),
-        "precipitation_hourly_max": max(
-            precipitation,
-            default=None,
-        ),
-        "visibility_min": min(visibility, default=None),
-        "cape_max": max(cape, default=None),
-        "weather_codes": weather_codes,
-    }
 
     return {
         "city": weather["city"],
@@ -407,7 +442,8 @@ def summarize_weather(weather):
         "retrieved_at": weather["retrieved_at"],
         "current": weather["current"],
         "today_forecast": weather.get("today_forecast"),
-        "next_24_hours": hourly_summary,
+        "next_24_hours": {"cape_max": max(cape, default=None)},
+        "next_24_hours_hourly": hourly_series(hourly),
         "recent_completed_days": weather.get(
             "previous_days", []
         )[-3:],
@@ -423,32 +459,110 @@ def summarize_weather(weather):
 # response is received). Never contains credentials or message text.
 LAST_GROQ_USAGE = {}
 
+# Program-generated shape summary of the last model response that
+# failed validation. Holds field identifiers, counts, JSON type names
+# and booleans only, never model-generated values or key names.
+LAST_RESPONSE_DIAGNOSTICS = {}
+
 
 def usage_number(usage, key):
     value = usage.get(key) if isinstance(usage, dict) else None
     return value if type(value) is int else None
 
 
-def describe_groq_http_error(status_code, response):
-    if status_code == 413:
-        reason = "request too large for the model or account limit"
-    elif status_code == 429:
-        reason = "rate or token limit reached (RPM, TPM, RPD or TPD)"
-    elif status_code == 400:
-        reason = "request rejected as invalid"
-    else:
-        reason = "request failed"
+# Fixed descriptions for the HTTP statuses Groq documents. Provider
+# error bodies are never copied: they can contain free text and partial
+# model output (for example "failed_generation").
+GROQ_STATUS_DESCRIPTIONS = {
+    400: "request rejected as invalid",
+    401: "authentication failed",
+    403: "permission denied",
+    404: "resource not found",
+    413: "request too large for the model or account limit",
+    422: "request could not be processed",
+    424: "a dependent request failed",
+    429: "rate or token limit reached (RPM, TPM, RPD or TPD)",
+    498: "flex tier capacity exceeded",
+    499: "request cancelled",
+    500: "provider internal error",
+    502: "provider gateway error",
+    503: "provider unavailable",
+}
 
-    retry_after = response.headers.get("retry-after") if hasattr(
-        response, "headers"
+# Fixed descriptions for provider error codes observed in practice.
+GROQ_ERROR_CODE_DESCRIPTIONS = {
+    "json_validate_failed": (
+        "the provider reported that the generated output did not "
+        "validate against the response schema"
+    ),
+}
+
+GROQ_GENERIC_ERROR_DESCRIPTION = "provider details withheld"
+
+# Provider identifiers (error.code, error.type) are passed on only when
+# they look like machine identifiers; anything else is withheld.
+_PROVIDER_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_RETRY_AFTER = re.compile(r"\d{1,6}(?:\.\d{1,3})?")
+
+
+def safe_provider_identifier(value):
+    if isinstance(value, str) and _PROVIDER_IDENTIFIER.fullmatch(value):
+        return value
+
+    return None
+
+
+def provider_error_fields(response):
+    """
+    The structured error.code and error.type from a provider error
+    body, each validated as an identifier, else None. The body is
+    parsed defensively; message, failed_generation, any other field and
+    the raw text are never read into the result.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError, AttributeError):
+        return None, None
+
+    error = body.get("error") if isinstance(body, dict) else None
+
+    if not isinstance(error, dict):
+        return None, None
+
+    return (
+        safe_provider_identifier(error.get("code")),
+        safe_provider_identifier(error.get("type")),
+    )
+
+
+def describe_groq_http_error(status_code, response):
+    """
+    Program-generated description of a Groq HTTP error. It contains only
+    the status, a fixed description, validated provider identifiers and
+    a numeric retry-after; never provider-supplied text.
+    """
+    status = status_code if type(status_code) is int else None
+    code, error_type = provider_error_fields(response)
+
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("retry-after") if hasattr(
+        headers, "get"
     ) else None
 
-    message = f"Groq API returned HTTP {status_code} ({reason})"
+    message = (
+        f"Groq API returned HTTP {status} "
+        f"({GROQ_STATUS_DESCRIPTIONS.get(status, 'request failed')})"
+    )
 
-    if retry_after:
-        message += f"; retry-after {compact_text(retry_after, 20)}s"
+    if isinstance(retry_after, str) and _RETRY_AFTER.fullmatch(retry_after):
+        message += f"; retry-after {retry_after}s"
 
-    return message + f": {compact_text(response.text, 400)}"
+    return (
+        message
+        + f"; provider code={code or 'unavailable'}, "
+        f"type={error_type or 'unavailable'}: "
+        + GROQ_ERROR_CODE_DESCRIPTIONS.get(code, GROQ_GENERIC_ERROR_DESCRIPTION)
+    )
 
 
 def ask_groq(messages, temperature=0.1):
@@ -457,8 +571,9 @@ def ask_groq(messages, temperature=0.1):
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is missing.")
 
-    serialized_messages = json_text(messages)
-    estimated_input_tokens = estimate_tokens(serialized_messages)
+    # Both guards measure the messages and the response schema.
+    request_text = serialized_request(messages)
+    estimated_input_tokens = estimate_tokens(request_text)
 
     estimated_total = (
         estimated_input_tokens + MAX_COMPLETION_TOKENS
@@ -468,12 +583,14 @@ def ask_groq(messages, temperature=0.1):
     print("Estimated input tokens:", estimated_input_tokens)
     print("Completion token allowance:", MAX_COMPLETION_TOKENS)
     print("Estimated total tokens:", estimated_total)
-    print("Request characters:", len(serialized_messages))
+    print("Request characters:", len(request_text))
+    print("Response schema characters:", len(json_text(RESPONSE_FORMAT)))
 
-    if len(serialized_messages) > MAX_REQUEST_CHARS:
+    if len(request_text) > MAX_REQUEST_CHARS:
         raise ValueError(
-            "Groq request blocked: prompt exceeds the configured "
-            f"{MAX_REQUEST_CHARS}-character limit."
+            "Groq request blocked: request (messages and response "
+            f"schema) exceeds the configured {MAX_REQUEST_CHARS}-"
+            "character limit."
         )
 
     if estimated_total > MAX_ESTIMATED_REQUEST_TOKENS:
@@ -491,7 +608,8 @@ def ask_groq(messages, temperature=0.1):
         # openai/gpt-oss-20b; reasoning_format is not supported there.
         "reasoning_effort": "low",
         "include_reasoning": False,
-        "response_format": {"type": "json_object"},
+        # Strict structured outputs: every field required, no extras.
+        "response_format": RESPONSE_FORMAT,
     }
 
     response = HTTP.post(
@@ -525,6 +643,11 @@ def ask_groq(messages, temperature=0.1):
     LAST_GROQ_USAGE.update({
         "prompt_tokens": usage_number(usage, "prompt_tokens"),
         "completion_tokens": usage_number(usage, "completion_tokens"),
+        "reasoning_tokens": usage_number(
+            usage.get("completion_tokens_details")
+            if isinstance(usage, dict) else None,
+            "reasoning_tokens",
+        ),
         "total_tokens": usage_number(usage, "total_tokens"),
         "finish_reason": (
             finish_reason if isinstance(finish_reason, str) else None
@@ -1069,6 +1192,11 @@ def apply_evidence_uncertainty(decision, hazards):
     decision["missing_evidence"].append(
         "Weather evidence gaps: " + summary
     )
+    add_incomplete_reason(
+        decision,
+        "WEATHER_EVIDENCE_UNCERTAIN",
+        ", ".join(sorted(gaps)),
+    )
 
     recommendation = decision.get("alert_recommendation")
 
@@ -1420,6 +1548,36 @@ def search_guidelines(policy, query, k=1, required_sections=None):
 # 6. GOOGLE SHEETS HISTORY
 # ============================================================
 
+def describe_history_error(exc):
+    """
+    Program-generated description of a history retrieval failure. The
+    exception text is never used: requests includes the full request
+    URL (the secret SHEET_URL and its query string) in its messages.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+
+        if type(status) is int:
+            return f"history service returned HTTP {status}"
+
+        return "history service returned an HTTP error"
+
+    if isinstance(exc, requests.Timeout):
+        return "history request timed out"
+
+    if isinstance(exc, requests.ConnectionError):
+        return "history service could not be reached"
+
+    if isinstance(exc, ValueError):
+        return "history response could not be read as JSON"
+
+    if isinstance(exc, requests.RequestException):
+        return "history request failed"
+
+    return "history retrieval failed"
+
+
 def tool_get_history(n=3):
     if not SHEET_URL:
         return {
@@ -1447,7 +1605,7 @@ def tool_get_history(n=3):
         return data[:MAX_HISTORY_RECORDS]
 
     except (requests.RequestException, ValueError) as exc:
-        return {"error": str(exc)}
+        return {"error": describe_history_error(exc)}
 
 
 def summarize_history(history):
@@ -1546,6 +1704,20 @@ VALID_RECOMMENDATIONS = {
 }
 
 
+def add_incomplete_reason(decision, code, detail=None):
+    """
+    Record why an assessment is incomplete as a structured code, once
+    per code. Details are generated by this program, never copied from
+    model output.
+    """
+    reasons = decision.setdefault("incomplete_reasons", [])
+
+    if not any(reason["code"] == code for reason in reasons):
+        reasons.append({"code": code, "detail": detail})
+
+    return decision
+
+
 def validate_string_list(value, field_name):
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list.")
@@ -1562,30 +1734,345 @@ def validate_string_list(value, field_name):
     ]
 
 
+# The 16 keys the model must return. limitations and missing_evidence
+# are program-owned and never requested from the model.
+RESPONSE_FIELDS = (
+    "hazard_type",
+    "likelihood_score",
+    "likelihood_reason",
+    "severity_score",
+    "severity_reason",
+    "exposure_score",
+    "exposure_reason",
+    "duration_score",
+    "duration_reason",
+    "geographic_impact_score",
+    "geographic_impact_reason",
+    "alert_recommendation",
+    "advice",
+    "reasoning",
+    "recommended_actions",
+    "sources",
+)
+
+SCORE_FIELDS = tuple(
+    field for field in RESPONSE_FIELDS if field.endswith("_score")
+)
+LIST_FIELDS = ("recommended_actions", "sources")
+
+
+def build_response_schema():
+    """
+    Strict JSON Schema for the model response, built from
+    RESPONSE_FIELDS (Groq structured outputs, strict mode). Every field
+    is required and no other field is allowed. Scores use Groq's
+    documented union-with-null form; the 1-5 range is not expressible in
+    the documented subset and stays enforced by validate_decision.
+    """
+    properties = {}
+
+    for field in RESPONSE_FIELDS:
+        if field in SCORE_FIELDS:
+            properties[field] = {"type": ["integer", "null"]}
+        elif field in LIST_FIELDS:
+            properties[field] = {"type": "array", "items": {"type": "string"}}
+        elif field == "alert_recommendation":
+            properties[field] = {
+                "type": "string",
+                "enum": sorted(VALID_RECOMMENDATIONS),
+            }
+        else:
+            properties[field] = {"type": "string"}
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(RESPONSE_FIELDS),
+        "additionalProperties": False,
+    }
+
+
+RESPONSE_SCHEMA_NAME = "weather_safety_assessment"
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": RESPONSE_SCHEMA_NAME,
+        "strict": True,
+        "schema": build_response_schema(),
+    },
+}
+
+
+def serialized_request(messages):
+    """
+    The text the request guards measure: the messages and the response
+    schema, since both are sent to Groq.
+    """
+    return json_text({"messages": messages, "response_format": RESPONSE_FORMAT})
+
+
+def json_type_name(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "other"
+
+
+def schema_value_matches(field, value):
+    """Whether a value has the type the response schema declares."""
+    if field in SCORE_FIELDS:
+        return value is None or type(value) is int
+    if field in LIST_FIELDS:
+        return isinstance(value, list) and all(
+            isinstance(item, str) for item in value
+        )
+    if field == "alert_recommendation":
+        return isinstance(value, str) and value in VALID_RECOMMENDATIONS
+    return isinstance(value, str)
+
+
+SCHEMA_TYPE_LABELS = {
+    field: (
+        "integer|null" if field in SCORE_FIELDS
+        else "array<string>" if field in LIST_FIELDS
+        else "string(enum)" if field == "alert_recommendation"
+        else "string"
+    )
+    for field in RESPONSE_FIELDS
+}
+
+
+def _normalised_key(text):
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _nested_normalised_keys(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield _normalised_key(key)
+
+            yield from _nested_normalised_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _nested_normalised_keys(item)
+
+
+def response_shape_diagnostics(response):
+    """
+    Program-generated summary of a model response's shape. It reports
+    schema field identifiers, counts, JSON type names and booleans
+    only. Unexpected (model-chosen) key names and all values are never
+    included.
+    """
+    if not isinstance(response, dict):
+        return {"response_type": json_type_name(response)}
+
+    unexpected = [key for key in response if key not in RESPONSE_FIELDS]
+    missing = [field for field in RESPONSE_FIELDS if field not in response]
+
+    unexpected_types = {}
+
+    for key in unexpected:
+        type_name = json_type_name(response[key])
+        unexpected_types[type_name] = unexpected_types.get(type_name, 0) + 1
+
+    unexpected_normalised = [
+        _normalised_key(key) for key in unexpected if isinstance(key, str)
+    ]
+    nested = set()
+
+    for value in response.values():
+        nested.update(_nested_normalised_keys(value))
+
+    variants = {}
+
+    for field in missing:
+        target = _normalised_key(field)
+        variants[field] = {
+            "case_or_separator_variant": target in unexpected_normalised,
+            "prefix_or_suffix_variant": any(
+                key != target and len(key) >= 4
+                and (
+                    key.startswith(target) or key.endswith(target)
+                    or target.startswith(key) or target.endswith(key)
+                )
+                for key in unexpected_normalised
+            ),
+            "found_nested": target in nested,
+        }
+
+    return {
+        "top_level_key_count": len(response),
+        "missing_required_count": len(missing),
+        "missing_required": missing,
+        "unexpected_key_count": len(unexpected),
+        "unexpected_value_types": dict(sorted(unexpected_types.items())),
+        "program_owned_keys": sorted(PROGRAM_OWNED_FIELDS & set(response)),
+        "missing_field_variants": variants,
+        "wrong_type_fields": [
+            {
+                "field": field,
+                "expected": SCHEMA_TYPE_LABELS[field],
+                "received": json_type_name(response[field]),
+            }
+            for field in RESPONSE_FIELDS
+            if field in response
+            and not schema_value_matches(field, response[field])
+        ],
+    }
+
+
+# ------------------------------------------------------------
+# Policy source citations. A citation counts only when it resolves to
+# exactly one retrieved section; the stored value is always that
+# section's canonical title. Nothing outside the retrieved sections can
+# be accepted.
+# ------------------------------------------------------------
+_SECTION_NUMBER = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(.+)$")
+
+
+def normalise_citation(text):
+    """Remove fixed wrappers, case and spacing differences."""
+    text = re.sub(r"\s+", " ", text).strip().strip("\"'`").strip()
+    text = re.sub(r"^=+\s*", "", text)
+    text = re.sub(r"\s*=+$", "", text)
+    text = re.sub(r"^policy section\s*:\s*", "", text, flags=re.I)
+    text = re.sub(r"^(?:#+|\u00a7|section)\s*", "", text, flags=re.I)
+    return text.strip().lower()
+
+
+def _citation_keys(heading):
+    """Full heading, number alone and heading text alone."""
+    full = normalise_citation(heading)
+    keys = {full: "normalised_title"}
+    match = _SECTION_NUMBER.match(full)
+
+    if match:
+        keys[match.group(1)] = "number"
+        keys[match.group(1) + "."] = "number"
+        keys[match.group(2)] = "heading"
+
+    return keys
+
+
+def citation_index(retrieved_sections):
+    """{normalised key: {(canonical title, rule), ...}}"""
+    index = {}
+
+    def add(heading, title, sub_heading=False):
+        for key, rule in _citation_keys(heading).items():
+            # A sub-heading is citable only with its number: "4.1
+            # Likelihood (L)" or "4.1", never "Likelihood (L)" alone.
+            if sub_heading and rule == "heading":
+                continue
+
+            index.setdefault(key, set()).add(
+                (title, "sub_heading" if sub_heading else rule)
+            )
+
+    for section in retrieved_sections:
+        title = section["section"]
+        add(title, title)
+
+        # Numbered sub-headings inside the retrieved text map to it.
+        for line in section["text"].splitlines():
+            if line.startswith("### "):
+                heading = line[4:].strip()
+
+                if _SECTION_NUMBER.match(heading):
+                    add(heading, title, sub_heading=True)
+
+    return index
+
+
+def resolve_citation(citation, retrieved_sections, index=None):
+    """(canonical title or None, rule) for one citation."""
+    titles = [section["section"] for section in retrieved_sections]
+
+    if not isinstance(citation, str):
+        return None, "unmatched"
+
+    if citation in titles:
+        return citation, "exact"
+
+    index = citation_index(retrieved_sections) if index is None else index
+    matches = index.get(normalise_citation(citation), set())
+    resolved = {title for title, _ in matches}
+
+    if len(resolved) == 1:
+        title = resolved.pop()
+        rules = sorted({rule for t, rule in matches if t == title})
+        return title, rules[0]
+
+    if len(resolved) > 1:
+        return None, "ambiguous"
+
+    if _SECTION_NUMBER.match(normalise_citation(citation)):
+        return None, "unretrieved_section_reference"
+
+    return None, "unmatched"
+
+
+def resolve_policy_sources(citations, retrieved_sections):
+    """Canonical titles for every resolvable citation, in order, once."""
+    index = citation_index(retrieved_sections)
+    resolved = []
+
+    for citation in citations:
+        title, _ = resolve_citation(citation, retrieved_sections, index)
+
+        if title is not None and title not in resolved:
+            resolved.append(title)
+
+    return resolved
+
+
+def source_resolution_diagnostics(citations, retrieved_sections):
+    """
+    Program-generated counts per resolution rule. Never includes the
+    model's citation text.
+    """
+    if not isinstance(citations, list):
+        return {"sources_type": json_type_name(citations)}
+
+    index = citation_index(retrieved_sections)
+    counts = {}
+
+    for citation in citations:
+        _, rule = resolve_citation(citation, retrieved_sections, index)
+        counts[rule] = counts.get(rule, 0) + 1
+
+    return {
+        "source_count": len(citations),
+        "resolution_counts": dict(sorted(counts.items())),
+    }
+
+
 def validate_decision(decision, retrieved_sections):
     if not isinstance(decision, dict):
         raise ValueError("AI returned an invalid assessment.")
 
-    required = [
-        "hazard_type",
-        "likelihood_score",
-        "likelihood_reason",
-        "severity_score",
-        "severity_reason",
-        "exposure_score",
-        "exposure_reason",
-        "duration_score",
-        "duration_reason",
-        "geographic_impact_score",
-        "geographic_impact_reason",
-        "alert_recommendation",
-        "advice",
-        "reasoning",
-        "recommended_actions",
-        "limitations",
-        "missing_evidence",
-        "sources",
-    ]
+    reserved = sorted(PROGRAM_OWNED_FIELDS & set(decision))
+
+    if reserved:
+        raise ValueError(
+            "Model output sets program-owned fields: " + ", ".join(reserved)
+        )
+
+    required = list(RESPONSE_FIELDS)
 
     missing = [
         field for field in required
@@ -1643,15 +2130,16 @@ def validate_decision(decision, retrieved_sections):
 
     for field in ("hazard_type", "advice", "reasoning"):
         if not isinstance(decision[field], str):
-            raise ValueError(f"Invalid text field: {field}")
+            raise ValueError(
+                f"Invalid text field: {field} (expected text, "
+                f"received {type(decision[field]).__name__})"
+            )
 
         if not decision[field].strip():
             raise ValueError(f"Empty text field: {field}")
 
     for field in (
         "recommended_actions",
-        "limitations",
-        "missing_evidence",
         "sources",
     ):
         decision[field] = validate_string_list(
@@ -1659,16 +2147,11 @@ def validate_decision(decision, retrieved_sections):
             field,
         )
 
-    available_titles = {
-        section["section"]
-        for section in retrieved_sections
-    }
-
-    valid_sources = [
-        source
-        for source in decision["sources"]
-        if source in available_titles
-    ]
+    # Only citations that resolve to exactly one retrieved section are
+    # kept, as canonical titles; anything else is dropped.
+    valid_sources = resolve_policy_sources(
+        decision["sources"], retrieved_sections
+    )
 
     if not valid_sources:
         raise ValueError(
@@ -1676,6 +2159,11 @@ def validate_decision(decision, retrieved_sections):
         )
 
     decision["sources"] = valid_sources
+
+    # Program-owned: filled only from validation outcomes and, later, the
+    # program's own evidence and status checks. Never from model text.
+    decision["limitations"] = []
+    decision["missing_evidence"] = []
 
     score, band = calculate_risk_score(
         decision["likelihood_score"],
@@ -1704,9 +2192,402 @@ def validate_decision(decision, retrieved_sections):
         decision["missing_evidence"].append(
             "Evidence required to score: " + ", ".join(unassessed) + "."
         )
+        add_incomplete_reason(
+            decision,
+            "RISK_DIMENSIONS_UNASSESSED",
+            ", ".join(unassessed),
+        )
 
     # The model's preliminary analysis is not a completed safety clearance.
     decision["assessment_status"] = "PRELIMINARY"
+
+    return decision
+
+
+# Dimensions whose required evidence this program does not have.
+# guidelines.md 4.3: exposure needs population, workforce, vulnerable-
+# group and infrastructure evidence; 4.5: geographic impact must not be
+# inferred "from a single city-wide weather reading". The pipeline has
+# neither, so the model's scores are never accepted: the score is set
+# to null (UNASSESSED, section 5 rule 4) with a fixed reason. Remove an
+# entry only when a real evidence source for that dimension exists.
+# (score field -> (reason field, fixed program-generated reason))
+EVIDENCE_GATED_DIMENSIONS = {
+    "exposure_score": (
+        "exposure_reason",
+        "Not assessed: no population, workforce, vulnerable-group or "
+        "infrastructure exposure evidence is available to this program.",
+    ),
+    "geographic_impact_score": (
+        "geographic_impact_reason",
+        "Not assessed: only one Dubai forecast point is available, and "
+        "geographic extent cannot be inferred from a single reading.",
+    ),
+}
+
+
+def apply_evidence_gate(decision):
+    """
+    Replace model-supplied scores for evidence-gated dimensions with
+    null and a fixed reason, before validation and risk calculation.
+    Only keys the model actually returned are touched, so a missing key
+    still fails validation. Returns the names of fields where the model
+    supplied a non-null value (names only, never the values).
+    """
+    if not isinstance(decision, dict):
+        return []
+
+    overridden = []
+
+    for score_field, (reason_field, reason) in (
+        EVIDENCE_GATED_DIMENSIONS.items()
+    ):
+        if score_field not in decision:
+            continue
+
+        if decision[score_field] is not None:
+            overridden.append(score_field)
+
+        decision[score_field] = None
+
+        if reason_field in decision:
+            decision[reason_field] = reason
+
+    return overridden
+
+
+class UnverifiedWarningClaim(ValueError):
+    """
+    Model text asserts an official warning state that was not checked.
+
+    Carries only program-generated metadata: the schema field label
+    (or "outside_schema"), the number (1-5) of the first matching
+    pattern, the already-validated canonical policy sources and the
+    evidence-gate override names. Never the matched text.
+    """
+
+    def __init__(
+        self, message, field_label="unknown", pattern_number=None,
+        shape=None,
+    ):
+        super().__init__(message)
+        self.field_label = field_label
+        self.pattern_number = pattern_number
+        self.shape = shape
+        self.sources = []
+        self.gate_overrides = []
+
+    def diagnostic(self):
+        """"field=<label>;pattern=<n>" built from fixed values only."""
+        label = (
+            self.field_label
+            if self.field_label in RESPONSE_FIELDS
+            or self.field_label == "outside_schema"
+            else "unknown"
+        )
+        number = (
+            self.pattern_number
+            if type(self.pattern_number) is int
+            and 1 <= self.pattern_number
+            <= len(UNVERIFIED_WARNING_CLAIM_PATTERNS)
+            else None
+        )
+
+        return f"field={label};pattern={number}"
+
+    def shape_diagnostic(self):
+        """
+        Fixed-vocabulary shape of a pattern 3 match, else None. Every
+        value is checked against the fixed sets; anything else becomes
+        "unknown" (words between: None).
+        """
+        if self.pattern_number != 3:
+            return None
+
+        shape = self.shape if isinstance(self.shape, dict) else {}
+        between = shape.get("words_between")
+
+        return {
+            "qualifier": (
+                shape.get("qualifier")
+                if shape.get("qualifier") in _CLAIM_QUALIFIERS
+                else "unknown"
+            ),
+            "term_class": (
+                shape.get("term_class")
+                if shape.get("term_class") in _CLAIM_TERM_CLASSES
+                else "unknown"
+            ),
+            "words_between": (
+                between
+                if type(between) is int and 0 <= between <= 2
+                else None
+            ),
+            "following_word_class": (
+                shape.get("following_word_class")
+                if shape.get("following_word_class") in _CLAIM_FOLLOW_CLASSES
+                else "unknown"
+            ),
+        }
+
+
+_WARNING_TERMS = r"(?:warnings?|advisor(?:y|ies)|emergency\s+instructions?)"
+_NOT_A_CLAIM = (
+    r"(?!\s+(?:feed|feeds|source|sources|data|system|service|check|checks"
+    r"|verification|status|integration|api|recommendation|recommended"
+    r"|level|levels|criteria|threshold|thresholds)\b)"
+)
+_WARNING_STATE = (
+    r"(?:in\s+effect|active|issued|in\s+place|current(?:ly)?|reported"
+    r"|announced|declared|exist|existing)"
+)
+_WARNING_AUTHORITIES = (
+    r"(?:NCM|NCEMA|Dubai\s+Police|MoHRE"
+    r"|National\s+Cent(?:er|re)\s+of\s+Meteorology|authorit(?:y|ies))"
+)
+
+# Statements about whether an official warning or advisory is, or is
+# not, in effect. While warnings are NOT_CHECKED either claim is
+# unsupported (guidelines sections 1, 9 and 16).
+UNVERIFIED_WARNING_CLAIM_PATTERNS = (
+    # "no official heat advisory is in effect", "no warnings were issued"
+    re.compile(
+        r"\bno\s+(?:[a-z-]+\s+){0,3}" + _WARNING_TERMS + r"\b"
+        + _NOT_A_CLAIM + r"(?:\s+[a-z-]+){0,4}?\s+" + _WARNING_STATE
+        + r"\b",
+        re.I,
+    ),
+    # "there are no warnings", "there's no advisory for Dubai"
+    re.compile(
+        r"\bthere(?:\s+(?:is|are|were|was)|['\u2019]s)\s+(?:currently\s+)?"
+        r"no\s+(?:[a-z-]+\s+){0,2}" + _WARNING_TERMS + r"\b" + _NOT_A_CLAIM,
+        re.I,
+    ),
+    # "there are no active warnings", "no official warning at this time"
+    re.compile(
+        r"\bno\s+(?:active|current|official|existing)\s+"
+        r"(?:[a-z-]+\s+){0,2}" + _WARNING_TERMS + r"\b" + _NOT_A_CLAIM,
+        re.I,
+    ),
+    # "a heat warning is in effect", "the advisory is not active"
+    re.compile(
+        _WARNING_TERMS + r"\s+(?:is|are|was|were|has|have)(?:n['\u2019]t)?\s+"
+        r"(?:not\s+|no\s+longer\s+)?(?:been\s+|currently\s+)?"
+        + _WARNING_STATE + r"\b(?!\s+by\b)",
+        re.I,
+    ),
+    # "NCM has not issued", "authorities have issued"
+    re.compile(
+        r"\b" + _WARNING_AUTHORITIES + r"\s+(?:has|have|had)(?:n['\u2019]t)?\s+"
+        r"(?:not\s+|no\s+)?(?:yet\s+)?"
+        r"(?:issued|declared|announced|reported)\b",
+        re.I,
+    ),
+)
+
+# A match preceded by "whether" or "if" (within three words) is a
+# conditional, not a claim: "verify whether an advisory is in effect".
+_CONDITIONAL_LEAD = re.compile(r"\b(?:whether|if)\b(?:\s+\S+){0,3}\s*$", re.I)
+
+# Invisible characters that could split a phrase without changing how
+# it reads; removed before matching.
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))
+
+# Fields only the program may set. A model response containing any of
+# them is rejected rather than trusted or silently dropped.
+PROGRAM_OWNED_FIELDS = frozenset({
+    "official_warning_status", "official_warning_authority",
+    "assessment_status", "risk_score", "risk_band",
+    "incomplete_reasons", "groq_usage", "send_alert", "alert_message",
+    "approval_status", "notification_status", "evidence_quality",
+    "evidence_confidence", "policy_status", "policy_version",
+    "policy_hash", "policy_path", "hazard_screening", "tools_used",
+    "weather_summary", "weather_source", "weather_retrieval_status",
+    "weather_data_timestamp", "assessment_timestamp", "city",
+    "timezone", "history_checked", "history_status",
+    "response_diagnostics", "evidence_gate_overrides",
+    "warning_claim_diagnostic", "limitations", "missing_evidence",
+})
+
+
+def find_unverified_warning_claim_pattern(text):
+    """
+    Number (1-5, in UNVERIFIED_WARNING_CLAIM_PATTERNS order) of the
+    first pattern that asserts an official warning state in text,
+    else None.
+    """
+    text = text.translate(_INVISIBLE)
+
+    for number, pattern in enumerate(
+        UNVERIFIED_WARNING_CLAIM_PATTERNS, start=1
+    ):
+        for match in pattern.finditer(text):
+            lead = text[max(0, match.start() - 40):match.start()]
+
+            if not _CONDITIONAL_LEAD.search(lead):
+                return number
+
+    return None
+
+
+def find_unverified_warning_claim(text):
+    """Return True when text asserts an official warning state."""
+    return find_unverified_warning_claim_pattern(text) is not None
+
+
+# Fixed vocabularies for the pattern 3 shape diagnostic.
+_CLAIM_QUALIFIERS = ("active", "current", "official", "existing")
+_CLAIM_TERM_CLASSES = ("warning", "advisory", "emergency_instruction")
+_CLAIM_FOLLOW_CLASSES = (
+    "end", "punctuation", "auxiliary", "preposition", "conjunction",
+    "other_word", "unknown",
+)
+_CLAIM_AUXILIARIES = frozenset({
+    "is", "are", "was", "were", "be", "been", "being", "has", "have",
+    "had", "will", "would", "can", "could", "should", "may", "might",
+    "must", "do", "does", "did",
+})
+_CLAIM_PREPOSITIONS = frozenset({
+    "for", "at", "in", "on", "of", "by", "to", "from", "during",
+    "within", "across", "over", "under", "with", "without", "as",
+    "today", "tonight", "now",
+})
+_CLAIM_CONJUNCTIONS = frozenset({
+    "and", "or", "but", "so", "because", "since", "while", "although",
+    "though", "if", "unless", "when", "that", "which",
+})
+
+# Applied only to the text already matched by pattern 3.
+_CLAIM_SHAPE_PARTS = re.compile(
+    r"no\s+(active|current|official|existing)\s+((?:[a-z-]+\s+){0,2})"
+    r"(warnings?|advisor(?:y|ies)|emergency\s+instructions?)",
+    re.I,
+)
+_CLAIM_NEXT_WORD = re.compile(r"\s*([A-Za-z][A-Za-z'\u2019-]*|\S)?")
+
+
+def _claim_follow_class(rest):
+    """Class of the text after a match, from the fixed vocabulary."""
+    found = _CLAIM_NEXT_WORD.match(rest).group(1)
+
+    if found is None:
+        return "end"
+
+    if not found[0].isalpha():
+        return "punctuation"
+
+    word = found.lower().replace("\u2019", "'")
+
+    if word in _CLAIM_AUXILIARIES:
+        return "auxiliary"
+
+    if word in _CLAIM_PREPOSITIONS:
+        return "preposition"
+
+    if word in _CLAIM_CONJUNCTIONS:
+        return "conjunction"
+
+    return "other_word"
+
+
+def find_unverified_warning_claim_shape(text):
+    """
+    Fixed-vocabulary shape of the first non-conditional pattern 3 match
+    in text, else None. Returns only values from the fixed sets above
+    and a count of 0-2; never the matched text or its surroundings.
+    """
+    text = text.translate(_INVISIBLE)
+    unknown = {
+        "qualifier": "unknown", "term_class": "unknown",
+        "words_between": None, "following_word_class": "unknown",
+    }
+
+    for match in UNVERIFIED_WARNING_CLAIM_PATTERNS[2].finditer(text):
+        lead = text[max(0, match.start() - 40):match.start()]
+
+        if _CONDITIONAL_LEAD.search(lead):
+            continue
+
+        parts = _CLAIM_SHAPE_PARTS.fullmatch(match.group(0))
+
+        if parts is None:
+            return unknown
+
+        term = parts.group(3).lower()
+
+        return {
+            "qualifier": parts.group(1).lower(),
+            "term_class": (
+                "warning" if term.startswith("warning")
+                else "advisory" if term.startswith("advis")
+                else "emergency_instruction"
+            ),
+            "words_between": len(parts.group(2).split()),
+            "following_word_class": _claim_follow_class(
+                text[match.end():]
+            ),
+        }
+
+    return None
+
+
+def model_strings(value):
+    """
+    Every string inside a model value, however deeply nested,
+    including dictionary key names.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+
+            yield from model_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from model_strings(item)
+
+
+def reject_unverified_warning_claims(decision, official_warning_status):
+    """
+    Fail closed when model text states that an official warning or
+    advisory is, or is not, in effect while official warnings have not
+    been verified. official_warning_status comes from the program,
+    never from the model. Every string in every model field is checked,
+    including keys outside the schema. The error names the field,
+    never its content.
+    """
+    if official_warning_status == "VERIFIED":
+        return decision
+
+    for field, value in decision.items():
+        # Top-level key names are model text too. Only schema field
+        # names are echoed in the error; any other key name is
+        # model-chosen and is never repeated.
+        location = (
+            field if field in RESPONSE_FIELDS
+            else "a field outside the response schema"
+        )
+
+        for text in model_strings({field: value}):
+            pattern_number = find_unverified_warning_claim_pattern(text)
+
+            if pattern_number is not None:
+                raise UnverifiedWarningClaim(
+                    "Model output makes an unverified official-warning "
+                    f"claim in {location} while official warning status "
+                    f"is {official_warning_status}.",
+                    field_label=(
+                        field if field in RESPONSE_FIELDS
+                        else "outside_schema"
+                    ),
+                    pattern_number=pattern_number,
+                    shape=(
+                        find_unverified_warning_claim_shape(text)
+                        if pattern_number == 3 else None
+                    ),
+                )
 
     return decision
 
@@ -1718,8 +2599,15 @@ def enforce_assessment_status(decision):
     any other warning status, including a missing one, forces
     INCOMPLETE. No official warning feed is integrated today.
     """
-    if decision.get("official_warning_status") != "VERIFIED":
+    status = decision.get("official_warning_status")
+
+    if status != "VERIFIED":
         decision["assessment_status"] = "INCOMPLETE"
+        add_incomplete_reason(
+            decision,
+            "OFFICIAL_WARNINGS_NOT_VERIFIED",
+            f"official_warning_status={status}",
+        )
 
     return decision
 
@@ -1786,30 +2674,20 @@ Requirements:
    definitions in the supplied policy, with a separate evidence-based
    rationale for each.
 3. Never treat missing evidence as a low score.
-4. Official warning status is NOT_CHECKED; do not claim otherwise.
-   Open-Meteo is a weather data source, not an official UAE warning
-   authority.
+4. Official warning status is NOT_CHECKED (program-reported). Free text must not use warning, warnings, advisory or advisories, or claim their existence, absence, availability or status; describe evidence limits without that. Follow the schema. Open-Meteo is not an official UAE warning authority.
 5. Distinguish current observations, forecasts and historical context.
 6. Do not assume all residents or workers have equal exposure.
 7. Previous alerts must not suppress a new or different hazard. Do not
    recommend an alert solely because a value is unusual.
 8. Use only recommendation values defined in the supplied policy.
-9. Explain missing evidence and limitations. The assessment is never a
+9. Explain missing evidence. The assessment is never a
    completed safety clearance.
 10. In sources, cite exact policy section titles.
 11. Return a single JSON object only.
 
-Return exactly these keys:
-hazard_type, likelihood_score, likelihood_reason, severity_score,
-severity_reason, exposure_score, exposure_reason, duration_score,
-duration_reason, geographic_impact_score, geographic_impact_reason,
-alert_recommendation, advice, reasoning, recommended_actions,
-limitations, missing_evidence, sources.
-
 Each score must be an integer from 1 to 5 when evidence supports it.
 If evidence for a dimension is insufficient, return null for that
-score, never a guessed value, and explain why in its rationale and in
-limitations. All list fields must be JSON arrays of strings.
+score, never a guessed value, and explain why in its rationale.
 """
 
 
@@ -1853,22 +2731,22 @@ def assess_weather(weather, history, policy, retrieved_sections):
         "weather": compact_weather,
         "recent_agent_history": compact_history,
         "policy_version": policy["version"],
-        "official_warning_status": (
-            "NOT_CHECKED. No NCM or other official warning feed "
-            "is integrated."
-        ),
+        "official_warning_status": "NOT_CHECKED (program-reported)",
         "risk_score_notice": (
-            "Any calculated risk score is the provisional internal "
-            "model in guidelines.md section 5, not an official "
-            "UAE/NCM classification."
+            "Any risk score is an internal provisional calculation made "
+            "by the program, not an official UAE or NCM classification, "
+            "and must not be treated as validated for automated public "
+            "notifications."
         ),
     }
 
     user_prompt = (
         "Assess the supplied weather situation using the policy "
         "sections below. Do not infer official warning status. "
-        "Do not claim the assessment is complete. Cite section "
-        "titles exactly as written in the section headers.\n\n"
+        "Do not claim the assessment is complete. In sources, give "
+        "each title exactly as it appears after 'POLICY SECTION:' in a "
+        "block header (for example '6.1 Extreme Heat'), without the "
+        "prefix or the '===' markers.\n\n"
         + format_policy_text(retrieved_sections)
         + "\n\nEVIDENCE AND STATUS (JSON):\n"
         + json_text(context)
@@ -1885,13 +2763,56 @@ def assess_weather(weather, history, policy, retrieved_sections):
         },
     ]
 
+    LAST_RESPONSE_DIAGNOSTICS.clear()
+
     response = ask_groq(messages)
     decision = parse_json_response(response)
 
-    decision = validate_decision(
-        decision,
-        retrieved_sections,
-    )
+    # Computed before validation, which normalises some values.
+    diagnostics = response_shape_diagnostics(decision)
+
+    if isinstance(decision, dict) and "sources" in decision:
+        diagnostics["source_resolution"] = source_resolution_diagnostics(
+            decision["sources"], retrieved_sections
+        )
+
+    # Evidence gate: model scores for exposure and geographic impact
+    # are discarded and replaced by null plus a fixed reason.
+    gate_overrides = apply_evidence_gate(decision)
+
+    try:
+        decision = validate_decision(
+            decision,
+            retrieved_sections,
+        )
+    except ValueError:
+        LAST_RESPONSE_DIAGNOSTICS.update(diagnostics)
+        print("\nRESPONSE SHAPE DIAGNOSTICS (program-generated; no model text)")
+        print(json_text(diagnostics))
+        raise
+
+    decision["evidence_gate_overrides"] = gate_overrides
+
+    # Checked on the model's own text, before the guard adds ours. The
+    # warning status is the program's: no official feed is integrated.
+    try:
+        decision = reject_unverified_warning_claims(decision, "NOT_CHECKED")
+    except UnverifiedWarningClaim as claim:
+        # Validation has already run: the sources are canonical retrieved
+        # titles and the override names are fixed program values.
+        claim.sources = list(decision["sources"])
+        claim.gate_overrides = list(gate_overrides)
+
+        claim_diagnostics = dict(diagnostics)
+        shape = claim.shape_diagnostic()
+
+        if shape is not None:
+            claim_diagnostics["warning_claim_shape"] = shape
+
+        LAST_RESPONSE_DIAGNOSTICS.update(claim_diagnostics)
+        print("\nRESPONSE SHAPE DIAGNOSTICS (program-generated; no model text)")
+        print(json_text(claim_diagnostics))
+        raise
 
     decision = apply_official_warning_guard(decision)
 
@@ -1937,6 +2858,7 @@ def incomplete_assessment(reason):
         "limitations": [reason],
         "missing_evidence": [],
         "sources": [],
+        "incomplete_reasons": [],
     }
 
 
@@ -1950,6 +2872,10 @@ def run_weather_agent():
     policy = None
     weather = None
     history = []
+    # None until screening runs, so a failure before it is not read as
+    # "no hazards".
+    hazards = None
+    LAST_RESPONSE_DIAGNOSTICS.clear()
 
     history_status = "NOT_CHECKED"
 
@@ -2043,6 +2969,7 @@ def run_weather_agent():
         decision["weather_summary"] = summarize_weather(weather)
         decision["hazard_screening"] = hazards
         decision["groq_usage"] = dict(LAST_GROQ_USAGE)
+        decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
 
         apply_evidence_uncertainty(decision, hazards)
 
@@ -2080,6 +3007,31 @@ def run_weather_agent():
 
         decision = incomplete_assessment(error_message)
 
+        if isinstance(exc, UnverifiedWarningClaim):
+            failure_code = "UNVERIFIED_WARNING_CLAIM"
+        elif isinstance(exc, FileNotFoundError):
+            failure_code = "POLICY_UNAVAILABLE"
+        else:
+            failure_code = "ASSESSMENT_ERROR"
+
+        add_incomplete_reason(
+            decision,
+            failure_code,
+            exc.diagnostic()
+            if isinstance(exc, UnverifiedWarningClaim)
+            else type(exc).__name__,
+        )
+
+        if isinstance(exc, UnverifiedWarningClaim):
+            decision["sources"] = [
+                title for title in exc.sources if isinstance(title, str)
+            ]
+            decision["evidence_gate_overrides"] = [
+                name for name in exc.gate_overrides
+                if name in EVIDENCE_GATED_DIMENSIONS
+            ]
+            decision["warning_claim_diagnostic"] = exc.diagnostic()
+
         if isinstance(exc, FileNotFoundError):
             decision["policy_status"] = "UNAVAILABLE"
         elif policy is not None:
@@ -2098,6 +3050,9 @@ def run_weather_agent():
         decision["policy_path"] = str(GUIDELINES_PATH)
 
         decision["official_warning_status"] = "NOT_CHECKED"
+        decision["groq_usage"] = dict(LAST_GROQ_USAGE)
+        decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
+        decision["hazard_screening"] = hazards
 
         decision["evidence_quality"] = "E0"
         decision["evidence_confidence"] = "NONE"
@@ -2138,6 +3093,10 @@ def run_agent_job(dry=False):
     print("POLICY:", decision.get("policy_status"))
     print("POLICY VERSION:", decision.get("policy_version"))
     print("ASSESSMENT:", decision.get("assessment_status"))
+
+    for reason in decision.get("incomplete_reasons", []):
+        print("INCOMPLETE REASON:", reason["code"], "|", reason["detail"])
+
     print("HAZARD:", decision.get("hazard_type"))
     print("RISK SCORE:", decision.get("risk_score"))
     print("RISK BAND:", decision.get("risk_band"))
@@ -2161,6 +3120,36 @@ def run_agent_job(dry=False):
             "|",
             decision.get(dimension + "_reason"),
         )
+
+    print("\nAUDIT SUMMARY (program-generated)")
+    print(
+        json_text(
+            {
+                "sources": decision.get("sources", []),
+                "alert_recommendation": decision.get(
+                    "alert_recommendation"
+                ),
+                "assessment_status": decision.get("assessment_status"),
+                "risk_score_calculated": (
+                    decision.get("risk_score") is not None
+                ),
+                "risk_band": decision.get("risk_band"),
+                "incomplete_reason_codes": [
+                    reason["code"]
+                    for reason in decision.get("incomplete_reasons", [])
+                ],
+                "evidence_gate_overrides": decision.get(
+                    "evidence_gate_overrides", []
+                ),
+                "warning_claim_diagnostic": decision.get(
+                    "warning_claim_diagnostic"
+                ),
+                "hazards_screened": sorted(
+                    decision.get("hazard_screening") or {}
+                ),
+            }
+        )
+    )
 
     print("\nSOURCES:", decision.get("sources"))
     print(
@@ -2438,8 +3427,6 @@ def run_tests():
             "advice": "a",
             "reasoning": "r",
             "recommended_actions": [],
-            "limitations": [],
-            "missing_evidence": [],
             "sources": ["Final Decision Rule"],
         }
         base.update(changes)
@@ -2502,7 +3489,7 @@ def run_tests():
         MAX_POLICY_CHARS == 13500
         and MAX_REQUEST_CHARS == 19000
         and MAX_ESTIMATED_REQUEST_TOKENS == 8000
-        and MAX_COMPLETION_TOKENS == 700,
+        and MAX_COMPLETION_TOKENS == 1000,
     )
 
     def make_weather(current=None, today=None, hourly=None):
@@ -3230,7 +4217,7 @@ def run_tests():
         sections, messages = build_request(
             {code: ["t"] for code in hazards}
         )
-        serialized = json_text(messages)
+        serialized = serialized_request(messages)
 
         return (
             len(serialized) <= MAX_REQUEST_CHARS
@@ -3254,9 +4241,11 @@ def run_tests():
         fits_all_budgets(["HEAT", "WIND_DUST"]),
     )
 
+    # With the response schema counted, five hazards no longer fit.
     check(
-        "All five hazards together fit every budget",
-        fits_all_budgets(list(HAZARD_POLICY_TITLES)),
+        "All five hazards together are blocked once the schema is "
+        "counted",
+        not fits_all_budgets(list(HAZARD_POLICY_TITLES)),
     )
 
     uncertain_all = {
@@ -3269,8 +4258,11 @@ def run_tests():
             self.posts = []
 
         def post(self, *args, **kwargs):
+            # Recorded, then raised as RuntimeError so a request that
+            # wrongly reaches the transport fails the check cleanly
+            # instead of aborting the whole suite.
             self.posts.append(args)
-            raise AssertionError("request must be blocked first")
+            raise RuntimeError("request must be blocked first")
 
     def groq_error(messages, **overrides):
         recorder = NoPostHttp()
@@ -3294,10 +4286,13 @@ def run_tests():
 
     message, posts = groq_error(extreme_messages)
 
+    # The pre-send guard that trips first depends on request size: the
+    # character limit is checked before the token estimate.
     check(
         "Worst case (all uncertain, sections 7 and 11) fails closed "
-        "on the token estimate before sending",
-        "token budget" in message and not posts,
+        "before sending",
+        ("token budget" in message or "character limit" in message)
+        and not posts,
     )
 
     oversized = [
@@ -3364,8 +4359,7 @@ def run_tests():
         "geographic_impact_reason": "r",
         "alert_recommendation": "NO_ALERT_RECOMMENDED",
         "advice": "a", "reasoning": "r",
-        "recommended_actions": [], "limitations": [],
-        "missing_evidence": [],
+        "recommended_actions": [],
         "sources": ["16. Final Decision Rule"],
     })
 
@@ -3384,7 +4378,9 @@ def run_tests():
 
         return with_globals(settings, lambda: run_weather_agent()[0])
 
-    benign_decision = pipeline(make_weather())
+    benign_decision = pipeline(
+        make_weather(), EVIDENCE_GATED_DIMENSIONS={}
+    )
 
     check(
         "Benign weather completes retrieval and stays INCOMPLETE",
@@ -3393,7 +4389,7 @@ def run_tests():
         and benign_decision["alert_recommendation"] == "MONITOR"
         and benign_decision["send_alert"] is False
         and len(sent_messages) == 1
-        and len(json_text(sent_messages[0])) <= MAX_REQUEST_CHARS,
+        and len(serialized_request(sent_messages[0])) <= MAX_REQUEST_CHARS,
     )
 
     sent_messages.clear()
@@ -3839,8 +4835,7 @@ def run_tests():
             "geographic_impact_reason": "r",
             "alert_recommendation": "NO_ALERT_RECOMMENDED",
             "advice": "a", "reasoning": "r",
-            "recommended_actions": [], "limitations": [],
-            "missing_evidence": [],
+            "recommended_actions": [],
             "sources": ["16. Final Decision Rule"],
         })
         mocks = {
@@ -3906,6 +4901,4680 @@ def run_tests():
         and Path(loaded_elsewhere["path"]).resolve()
         == (Path(__file__).resolve().parent / "guidelines.md")
         and loaded_elsewhere["hash"] == hazard_policy["hash"],
+    )
+
+    # ------------------------------------------------------------
+    # Regression: dry run failed with "ValueError: Invalid text
+    # field: advice" although Groq reported finish_reason=stop with
+    # 694 of 700 completion tokens. The JSON parsed and passed every
+    # earlier validation step, so `advice` was present but not a
+    # string. The prompt never stated that advice is plain text.
+    # Everything below is self-contained and offline.
+    # ------------------------------------------------------------
+    def adv_response(**changes):
+        body = {
+            "hazard_type": "HEAT",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 3, "exposure_reason": "er",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 3,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity at midday.",
+            "reasoning": "Temperature reaches the screening value.",
+            "recommended_actions": ["Drink water"],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return body
+
+    adv_sections = [
+        {"section": "6.1 Extreme Heat", "text": "x"},
+        {"section": "16. Final Decision Rule", "text": "x"},
+    ]
+
+    def adv_validate(**changes):
+        try:
+            return validate_decision(adv_response(**changes), adv_sections)
+        except ValueError as exc:
+            return str(exc)
+
+    def adv_raises(function):
+        try:
+            function()
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    def adv_error(body):
+        try:
+            validate_decision(body, adv_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    # 1. A valid response containing advice.
+    adv_ok = adv_validate()
+
+    check(
+        "Valid response with advice passes validation unchanged",
+        isinstance(adv_ok, dict)
+        and adv_ok["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and adv_ok["risk_score"] == 9.0
+        and adv_ok["risk_band"] == "MODERATE"
+        and adv_ok["assessment_status"] == "PRELIMINARY",
+    )
+
+    # 2. Invalid types for advice are rejected and named.
+    for label, bad in {
+        "list": ["a", "b"],
+        "dict": {"text": "a"},
+        "null": None,
+        "int": 3,
+        "bool": True,
+    }.items():
+        message = adv_validate(advice=bad)
+
+        check(
+            f"advice of type {label} is rejected with the type named",
+            isinstance(message, str)
+            and message.startswith("Invalid text field: advice")
+            and "expected text" in message
+            and f"received {type(bad).__name__}" in message,
+        )
+
+    check(
+        "Blank advice is rejected as empty",
+        adv_validate(advice="   ") == "Empty text field: advice",
+    )
+
+    check(
+        "Type errors also name hazard_type and reasoning",
+        adv_validate(hazard_type=["HEAT"]).startswith(
+            "Invalid text field: hazard_type"
+        )
+        and adv_validate(reasoning={"a": 1}).startswith(
+            "Invalid text field: reasoning"
+        ),
+    )
+
+    check(
+        "Type error reports the type, never the model's content",
+        "secret-model-text" not in adv_validate(
+            advice=["secret-model-text"]
+        ),
+    )
+
+    # 3. Missing required fields: every key is required.
+    adv_keys = list(adv_response())
+
+    check(
+        "Sixteen response keys are required",
+        len(adv_keys) == 16,
+    )
+
+    for key in adv_keys:
+        body = adv_response()
+        del body[key]
+
+        check(
+            f"Missing required field is rejected: {key}",
+            adv_error(body) == "Missing assessment fields: " + key,
+        )
+
+    check(
+        "Non-object model output is rejected",
+        adv_error([1, 2]) == "AI returned an invalid assessment."
+        and adv_error("text") == "AI returned an invalid assessment.",
+    )
+
+    # 4. Malformed or truncated JSON never reaches validation.
+    adv_json = json_text(adv_response())
+    truncated_failures = 0
+
+    for cut in range(1, len(adv_json), 37):
+        try:
+            parse_json_response(adv_json[:cut])
+        except ValueError as exc:
+            if "invalid JSON" in str(exc):
+                truncated_failures += 1
+
+    check(
+        "Truncated JSON is always rejected as invalid",
+        truncated_failures == len(range(1, len(adv_json), 37)),
+    )
+
+    check(
+        "Malformed and non-object JSON are rejected",
+        all(
+            "JSON" in adv_raises(lambda text=text: parse_json_response(text))
+            for text in (
+                "{not json", "", "   ", "[1, 2]", "\"text\"", "null",
+                "{\"advice\": }",
+            )
+        ),
+    )
+
+    # Stop plus valid JSON does not prove schema completeness.
+    incomplete_body = adv_response()
+    del incomplete_body["sources"]
+
+    check(
+        "Valid JSON with a missing field is rejected despite a "
+        "clean finish",
+        "Missing assessment fields: sources" in adv_error(
+            parse_json_response(json_text(incomplete_body))
+        ),
+    )
+
+    # Contract: the response schema (sent with every request and
+    # enforced by Groq strict mode) and the validator agree.
+    adv_schema = build_response_schema()
+
+    check(
+        "Schema lists exactly the keys the validator requires",
+        sorted(adv_schema["required"]) == sorted(adv_keys)
+        and sorted(adv_schema["properties"]) == sorted(adv_keys)
+        and len(set(adv_schema["required"])) == 16,
+    )
+
+    adv_string_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == "string"
+    ]
+    adv_score_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == ["integer", "null"]
+    ]
+    adv_array_keys = [
+        key for key in adv_keys
+        if adv_schema["properties"][key].get("type") == "array"
+    ]
+
+    check(
+        "Schema states the type of every key",
+        {"hazard_type", "advice", "reasoning",
+         "alert_recommendation"} <= set(adv_string_keys)
+        and set(adv_score_keys)
+        == {k for k in adv_keys if k.endswith("_score")}
+        and set(adv_array_keys)
+        == {"recommended_actions", "sources"}
+        and len(adv_string_keys) + len(adv_score_keys)
+        + len(adv_array_keys) == 16
+        and all(
+            isinstance(adv_response()[key], str) for key in adv_string_keys
+        )
+        and all(
+            type(adv_response()[key]) is int for key in adv_score_keys
+        )
+        and all(
+            isinstance(adv_response()[key], list) for key in adv_array_keys
+        ),
+    )
+
+    check(
+        "Decision fields reach the Sheets payload as text",
+        isinstance(adv_ok["advice"], str)
+        and isinstance(adv_ok["reasoning"], str),
+    )
+
+    # 5. A complete valid response reaches assessment construction.
+    def adv_weather():
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00",
+                "temperature_2m": 35.5, "apparent_temperature": 34.3,
+                "precipitation": 0, "wind_speed_10m": 5,
+                "wind_gusts_10m": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            },
+            "today_forecast": {
+                "high": 36, "low": 25, "wind": 8, "gust": 15,
+                "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": "2026-11-08T13:00", "temperature": 35,
+                "apparent_temperature": 34, "precipitation": 0,
+                "wind": 5, "gust": 10, "visibility": 20000,
+                "weather_code": 0, "cape": 0,
+            }],
+            "history_summary": {},
+        }
+
+    def adv_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def adv_assess(reply):
+        return adv_override(
+            {
+                "ask_groq": lambda messages, temperature=0.1: reply,
+                "EVIDENCE_GATED_DIMENSIONS": {},
+            },
+            lambda: assess_weather(
+                adv_weather(), [], load_guidelines_quietly(),
+                adv_sections,
+            ),
+        )
+
+    def load_guidelines_quietly():
+        with contextlib.redirect_stdout(io.StringIO()):
+            return load_guidelines()
+
+    constructed = adv_assess(json_text(adv_response()))
+
+    check(
+        "Complete valid response reaches assessment construction",
+        constructed["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and constructed["risk_score"] == 9.0
+        and constructed["risk_band"] == "MODERATE"
+        and constructed["assessment_status"] == "INCOMPLETE"
+        and constructed["alert_recommendation"] == "MONITOR"
+        and constructed["sources"] == ["6.1 Extreme Heat"]
+        and constructed["official_warning_status"]
+        == "NOT_CHECKED",
+    )
+
+    check(
+        "Assessment construction still fails closed on bad advice",
+        "Invalid text field: advice" in adv_raises(
+            lambda: adv_assess(json_text(adv_response(advice=["a"])))
+        ),
+    )
+
+    # 6. Real retrieval and assessment path, mocked external services
+    #    (weather, history, Groq transport). Real guidelines.md,
+    #    real retrieval, real ask_groq, real validation.
+    class AdvResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content, finish="stop", usage=None):
+            self.content = content
+            self.finish = finish
+            self.usage = usage
+
+        def json(self):
+            body = {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": self.finish,
+                }]
+            }
+
+            if self.usage is not None:
+                body["usage"] = self.usage
+
+            return body
+
+    class AdvHttp:
+        def __init__(self, response):
+            self.response = response
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return self.response
+
+    incident_usage = {
+        "prompt_tokens": 3239,
+        "completion_tokens": 694,
+        "total_tokens": 3933,
+        "completion_tokens_details": {"reasoning_tokens": 301},
+    }
+
+    def adv_pipeline(content, finish="stop", usage=incident_usage):
+        transport = AdvHttp(AdvResponse(content, finish, usage))
+        printed = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()[0]
+
+        result = adv_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_adv_test_key_not_real",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: adv_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+        return result, printed.getvalue(), transport
+
+    # Sources must be section titles actually retrieved for a heat day.
+    real_sources = ["6.1 Extreme Heat", "16. Final Decision Rule"]
+
+    good_result, good_output, good_transport = adv_pipeline(
+        json_text(adv_response(sources=real_sources))
+    )
+
+    check(
+        "Real path completes a valid response and records usage",
+        "load_guidelines" in good_result["tools_used"]
+        and "search_guidelines" in good_result["tools_used"]
+        and good_result["advice"]
+        == "Limit strenuous outdoor activity at midday."
+        and good_result["assessment_status"] == "INCOMPLETE"
+        and good_result["send_alert"] is False
+        and good_result["notification_status"] == "NOT_SENT"
+        and good_result["official_warning_status"] == "NOT_CHECKED"
+        and good_result["groq_usage"]["prompt_tokens"] == 3239
+        and good_result["groq_usage"]["completion_tokens"] == 694
+        and good_result["groq_usage"]["reasoning_tokens"] == 301
+        and good_result["groq_usage"]["finish_reason"] == "stop"
+        and "gsk_adv_test_key_not_real" not in good_output
+        and len(good_transport.posts) == 1,
+    )
+
+    incident_result, incident_output, _ = adv_pipeline(
+        json_text(adv_response(
+            advice=["Limit activity", "Drink water"],
+            sources=real_sources,
+        ))
+    )
+
+    check(
+        "Incident reproduced: advice as a list fails closed with the "
+        "type named and usage kept",
+        incident_result["assessment_status"] == "INCOMPLETE"
+        and incident_result["alert_recommendation"]
+        == "UNABLE_TO_ASSESS"
+        and incident_result["risk_band"] == "UNASSESSED"
+        and incident_result["risk_score"] is None
+        and "Invalid text field: advice (expected text, received list)"
+        in incident_result["reasoning"]
+        and incident_result["send_alert"] is False
+        and incident_result["notification_status"] == "NOT_SENT"
+        and incident_result["official_warning_status"] == "NOT_CHECKED"
+        and incident_result["groq_usage"]["completion_tokens"] == 694
+        and incident_result["groq_usage"]["finish_reason"] == "stop"
+        and "gsk_adv_test_key_not_real"
+        not in json_text(incident_result) + incident_output,
+    )
+
+    missing_result, _, _ = adv_pipeline(
+        json_text({
+            key: value for key, value in adv_response().items()
+            if key != "advice"
+        })
+    )
+    truncated_result, _, _ = adv_pipeline(
+        json_text(adv_response())[:200], finish="length"
+    )
+    cut_stop_result, _, _ = adv_pipeline(
+        json_text(adv_response())[:200], finish="stop"
+    )
+
+    check(
+        "Real path fails closed on missing field, truncation and "
+        "malformed JSON",
+        "Missing assessment fields: advice" in missing_result["reasoning"]
+        and "cut off" in truncated_result["reasoning"]
+        and "invalid JSON" in cut_stop_result["reasoning"]
+        and all(
+            result["assessment_status"] == "INCOMPLETE"
+            and result["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and result["send_alert"] is False
+            for result in (
+                missing_result, truncated_result, cut_stop_result
+            )
+        ),
+    )
+
+    check(
+        "Absent reasoning-token detail is recorded as null",
+        adv_pipeline(
+            json_text(adv_response(sources=real_sources)),
+            usage={"prompt_tokens": 1, "completion_tokens": 2,
+                   "total_tokens": 3},
+        )[0]["groq_usage"]["reasoning_tokens"] is None,
+    )
+
+    # ------------------------------------------------------------
+    # Fixes A, B and C (self-contained, offline):
+    #   A. model text must not claim any official warning state
+    #      while official warnings are NOT_CHECKED;
+    #   B. the hourly next-24-hour series reaches the model (duration);
+    #   C. structured incomplete_reasons on every decision.
+    # ------------------------------------------------------------
+    def abc_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def abc_weather(hours=24, **current):
+        start = datetime(2026, 11, 8, 13, 0)
+        base_current = {
+            "time": "2026-11-08T12:00",
+            "temperature_2m": 28.3, "apparent_temperature": 32.4,
+            "relative_humidity_2m": 65, "precipitation": 0,
+            "wind_speed_10m": 12, "wind_gusts_10m": 20,
+            "visibility": 24140, "weather_code": 1, "cape": 0,
+        }
+        base_current.update(current)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": base_current,
+            "today_forecast": {
+                "high": 31, "low": 24, "wind": 15, "gust": 27,
+                "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [
+                {
+                    "time": (start + timedelta(hours=h)).strftime(
+                        "%Y-%m-%dT%H:%M"
+                    ),
+                    "temperature": 31.4, "apparent_temperature": 34.6,
+                    "humidity": 63, "precipitation": 0.0,
+                    "wind": 13.7, "gust": 27.4, "visibility": 24140.0,
+                    "weather_code": 1, "cape": 0,
+                }
+                for h in range(hours)
+            ],
+            "history_summary": {},
+        }
+
+    def abc_reply(**changes):
+        body = {
+            "hazard_type": "HEAT",
+            "likelihood_score": 2, "likelihood_reason": "lr",
+            "severity_score": 2, "severity_reason": "sr",
+            "exposure_score": None,
+            "exposure_reason": "No population exposure data supplied.",
+            "duration_score": None,
+            "duration_reason": "dr",
+            "geographic_impact_score": None,
+            "geographic_impact_reason": "Single city-wide point.",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity at midday. "
+                      "Official warning status was not checked; "
+                      "consult NCM for official warnings.",
+            "reasoning": "Apparent temperature reaches the heat "
+                         "screening value.",
+            "recommended_actions": ["Check NCM warnings before work"],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return json_text(body)
+
+    class AbcResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 3239, "completion_tokens": 600,
+                    "total_tokens": 3839,
+                },
+            }
+
+    class AbcHttp:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append({"url": url, "json": json})
+            return AbcResponse(self.content)
+
+    def abc_pipeline(content, weather=None, **extra):
+        transport = AbcHttp(content)
+        printed = io.StringIO()
+        settings = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_abc_test_key_not_real",
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: weather or abc_weather(),
+            "tool_get_history": lambda n=3: [],
+        }
+        settings.update(extra)
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()[0]
+
+        return abc_override(settings, run), printed.getvalue(), transport
+
+    def abc_codes(decision):
+        return [reason["code"] for reason in decision["incomplete_reasons"]]
+
+    # A1. Claim detection: assertions of either state are claims.
+    claims = (
+        "No official heat advisory is in effect.",
+        "There is no official heat advisory in effect for Dubai.",
+        "There are no active warnings.",
+        "No warnings have been issued for Dubai today.",
+        "No current official weather warnings.",
+        "There is no official warning at this time.",
+        "no heat advisories are in place",
+        "A heat warning is currently in effect.",
+        "The NCM advisory is active until 6 PM.",
+        "Warnings have not been issued.",
+        "NCM has not issued any warning.",
+        "Authorities have issued an emergency instruction.",
+        "The National Center of Meteorology has not issued alerts.",
+    )
+
+    for text in claims:
+        check(
+            f"Warning-state claim detected: {text}",
+            find_unverified_warning_claim(text),
+        )
+
+    neutral = (
+        "Official warning status was not checked.",
+        "Official warning status was not checked; consult NCM for "
+        "official warnings.",
+        "Check NCM warnings before outdoor work.",
+        "Consult NCM for official warnings and advisories.",
+        "Official NCM and emergency authority warnings were not "
+        "retrieved or verified by this implementation.",
+        "NOT_CHECKED. No NCM or other official warning feed is "
+        "integrated.",
+        "No immediate advisory recommendation is justified.",
+        "No current advisory recommendation is made.",
+        "Verify whether a heat advisory is in effect with NCM.",
+        "If an official warning is issued, follow it.",
+        "Heat advisories are issued by NCM.",
+        "No alert is recommended.",
+        "Previous alerts must not suppress a new hazard.",
+        "Warning criteria are defined by NCM.",
+    )
+
+    for text in neutral:
+        check(
+            f"Neutral wording is not a claim: {text}",
+            not find_unverified_warning_claim(text),
+        )
+
+    # A2. Every model text field is checked, without echoing content.
+    def abc_claim_error(field, value):
+        decision = json.loads(abc_reply())
+        decision[field] = value
+        try:
+            reject_unverified_warning_claims(decision, "NOT_CHECKED")
+            return ""
+        except UnverifiedWarningClaim as exc:
+            return str(exc)
+
+    abc_text_fields = (
+        "hazard_type", "advice", "reasoning",
+        "likelihood_reason", "severity_reason", "exposure_reason",
+        "duration_reason", "geographic_impact_reason",
+        "recommended_actions", "unexpected_notes",
+    )
+
+    for field in abc_text_fields:
+        value = (
+            ["No official heat advisory is in effect."]
+            if field == "recommended_actions"
+            else "No official heat advisory is in effect."
+        )
+        message = abc_claim_error(field, value)
+
+        expected_location = (
+            field if field in RESPONSE_FIELDS
+            else "a field outside the response schema"
+        )
+
+        check(
+            f"Warning claim rejected in field: {field}",
+            f"claim in {expected_location}" in message
+            and "heat advisory" not in message,
+        )
+
+    check(
+        "Claim check is skipped only for VERIFIED warning status",
+        reject_unverified_warning_claims(
+            {"advice": "No official heat advisory is in effect."},
+            "VERIFIED",
+        )["advice"] == "No official heat advisory is in effect.",
+    )
+
+    check(
+        "Prompt forbids the terms warning and advisory in free text",
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability "
+        "or status" in " ".join(SYSTEM_PROMPT.split()),
+    )
+
+    # A3. Real path: the incident's contradictory advice fails closed.
+    for label, recommendation in (
+        ("MONITOR", "MONITOR"),
+        ("NO_ALERT", "NO_ALERT_RECOMMENDED"),
+        ("ADVISORY", "ADVISORY_RECOMMENDED"),
+    ):
+        claimed, claimed_output, _ = abc_pipeline(abc_reply(
+            alert_recommendation=recommendation,
+            advice="No official heat advisory is in effect. "
+                   "Limit outdoor activity.",
+        ))
+
+        check(
+            f"Contradictory advice fails closed ({label})",
+            claimed["assessment_status"] == "INCOMPLETE"
+            and claimed["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and claimed["risk_band"] == "UNASSESSED"
+            and claimed["send_alert"] is False
+            and claimed["official_warning_status"] == "NOT_CHECKED"
+            and "UNVERIFIED_WARNING_CLAIM" in abc_codes(claimed)
+            and "OFFICIAL_WARNINGS_NOT_VERIFIED" in abc_codes(claimed)
+            and "heat advisory is in effect"
+            not in json_text(claimed) + claimed_output
+            and "gsk_abc_test_key_not_real" not in claimed_output,
+        )
+
+    neutral_result, _, _ = abc_pipeline(abc_reply())
+
+    check(
+        "Neutral advice passes through the real path unchanged",
+        neutral_result["advice"].startswith(
+            "Limit strenuous outdoor activity at midday."
+        )
+        and "UNVERIFIED_WARNING_CLAIM" not in abc_codes(neutral_result),
+    )
+
+    # B1. Hourly series: complete, ordered, faithful.
+    series_weather = abc_weather()
+    series_weather["hourly_forecast_next_24h"][5]["humidity"] = None
+    series_weather["hourly_forecast_next_24h"][7]["apparent_temperature"] = 40.04
+    series = hourly_series(series_weather["hourly_forecast_next_24h"])
+
+    check(
+        "Hourly series covers all 24 hours in order",
+        series["start"] == "2026-11-08T13:00"
+        and series["step_hours"] == 1
+        and all(
+            len(series[name]) == 24
+            for name, _, _ in HOURLY_SERIES_FIELDS
+        ),
+    )
+
+    check(
+        "Hourly series keeps values and nulls faithfully",
+        series["apparent_c"][7] == 40.0
+        and series["temp_c"][0] == 31.4
+        and series["humidity_pct"][5] is None
+        and series["humidity_pct"][0] == 63
+        and series["visibility_m"][0] == 24140
+        and series["wind_kmh"][0] == 13.7
+        and series["gust_kmh"][0] == 27.4
+        and series["weather_code"][0] == 1,
+    )
+
+    gapped = abc_weather()
+    del gapped["hourly_forecast_next_24h"][3]
+    gap_series = hourly_series(gapped["hourly_forecast_next_24h"])
+
+    check(
+        "Non-consecutive hours list every timestamp",
+        "start" not in gap_series
+        and gap_series["times"]
+        == [r["time"] for r in gapped["hourly_forecast_next_24h"]]
+        and len(gap_series["temp_c"]) == 23,
+    )
+
+    empty_summary = summarize_weather(abc_weather(hours=0))
+
+    check(
+        "No hourly data gives no series",
+        hourly_series([]) is None
+        and "next_24_hours_hourly" in empty_summary
+        and empty_summary["next_24_hours_hourly"] is None,
+    )
+
+    sent_request, _, sent_transport = abc_pipeline(abc_reply())
+    sent_text = json_text(
+        sent_transport.posts[0]["json"]["messages"]
+    ) if sent_transport.posts else ""
+
+    check(
+        "Model request carries the hourly series",
+        "next_24_hours_hourly" in sent_text
+        and "step_hours" in sent_text
+        and "apparent_c" in sent_text,
+    )
+
+    # B2. Realistic 24-hour requests against the unchanged budgets.
+    def abc_request_size(hazards):
+        weather = abc_weather()
+        with contextlib.redirect_stdout(io.StringIO()):
+            policy = load_guidelines()
+            required = select_hazard_guidance(policy, hazards)
+            required += select_conditional_sections(
+                policy, hazards, weather
+            )
+            sections = search_guidelines(
+                policy, "x", k=0, required_sections=required
+            )
+
+        captured = []
+
+        def capture(messages, temperature=0.1):
+            captured.append(messages)
+            raise RuntimeError("captured")
+
+        def assemble():
+            try:
+                assess_weather(weather, [
+                    {"timestamp": "t" * 60, "city": "c" * 60,
+                     "advice": "a" * 500, "alert_sent": False,
+                     "alert_message": "m" * 500},
+                ] * MAX_HISTORY_RECORDS, policy, sections)
+            except RuntimeError:
+                pass
+
+        abc_override({"ask_groq": capture}, assemble)
+        text = serialized_request(captured[0])
+
+        return len(text), estimate_tokens(text) + MAX_COMPLETION_TOKENS
+
+    def abc_fits(hazards):
+        chars, tokens = abc_request_size(hazards)
+        return (
+            chars <= MAX_REQUEST_CHARS
+            and tokens <= MAX_ESTIMATED_REQUEST_TOKENS
+        )
+
+    check(
+        "24-hour series: no-hazard request fits every budget",
+        abc_fits({}),
+    )
+
+    for code in HAZARD_POLICY_TITLES:
+        check(
+            f"24-hour series: single hazard fits every budget: {code}",
+            abc_fits({code: ["t"]}),
+        )
+
+    # With the 1,000-token completion allowance, heat + wind with
+    # worst-case history exceeds the 8,000-token estimate (fails closed).
+    check(
+        "24-hour series: heat with wind is blocked at the 1,000-token "
+        "completion allowance",
+        not abc_fits({"HEAT": ["t"], "WIND_DUST": ["t"]}),
+    )
+
+    check(
+        "24-hour series: five simultaneous hazards exceed the budget "
+        "(fails closed, documented trade-off)",
+        not abc_fits({code: ["t"] for code in HAZARD_POLICY_TITLES}),
+    )
+
+    # C. Structured incomplete reasons.
+    check(
+        "Incident shape records warnings and unassessed dimensions",
+        abc_codes(neutral_result)[:2] == [
+            "RISK_DIMENSIONS_UNASSESSED",
+            "OFFICIAL_WARNINGS_NOT_VERIFIED",
+        ]
+        and next(
+            r["detail"] for r in neutral_result["incomplete_reasons"]
+            if r["code"] == "RISK_DIMENSIONS_UNASSESSED"
+        ) == "exposure_score, duration_score, geographic_impact_score",
+    )
+
+    # No heat here, so the request fits the budgets and reaches
+    # validation, where the evidence-gap reason is recorded.
+    uncertain_weather = abc_weather(
+        visibility=None, temperature_2m=22, apparent_temperature=22
+    )
+    uncertain_weather["today_forecast"]["high"] = 24
+    for record in uncertain_weather["hourly_forecast_next_24h"]:
+        record["visibility"] = None
+        record["temperature"] = 22
+        record["apparent_temperature"] = 22
+
+    uncertain_result, _, _ = abc_pipeline(
+        abc_reply(sources=["9. Official Warning Override"]),
+        weather=uncertain_weather,
+    )
+
+    check(
+        "Evidence gaps are recorded as WEATHER_EVIDENCE_UNCERTAIN",
+        "WEATHER_EVIDENCE_UNCERTAIN" in abc_codes(uncertain_result)
+        and "WIND_DUST" in next(
+            r["detail"] for r in uncertain_result["incomplete_reasons"]
+            if r["code"] == "WEATHER_EVIDENCE_UNCERTAIN"
+        ),
+    )
+
+    def missing_policy():
+        raise FileNotFoundError("guidelines.md not found")
+
+    no_policy, _, _ = abc_pipeline(
+        abc_reply(), load_guidelines=missing_policy
+    )
+    budget_failure, _, _ = abc_pipeline(abc_reply(), MAX_POLICY_CHARS=5000)
+
+    check(
+        "Failures record POLICY_UNAVAILABLE or ASSESSMENT_ERROR",
+        abc_codes(no_policy) == [
+            "POLICY_UNAVAILABLE", "OFFICIAL_WARNINGS_NOT_VERIFIED",
+        ]
+        and abc_codes(budget_failure) == [
+            "ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED",
+        ]
+        and next(
+            r["detail"] for r in budget_failure["incomplete_reasons"]
+            if r["code"] == "ASSESSMENT_ERROR"
+        ) == "ValueError",
+    )
+
+    duplicate = {}
+    add_incomplete_reason(duplicate, "X", "first")
+    add_incomplete_reason(duplicate, "X", "second")
+
+    check(
+        "Each incomplete reason code is recorded once",
+        duplicate["incomplete_reasons"] == [
+            {"code": "X", "detail": "first"}
+        ],
+    )
+
+    check(
+        "No decision is COMPLETE while warnings are unverified",
+        all(
+            decision["assessment_status"] == "INCOMPLETE"
+            and "OFFICIAL_WARNINGS_NOT_VERIFIED" in abc_codes(decision)
+            for decision in (
+                neutral_result, uncertain_result, no_policy,
+                budget_failure, sent_request,
+            )
+        ),
+    )
+
+    # Dry run prints the reasons and still makes no POST.
+    class AbcNoPost:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, *args, **kwargs):
+            self.posts.append(args)
+
+    no_post = AbcNoPost()
+    dry_output = io.StringIO()
+
+    def abc_dry_run():
+        with contextlib.redirect_stdout(dry_output):
+            run_agent_job(dry=True)
+
+    abc_override(
+        {
+            "HTTP": no_post,
+            "run_weather_agent": lambda: (neutral_result, []),
+        },
+        abc_dry_run,
+    )
+
+    check(
+        "Dry run prints incomplete reasons and makes no POST",
+        "INCOMPLETE REASON: OFFICIAL_WARNINGS_NOT_VERIFIED"
+        in dry_output.getvalue()
+        and "INCOMPLETE REASON: RISK_DIMENSIONS_UNASSESSED"
+        in dry_output.getvalue()
+        and no_post.posts == [],
+    )
+
+    # ------------------------------------------------------------
+    # Fix B compaction, request guards and A/C bypass hardening
+    # (self-contained, offline, realistic varying 24-hour data).
+    # ------------------------------------------------------------
+    def rv_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def rv_weather(**today):
+        start = datetime(2026, 11, 8, 13, 0)
+        hours = []
+
+        for h in range(24):
+            phase = math.cos((h + 1) / 24 * 2 * math.pi)
+            hours.append({
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": round(31.0 + 4.3 * phase, 1),
+                "apparent_temperature": round(33.6 + 5.1 * phase, 1),
+                "humidity": int(58 - 17 * phase),
+                "precipitation": [0.0, 0.0, 0.2, 1.4, 0.6, 0.0][h % 6],
+                "wind": round(14.6 + 7.9 * phase, 1),
+                "gust": round(28.3 + 13.4 * phase, 1),
+                "visibility": [24140.0, 22300.0, 18760.0, 24140.0][h % 4],
+                "weather_code": [1, 2, 61, 63, 2, 95][h % 6],
+                "cape": [0, 120, 840, 1460, 300, 0][h % 6],
+            })
+
+        forecast = {"high": 31.4, "low": 24.1, "wind": 15.8,
+                    "gust": 27.4, "precipitation": 0.0}
+        forecast.update(today)
+
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "interval": 900,
+                "temperature_2m": 28.3, "relative_humidity_2m": 65,
+                "apparent_temperature": 32.4, "precipitation": 0.0,
+                "wind_speed_10m": 12.2, "wind_gusts_10m": 20.5,
+                "visibility": 24140.0, "weather_code": 1, "cape": 0.0,
+            },
+            "today_forecast": forecast,
+            "previous_days": [
+                {"date": f"2026-11-0{d}", "high": 31.2, "low": 23.8,
+                 "wind": 18.4, "gust": 33.1, "precipitation": 0.0}
+                for d in (5, 6, 7)
+            ],
+            "hourly_forecast_next_24h": hours,
+            "history_summary": {"average_high": 31.1,
+                                "average_low": 23.9, "peak_wind": 21.6},
+        }
+
+    def rv_heat_wind_weather():
+        weather = rv_weather()
+
+        for record in weather["hourly_forecast_next_24h"]:
+            record["precipitation"] = 0.0
+            record["weather_code"] = 1
+
+        return weather
+
+    def rv_heat_only_weather():
+        weather = rv_heat_wind_weather()
+
+        for record in weather["hourly_forecast_next_24h"]:
+            record["wind"] = 12.0
+            record["gust"] = 25.0
+
+        return weather
+
+    rv_history = [{
+        "timestamp": "t" * 60, "city": "c" * 60, "advice": "a" * 500,
+        "alert_sent": False, "alert_message": "m" * 500,
+    }] * MAX_HISTORY_RECORDS
+
+    # B. Series keeps exact source values, order and nulls.
+    rv_source = rv_weather()["hourly_forecast_next_24h"]
+    rv_series = hourly_series(rv_source)
+
+    check(
+        "Series keeps every source value exactly",
+        all(
+            rv_series[name][index]
+            == (int(record[key]) if digits == 0 else record[key])
+            for name, key, digits in HOURLY_SERIES_FIELDS
+            for index, record in enumerate(rv_source)
+        ),
+    )
+
+    check(
+        "Series keeps hourly order and timestamps",
+        rv_series["start"] == rv_source[0]["time"]
+        and rv_series["step_hours"] == 1
+        and all(
+            len(rv_series[name]) == len(rv_source)
+            for name, _, _ in HOURLY_SERIES_FIELDS
+        ),
+    )
+
+    rv_summary = summarize_weather(rv_weather())
+
+    check(
+        "Duplicate min/max summary removed; CAPE (not in series) kept",
+        rv_summary["next_24_hours"]
+        == {"cape_max": max(r["cape"] for r in rv_source)}
+        and "next_24_hours_hourly" in rv_summary,
+    )
+
+    # Hazard-relevant column filtering is intentionally not applied:
+    # screening values are not policy thresholds, so every column stays.
+    check(
+        "Every series column is sent regardless of detected hazards",
+        set(rv_summary["next_24_hours_hourly"])
+        == {"start", "step_hours"}
+        | {name for name, _, _ in HOURLY_SERIES_FIELDS},
+    )
+
+    # Realistic request sizes under the unchanged budgets.
+    def rv_request(hazards, weather):
+        with contextlib.redirect_stdout(io.StringIO()):
+            policy = load_guidelines()
+            required = select_hazard_guidance(policy, hazards)
+            required += select_conditional_sections(
+                policy, hazards, weather
+            )
+            sections = search_guidelines(
+                policy, "x", k=0, required_sections=required
+            )
+
+        captured = []
+
+        def capture(messages, temperature=0.1):
+            captured.append(messages)
+            raise RuntimeError("captured")
+
+        def assemble():
+            try:
+                assess_weather(weather, rv_history, policy, sections)
+            except RuntimeError:
+                pass
+
+        rv_override({"ask_groq": capture}, assemble)
+        text = serialized_request(captured[0])
+
+        return (
+            len(text) <= MAX_REQUEST_CHARS
+            and estimate_tokens(text) + MAX_COMPLETION_TOKENS
+            <= MAX_ESTIMATED_REQUEST_TOKENS
+        )
+
+    rv_four = ("HEAT", "WIND_DUST", "RAIN_FLOOD", "LIGHTNING")
+
+    for label, hazards, expected in (
+        ("no hazard", (), True),
+        ("heat", ("HEAT",), False),
+        ("heat + wind", ("HEAT", "WIND_DUST"), False),
+        ("heat + wind + rain", ("HEAT", "WIND_DUST", "RAIN_FLOOD"), False),
+        ("four hazards", rv_four, False),
+        ("five hazards", tuple(HAZARD_POLICY_TITLES), False),
+    ):
+        check(
+            f"Realistic request {'fits' if expected else 'is blocked'}: "
+            f"{label}",
+            rv_request({code: ["t"] for code in hazards}, rv_weather())
+            is expected,
+        )
+
+    # Request guards, each verified on its own (offline transport).
+    class RvResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class RvTransport:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return RvResponse()
+
+    rv_overhead = len(serialized_request([{"role": "user", "content": ""}]))
+
+    def rv_message(serialized_length):
+        return [{
+            "role": "user",
+            "content": "x" * (serialized_length - rv_overhead),
+        }]
+
+    def rv_send(serialized_length, **limits):
+        transport = RvTransport()
+        settings = {"GROQ_API_KEY": "gsk_rv_test_key", "HTTP": transport}
+        settings.update(limits)
+        outcome = {"error": ""}
+
+        def run():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ask_groq(rv_message(serialized_length))
+            except (ValueError, RuntimeError) as exc:
+                outcome["error"] = str(exc)
+
+        rv_override(settings, run)
+
+        return outcome["error"], transport.posts
+
+    # Character guard alone (token cap lifted).
+    error, posts = rv_send(
+        MAX_REQUEST_CHARS, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9
+    )
+
+    check(
+        "Character guard: request at the limit is sent (control)",
+        error == "" and len(posts) == 1,
+    )
+
+    error, posts = rv_send(
+        MAX_REQUEST_CHARS + 1, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9
+    )
+
+    check(
+        "Character guard alone blocks one character over, no POST",
+        "character limit" in error and posts == [],
+    )
+
+    # Token guard alone (character limit lifted).
+    rv_at_cap = int(
+        (MAX_ESTIMATED_REQUEST_TOKENS - MAX_COMPLETION_TOKENS) * 2.5
+    )
+
+    error, posts = rv_send(rv_at_cap, MAX_REQUEST_CHARS=10 ** 9)
+
+    check(
+        "Token guard: request at the cap is sent (control)",
+        error == "" and len(posts) == 1
+        and estimate_tokens(serialized_request(rv_message(rv_at_cap)))
+        + MAX_COMPLETION_TOKENS == MAX_ESTIMATED_REQUEST_TOKENS,
+    )
+
+    error, posts = rv_send(rv_at_cap + 2, MAX_REQUEST_CHARS=10 ** 9)
+
+    check(
+        "Token guard alone blocks one token over, no POST",
+        "token budget" in error and posts == [],
+    )
+
+    # Under the real limits the token guard trips below the char limit.
+    error, posts = rv_send(rv_at_cap + 2)
+
+    check(
+        "Token guard blocks under real limits before the char limit",
+        rv_at_cap + 2 < MAX_REQUEST_CHARS
+        and "token budget" in error and posts == [],
+    )
+
+    # Pipeline: blocked scenarios never reach Groq; a fitting one does.
+    rv_reply = json_text({
+        "hazard_type": "HEAT",
+        "likelihood_score": 2, "likelihood_reason": "lr",
+        "severity_score": 2, "severity_reason": "sr",
+        "exposure_score": None, "exposure_reason": "er",
+        "duration_score": None, "duration_reason": "dr",
+        "geographic_impact_score": None,
+        "geographic_impact_reason": "gr",
+        "alert_recommendation": "MONITOR",
+        "advice": "Limit outdoor activity. Official warning status "
+                  "was not checked.",
+        "reasoning": "r", "recommended_actions": [],
+        "sources": ["6.1 Extreme Heat"],
+    })
+
+    class RvGroq:
+        def __init__(self, content=rv_reply):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            response = RvResponse()
+            content = self.content
+            response.json = lambda: {
+                "choices": [{
+                    "message": {"content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3239, "completion_tokens": 600,
+                          "total_tokens": 3839},
+            }
+            return response
+
+    def rv_pipeline(weather, content=rv_reply, history=None):
+        transport = RvGroq(content)
+        history = rv_history if history is None else history
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                return run_weather_agent()[0]
+
+        decision = rv_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_rv_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: weather,
+                "tool_get_history": lambda n=3: history,
+            },
+            run,
+        )
+
+        return decision, transport
+
+    four_decision, four_transport = rv_pipeline(rv_weather())
+    five_decision, five_transport = rv_pipeline(rv_weather(low=8.0))
+    heat_wind_decision, heat_wind_transport = rv_pipeline(
+        rv_heat_wind_weather()
+    )
+    heat_worst_decision, heat_worst_transport = rv_pipeline(
+        rv_heat_only_weather()
+    )
+    fit_decision, fit_transport = rv_pipeline(
+        rv_heat_only_weather(), history=[]
+    )
+
+    check(
+        "Four-hazard request is rejected before Groq (INCOMPLETE)",
+        set(four_decision["hazard_screening"]) == set(rv_four)
+        and four_transport.posts == []
+        and four_decision["assessment_status"] == "INCOMPLETE"
+        and four_decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and (
+            "token budget" in four_decision["reasoning"]
+            or "character limit" in four_decision["reasoning"]
+        )
+        and [r["code"] for r in four_decision["incomplete_reasons"]]
+        == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
+    )
+
+    check(
+        "Five-hazard request is rejected before Groq (INCOMPLETE)",
+        set(five_decision["hazard_screening"])
+        == set(HAZARD_POLICY_TITLES)
+        and five_transport.posts == []
+        and five_decision["assessment_status"] == "INCOMPLETE"
+        and five_decision["send_alert"] is False,
+    )
+
+    check(
+        "Heat + wind with worst-case history is rejected before Groq "
+        "once the schema is counted",
+        set(heat_wind_decision["hazard_screening"])
+        == {"HEAT", "WIND_DUST"}
+        and heat_wind_transport.posts == []
+        and heat_wind_decision["assessment_status"] == "INCOMPLETE"
+        and heat_wind_decision["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Heat-only with worst-case history is rejected before Groq at "
+        "the 1,000-token completion allowance",
+        set(heat_worst_decision["hazard_screening"]) == {"HEAT"}
+        and heat_worst_transport.posts == []
+        and "token budget" in heat_worst_decision["reasoning"]
+        and heat_worst_decision["assessment_status"] == "INCOMPLETE"
+        and heat_worst_decision["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Heat-only request without history reaches Groq once and is "
+        "assessed",
+        set(fit_decision["hazard_screening"]) == {"HEAT"}
+        and len(fit_transport.posts) == 1
+        and fit_decision["groq_usage"]["prompt_tokens"] == 3239
+        and fit_decision["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED"
+        in [r["code"] for r in fit_decision["incomplete_reasons"]],
+    )
+
+    # A. Bypass hardening.
+    def rv_reply_with(**extra):
+        body = json.loads(rv_reply)
+        body.update(extra)
+        return json_text(body)
+
+    spoofed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
+        official_warning_status="VERIFIED",
+        advice="No official heat advisory is in effect.",
+    ), history=[])
+    injected, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
+        incomplete_reasons=[{"code": "NONE", "detail": "all clear"}],
+    ), history=[])
+    hidden, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(
+        notes={"extra": ["Fine.", "There are no warnings for Dubai."]},
+    ), history=[])
+
+    check(
+        "Model cannot set the warning status to skip the claim check",
+        "program-owned fields: official_warning_status"
+        in spoofed["reasoning"]
+        and spoofed["official_warning_status"] == "NOT_CHECKED"
+        and spoofed["alert_recommendation"] == "UNABLE_TO_ASSESS",
+    )
+
+    check(
+        "Model cannot inject incomplete reasons",
+        "program-owned fields: incomplete_reasons" in injected["reasoning"]
+        and all(
+            r["code"] != "NONE" for r in injected["incomplete_reasons"]
+        ),
+    )
+
+    check(
+        "Claims in unexpected or nested model fields are rejected",
+        [r["code"] for r in hidden["incomplete_reasons"]][0]
+        == "UNVERIFIED_WARNING_CLAIM"
+        and "claim in a field outside the response schema"
+        in hidden["reasoning"]
+        and "notes" not in hidden["reasoning"]
+        and "no warnings for Dubai" not in json_text(hidden),
+    )
+
+    def rv_direct_claim_error(decision):
+        try:
+            reject_unverified_warning_claims(decision, "NOT_CHECKED")
+            return ""
+        except UnverifiedWarningClaim as exc:
+            return str(exc)
+
+    check(
+        "Claim check ignores a model-supplied VERIFIED status",
+        "claim in advice" in rv_direct_claim_error({
+            "official_warning_status": "VERIFIED",
+            "advice": "No official heat advisory is in effect.",
+        }),
+    )
+
+    check(
+        "Claim in a top-level key name is rejected without echoing it",
+        "claim in a field outside the response schema"
+        in rv_direct_claim_error({
+            "advice": "Limit outdoor activity.",
+            "No official heat advisory is in effect": True,
+        })
+        and "heat advisory" not in rv_direct_claim_error({
+            "No official heat advisory is in effect": True,
+        }),
+    )
+
+    check(
+        "Claim in a nested key name is rejected",
+        "claim in a field outside the response schema"
+        in rv_direct_claim_error({
+            "notes": {"There are no warnings": ["ok"]},
+        }),
+    )
+
+    check(
+        "Schema field names are still named in claim errors",
+        "claim in advice" in rv_direct_claim_error({
+            "advice": "No official heat advisory is in effect.",
+        })
+        and "claim in recommended_actions" in rv_direct_claim_error({
+            "recommended_actions": ["There are no warnings."],
+        }),
+    )
+
+    keyed, _ = rv_pipeline(rv_heat_only_weather(), rv_reply_with(**{
+        "NCM has not issued any warning": True,
+    }), history=[])
+
+    check(
+        "Real path: key-name claim fails closed without echoing it",
+        [r["code"] for r in keyed["incomplete_reasons"]][0]
+        == "UNVERIFIED_WARNING_CLAIM"
+        and keyed["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and keyed["send_alert"] is False
+        and "NCM has not issued" not in json_text(keyed),
+    )
+
+    check(
+        "Response schema constant matches the sent schema and validator",
+        len(RESPONSE_FIELDS) == 16
+        and len(set(RESPONSE_FIELDS)) == 16
+        and list(build_response_schema()["properties"])
+        == list(RESPONSE_FIELDS)
+        and RESPONSE_FORMAT["json_schema"]["schema"]
+        == build_response_schema(),
+    )
+
+    for text in (
+        "The heat advisory isn't in effect.",
+        "Warnings aren't active today.",
+        "NCM hasn't issued any warning.",
+        "There's no advisory for Dubai.",
+        "There are no warnings.",
+        "No official heat ad​visory is in ef​fect.",
+        "No official warning is in effect.",
+    ):
+        check(
+            f"Claim variant detected: {text!r}",
+            find_unverified_warning_claim(text),
+        )
+
+    rv_known_codes = {
+        "OFFICIAL_WARNINGS_NOT_VERIFIED", "RISK_DIMENSIONS_UNASSESSED",
+        "WEATHER_EVIDENCE_UNCERTAIN", "UNVERIFIED_WARNING_CLAIM",
+        "POLICY_UNAVAILABLE", "ASSESSMENT_ERROR",
+    }
+
+    check(
+        "Every recorded reason code is program-defined",
+        all(
+            reason["code"] in rv_known_codes
+            for decision in (
+                four_decision, five_decision, fit_decision, spoofed,
+                injected, hidden,
+            )
+            for reason in decision["incomplete_reasons"]
+        ),
+    )
+
+    check(
+        "Every rejected or blocked assessment stays fail-closed",
+        all(
+            decision["assessment_status"] == "INCOMPLETE"
+            and decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and decision["risk_band"] == "UNASSESSED"
+            and decision["send_alert"] is False
+            and decision["notification_status"] == "NOT_SENT"
+            for decision in (
+                four_decision, five_decision, spoofed, injected, hidden,
+            )
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # Strict structured outputs and schema-failure diagnostics
+    # (self-contained, offline).
+    # ------------------------------------------------------------
+    def ss_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def ss_copy(value):
+        return json.loads(json_text(value))
+
+    ss_format = RESPONSE_FORMAT
+    ss_schema = ss_format["json_schema"]["schema"]
+
+    check(
+        "Response format is strict json_schema with a name",
+        ss_format["type"] == "json_schema"
+        and ss_format["json_schema"]["strict"] is True
+        and ss_format["json_schema"]["name"] == RESPONSE_SCHEMA_NAME
+        and set(ss_format["json_schema"]) == {"name", "strict", "schema"},
+    )
+
+    check(
+        "Schema requires exactly the 18 RESPONSE_FIELDS, in order",
+        ss_schema["type"] == "object"
+        and list(ss_schema["properties"]) == list(RESPONSE_FIELDS)
+        and ss_schema["required"] == list(RESPONSE_FIELDS)
+        and ss_schema["additionalProperties"] is False,
+    )
+
+    check(
+        "Scores are nullable integers (documented union with null)",
+        len(SCORE_FIELDS) == 5
+        and all(
+            ss_schema["properties"][field] == {"type": ["integer", "null"]}
+            for field in SCORE_FIELDS
+        ),
+    )
+
+    check(
+        "alert_recommendation is limited to the permitted values",
+        ss_schema["properties"]["alert_recommendation"] == {
+            "type": "string", "enum": sorted(VALID_RECOMMENDATIONS),
+        },
+    )
+
+    check(
+        "List fields are arrays of strings; all others are strings",
+        all(
+            ss_schema["properties"][field]
+            == {"type": "array", "items": {"type": "string"}}
+            for field in LIST_FIELDS
+        )
+        and all(
+            ss_schema["properties"][field] == {"type": "string"}
+            for field in RESPONSE_FIELDS
+            if field not in SCORE_FIELDS
+            and field not in LIST_FIELDS
+            and field != "alert_recommendation"
+        ),
+    )
+
+    def ss_keywords(node):
+        found = set()
+
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key != "properties":
+                    found.add(key)
+                    found |= ss_keywords(value)
+                else:
+                    for item in value.values():
+                        found |= ss_keywords(item)
+        elif isinstance(node, list):
+            for item in node:
+                found |= ss_keywords(item)
+
+        return found
+
+    check(
+        "Schema uses only documented strict-mode keywords",
+        ss_keywords(ss_schema) <= {
+            "type", "properties", "required", "additionalProperties",
+            "items", "enum",
+        },
+    )
+
+    # Schema types and the validator's type checks agree, field by field.
+    ss_samples = {
+        "string": "x", "integer": 3, "null": None, "array": ["x"],
+        "object": {"x": "y"},
+    }
+
+    def ss_declared(field):
+        declared = ss_schema["properties"][field]["type"]
+        return declared if isinstance(declared, list) else [declared]
+
+    check(
+        "Every field accepts its schema type and rejects the others",
+        all(
+            schema_value_matches(
+                field,
+                sorted(VALID_RECOMMENDATIONS)[0]
+                if field == "alert_recommendation" and kind == "string"
+                else ss_samples[kind],
+            )
+            == (kind in ss_declared(field))
+            for field in RESPONSE_FIELDS
+            for kind in ss_samples
+        ),
+    )
+
+    # The removed type paragraph is fully covered by the schema; every
+    # semantic instruction remains in the prompt.
+    ss_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Prompt no longer duplicates the schema type paragraph",
+        "Return exactly these 18 keys" not in ss_prompt
+        and "Plain-text strings" not in ss_prompt
+        and "Arrays of strings" not in ss_prompt,
+    )
+
+    for phrase in (
+        "Follow the supplied policy sections",
+        "Never invent weather measurements, official warnings, "
+        "regulatory requirements, thresholds or geographic information",
+        "Assess only the supplied city and evidence",
+        "Identify hazards from actual measurements and forecasts",
+        "using the scale definitions in the supplied policy",
+        "separate evidence-based rationale for each",
+        "Never treat missing evidence as a low score",
+        "Official warning status is NOT_CHECKED",
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability "
+        "or status",
+        "Open-Meteo is not an official UAE warning authority",
+        "Distinguish current observations, forecasts and historical "
+        "context",
+        "Do not assume all residents or workers have equal exposure",
+        "Previous alerts must not suppress a new or different hazard",
+        "Do not recommend an alert solely because a value is unusual",
+        "Use only recommendation values defined in the supplied policy",
+        "The assessment is never a completed safety clearance",
+        "In sources, cite exact policy section titles",
+        "Return a single JSON object only",
+        "Each score must be an integer from 1 to 5 when evidence "
+        "supports it",
+        "return null for that score, never a guessed value, and explain "
+        "why in its rationale",
+    ):
+        check(
+            f"Prompt keeps instruction: {phrase[:60]}",
+            phrase in ss_prompt,
+        )
+
+    # Independent reference checker for the documented subset.
+    def ss_type_ok(value, type_name):
+        return {
+            "string": isinstance(value, str),
+            "integer": type(value) is int,
+            "null": value is None,
+            "array": isinstance(value, list),
+            "object": isinstance(value, dict),
+        }[type_name]
+
+    def ss_conforms(value, schema):
+        types = schema.get("type")
+        types = types if isinstance(types, list) else [types]
+
+        if not any(ss_type_ok(value, t) for t in types):
+            return False
+
+        if "enum" in schema and value not in schema["enum"]:
+            return False
+
+        if isinstance(value, list) and "items" in schema:
+            return all(ss_conforms(item, schema["items"]) for item in value)
+
+        if isinstance(value, dict) and "properties" in schema:
+            if schema.get("additionalProperties") is False and (
+                set(value) - set(schema["properties"])
+            ):
+                return False
+
+            if any(field not in value for field in schema["required"]):
+                return False
+
+            return all(
+                ss_conforms(value[field], schema["properties"][field])
+                for field in schema["properties"]
+                if field in value
+            )
+
+        return True
+
+    def ss_response(**changes):
+        body = {
+            "hazard_type": "NONE",
+            "likelihood_score": 1, "likelihood_reason": "lr",
+            "severity_score": 1, "severity_reason": "sr",
+            "exposure_score": None, "exposure_reason": "er",
+            "duration_score": None, "duration_reason": "dr",
+            "geographic_impact_score": None,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "UNABLE_TO_ASSESS",
+            "advice": "Official warning status was not checked.",
+            "reasoning": "Three dimensions lack evidence.",
+            "recommended_actions": [],
+            "sources": ["16. Final Decision Rule"],
+        }
+        body.update(changes)
+        return body
+
+    ss_sections = [{"section": "16. Final Decision Rule", "text": "x"}]
+
+    def ss_validation_error(body):
+        try:
+            validate_decision(ss_copy(body), ss_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    ss_complete = ss_response()
+
+    check(
+        "Complete fixture conforms to the schema and validates",
+        ss_conforms(ss_complete, ss_schema)
+        and ss_validation_error(ss_complete) == ""
+        and response_shape_diagnostics(ss_complete)["missing_required"]
+        == []
+        and response_shape_diagnostics(ss_complete)["wrong_type_fields"]
+        == [],
+    )
+
+    for field in RESPONSE_FIELDS:
+        omitted = ss_response()
+        del omitted[field]
+        diagnostics = response_shape_diagnostics(omitted)
+
+        check(
+            f"Omitted field is non-conforming, rejected and diagnosed: "
+            f"{field}",
+            not ss_conforms(omitted, ss_schema)
+            and ss_validation_error(omitted)
+            == "Missing assessment fields: " + field
+            and diagnostics["missing_required"] == [field]
+            and diagnostics["missing_required_count"] == 1
+            and diagnostics["unexpected_key_count"] == 0,
+        )
+
+    for label, field, value in (
+        ("advice as array", "advice", ["a"]),
+        ("reasoning as object", "reasoning", {"text": "x"}),
+        ("score as string", "severity_score", "3"),
+        ("score as float", "likelihood_score", 2.5),
+        ("score as boolean", "exposure_score", True),
+        ("recommendation outside enum", "alert_recommendation", "ALERT"),
+        ("list as string", "recommended_actions", "none"),
+        ("list with a number", "sources", [1]),
+    ):
+        body = ss_response(**{field: value})
+        wrong = response_shape_diagnostics(body)["wrong_type_fields"]
+
+        check(
+            f"Wrong type is non-conforming, rejected and diagnosed: "
+            f"{label}",
+            not ss_conforms(body, ss_schema)
+            and ss_validation_error(body) != ""
+            and [item["field"] for item in wrong] == [field],
+        )
+
+    extra = ss_response(notes="x")
+    nested = ss_response(notes={"reasoning": "x"})
+
+    check(
+        "Extra and nested keys are non-conforming",
+        not ss_conforms(extra, ss_schema)
+        and not ss_conforms(nested, ss_schema),
+    )
+
+    check(
+        "Null scores conform and are treated as unassessed",
+        ss_conforms(ss_complete, ss_schema)
+        and validate_decision(ss_copy(ss_complete), ss_sections)[
+            "risk_band"
+        ] == "UNASSESSED",
+    )
+
+    out_of_range = ss_response(likelihood_score=7)
+
+    check(
+        "Schema-conforming out-of-range score is still rejected locally",
+        ss_conforms(out_of_range, ss_schema)
+        and "Invalid risk dimension value" in ss_validation_error(
+            out_of_range
+        ),
+    )
+
+    # Diagnostics distinguish omission, renaming and nesting, and never
+    # contain model-chosen key names or values.
+    def ss_without_reasoning(**extra):
+        body = ss_response(**extra)
+        del body["reasoning"]
+        return body
+
+    ss_cases = {
+        "omitted": ss_without_reasoning(),
+        "case": ss_without_reasoning(Reasoning="SECRET-VALUE-1"),
+        "prefix": ss_without_reasoning(
+            assessment_reasoning="SECRET-VALUE-2"
+        ),
+        "nested": ss_without_reasoning(
+            summary_block={"reasoning": "SECRET-VALUE-3"}
+        ),
+    }
+    ss_diag = {
+        name: response_shape_diagnostics(body)
+        for name, body in ss_cases.items()
+    }
+
+    def ss_flags(name):
+        return ss_diag[name]["missing_field_variants"]["reasoning"]
+
+    check(
+        "Diagnostics: plain omission shows no variant",
+        ss_diag["omitted"]["missing_required"] == ["reasoning"]
+        and ss_diag["omitted"]["unexpected_key_count"] == 0
+        and not any(ss_flags("omitted").values()),
+    )
+
+    check(
+        "Diagnostics: case variant detected",
+        ss_flags("case")["case_or_separator_variant"]
+        and not ss_flags("case")["found_nested"]
+        and ss_diag["case"]["unexpected_value_types"] == {"string": 1},
+    )
+
+    check(
+        "Diagnostics: prefix variant detected",
+        ss_flags("prefix")["prefix_or_suffix_variant"]
+        and not ss_flags("prefix")["case_or_separator_variant"],
+    )
+
+    check(
+        "Diagnostics: nested key detected",
+        ss_flags("nested")["found_nested"]
+        and ss_diag["nested"]["unexpected_value_types"] == {"object": 1},
+    )
+
+    ss_diag_text = json_text(ss_diag)
+
+    check(
+        "Diagnostics never contain model key names or values",
+        not any(
+            marker in ss_diag_text
+            for marker in (
+                "SECRET-VALUE", "Reasoning", "assessment_reasoning",
+                "summary_block",
+            )
+        ),
+    )
+
+    check(
+        "Diagnostics name program-owned keys and non-object responses",
+        response_shape_diagnostics(
+            ss_response(official_warning_status="VERIFIED")
+        )["program_owned_keys"] == ["official_warning_status"]
+        and response_shape_diagnostics([1, 2])
+        == {"response_type": "array"},
+    )
+
+    check(
+        "response_diagnostics is a program-owned field",
+        "response_diagnostics" in PROGRAM_OWNED_FIELDS,
+    )
+
+    # Payload and guards: the schema is sent and counted.
+    class SsResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3898, "completion_tokens": 606,
+                          "total_tokens": 4504,
+                          "completion_tokens_details": {
+                              "reasoning_tokens": 105}},
+            }
+
+    class SsTransport:
+        def __init__(self, content="{}"):
+            self.content = content
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return SsResponse(self.content)
+
+    def ss_send(messages, **limits):
+        transport = SsTransport()
+        settings = {"GROQ_API_KEY": "gsk_ss_test_key", "HTTP": transport}
+        settings.update(limits)
+        outcome = {"error": ""}
+
+        def run():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ask_groq(messages)
+            except (ValueError, RuntimeError) as exc:
+                outcome["error"] = str(exc)
+
+        ss_override(settings, run)
+
+        return outcome["error"], transport.payloads
+
+    _, ss_payloads = ss_send([{"role": "user", "content": "hi"}])
+
+    check(
+        "Payload sends the strict response format, not json_object",
+        len(ss_payloads) == 1
+        and ss_payloads[0]["response_format"] == RESPONSE_FORMAT
+        and "json_object" not in json_text(ss_payloads[0])
+        and ss_payloads[0]["max_completion_tokens"]
+        == MAX_COMPLETION_TOKENS
+        and ss_payloads[0]["reasoning_effort"] == "low",
+    )
+
+    def ss_message_measuring(guard_length):
+        """Message whose guard-measured text has exactly this length."""
+        base = len(serialized_request([{"role": "user", "content": ""}]))
+        return [{"role": "user", "content": "x" * (guard_length - base)}]
+
+    ss_schema_chars = (
+        len(serialized_request([{"role": "user", "content": ""}]))
+        - len(json_text([{"role": "user", "content": ""}]))
+    )
+
+    over_by_schema = ss_message_measuring(MAX_REQUEST_CHARS + 1)
+    error, payloads = ss_send(
+        over_by_schema, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9
+    )
+
+    check(
+        "Character guard counts the schema (fits without it, blocked "
+        "with it, no Groq call)",
+        ss_schema_chars > 1000
+        and len(json_text(over_by_schema)) <= MAX_REQUEST_CHARS
+        and "character limit" in error
+        and payloads == [],
+    )
+
+    ss_token_cap_chars = int(
+        (MAX_ESTIMATED_REQUEST_TOKENS - MAX_COMPLETION_TOKENS) * 2.5
+    )
+    over_tokens = ss_message_measuring(ss_token_cap_chars + 2)
+    error, payloads = ss_send(over_tokens, MAX_REQUEST_CHARS=10 ** 9)
+
+    check(
+        "Token guard counts the schema (fits without it, blocked with "
+        "it, no Groq call)",
+        estimate_tokens(json_text(over_tokens)) + MAX_COMPLETION_TOKENS
+        <= MAX_ESTIMATED_REQUEST_TOKENS
+        and "token budget" in error
+        and payloads == [],
+    )
+
+    at_limit = ss_message_measuring(MAX_REQUEST_CHARS)
+    error, payloads = ss_send(at_limit, MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9)
+
+    check(
+        "Request at the character limit including the schema is sent",
+        error == "" and len(payloads) == 1,
+    )
+
+    # Real pipeline: the incident response fails closed with
+    # diagnostics; a complete response records empty diagnostics.
+    def ss_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 22,
+                "apparent_temperature": 22, "precipitation": 0,
+                "wind_speed_10m": 5, "wind_gusts_10m": 10,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 24, "low": 18, "wind": 8,
+                               "gust": 15, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 22, "apparent_temperature": 22,
+                "humidity": 55, "precipitation": 0, "wind": 6,
+                "gust": 12, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def ss_pipeline(content):
+        transport = SsTransport(content)
+        printed = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()[0]
+
+        decision = ss_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_ss_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: ss_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+        return decision, printed.getvalue(), transport
+
+    incident, incident_output, incident_transport = ss_pipeline(
+        json_text(ss_without_reasoning(assessment_reasoning="SECRET-VALUE-9"))
+    )
+
+    check(
+        "Incident response fails closed with diagnostics recorded",
+        len(incident_transport.payloads) == 1
+        and incident["assessment_status"] == "INCOMPLETE"
+        and incident["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and incident["send_alert"] is False
+        and "Missing assessment fields: reasoning" in incident["reasoning"]
+        and incident["response_diagnostics"]["missing_required"]
+        == ["reasoning"]
+        and incident["response_diagnostics"]["missing_field_variants"][
+            "reasoning"
+        ]["prefix_or_suffix_variant"] is True
+        and incident["groq_usage"]["reasoning_tokens"] == 105,
+    )
+
+    check(
+        "Diagnostics are printed without model text or key",
+        "RESPONSE SHAPE DIAGNOSTICS" in incident_output
+        and "SECRET-VALUE" not in incident_output + json_text(incident)
+        and "assessment_reasoning" not in incident_output
+        and "gsk_ss_test_key" not in incident_output,
+    )
+
+    complete_run, complete_output, _ = ss_pipeline(json_text(ss_complete))
+
+    check(
+        "Complete response passes with empty diagnostics",
+        complete_run["response_diagnostics"] == {}
+        and "RESPONSE SHAPE DIAGNOSTICS" not in complete_output
+        and complete_run["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED"
+        in [r["code"] for r in complete_run["incomplete_reasons"]],
+    )
+
+    check(
+        "Claim guard still applies to schema-valid responses",
+        "UNVERIFIED_WARNING_CLAIM" in [
+            r["code"] for r in ss_pipeline(json_text(ss_response(
+                advice="No official heat advisory is in effect."
+            )))[0]["incomplete_reasons"]
+        ],
+    )
+
+    # ------------------------------------------------------------
+    # Completion allowance (1,000 tokens) against the unchanged
+    # 8,000-token and 19,000-character guards (offline).
+    # ------------------------------------------------------------
+    class CtResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": "{}"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class CtTransport:
+        def __init__(self):
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return CtResponse()
+
+    def ct_message(guard_length):
+        base = len(serialized_request([{"role": "user", "content": ""}]))
+        return [{"role": "user", "content": "x" * (guard_length - base)}]
+
+    def ct_send(guard_length):
+        transport = CtTransport()
+        saved = {name: globals()[name] for name in ("HTTP", "GROQ_API_KEY")}
+        globals().update({"HTTP": transport, "GROQ_API_KEY": "gsk_ct_key"})
+        error = ""
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ask_groq(ct_message(guard_length))
+        except (ValueError, RuntimeError) as exc:
+            error = str(exc)
+        finally:
+            globals().update(saved)
+
+        return error, transport.payloads
+
+    check(
+        "Completion allowance is exactly 1,000 and never above it",
+        MAX_COMPLETION_TOKENS == 1000
+        and MAX_COMPLETION_TOKENS <= 1000
+        and MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500,
+    )
+
+    # The failing dry run: 17,225 request characters = 6,890 estimated
+    # input tokens; 6,890 + 1,000 = 7,890 is within the 8,000 total.
+    error, payloads = ct_send(17225)
+
+    check(
+        "Failing request estimate (6,890 + 1,000 = 7,890) passes the "
+        "guards and is sent",
+        estimate_tokens(serialized_request(ct_message(17225))) == 6890
+        and 6890 + MAX_COMPLETION_TOKENS == 7890
+        and error == ""
+        and len(payloads) == 1
+        and payloads[0]["max_completion_tokens"] == 1000,
+    )
+
+    # Exactly 8,000 (7,000 input + 1,000) is allowed; 8,001 is not.
+    error, payloads = ct_send(17500)
+
+    check(
+        "Request at exactly 8,000 estimated tokens is sent",
+        estimate_tokens(serialized_request(ct_message(17500)))
+        + MAX_COMPLETION_TOKENS == 8000
+        and error == "" and len(payloads) == 1,
+    )
+
+    error, payloads = ct_send(17502)
+
+    check(
+        "Request over 8,000 estimated tokens is rejected before Groq",
+        estimate_tokens(serialized_request(ct_message(17502)))
+        + MAX_COMPLETION_TOKENS == 8001
+        and "token budget" in error
+        and payloads == [],
+    )
+
+    error, payloads = ct_send(MAX_REQUEST_CHARS + 1)
+
+    check(
+        "Request over the character limit is still rejected before Groq",
+        "character limit" in error and payloads == [],
+    )
+
+    # ------------------------------------------------------------
+    # Groq HTTP error bodies are never propagated (self-contained,
+    # offline). Each synthetic body carries unique marker strings.
+    # ------------------------------------------------------------
+    def he_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    class HeResponse:
+        def __init__(self, status_code, text, headers=None):
+            self.status_code = status_code
+            self.text = text
+            self.headers = headers or {}
+
+        def json(self):
+            return json.loads(self.text)
+
+        def raise_for_status(self):
+            return None
+
+    class HeTransport:
+        def __init__(self, response):
+            self.response = response
+            self.payloads = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            return self.response
+
+    def he_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 22,
+                "apparent_temperature": 22, "precipitation": 0,
+                "wind_speed_10m": 5, "wind_gusts_10m": 10,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 24, "low": 18, "wind": 8,
+                               "gust": 15, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 22, "apparent_temperature": 22,
+                "humidity": 55, "precipitation": 0, "wind": 6,
+                "gust": 12, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def he_run(response, history=()):
+        """Real pipeline + dry run + live-mode payload, all offline."""
+        groq = HeTransport(response)
+        pipeline_log = io.StringIO()
+
+        def assess():
+            with contextlib.redirect_stdout(pipeline_log):
+                return run_weather_agent()
+
+        decision, used = he_override(
+            {
+                "HTTP": groq,
+                "GROQ_API_KEY": "gsk_he_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: he_weather(),
+                "tool_get_history": lambda n=3: list(history),
+            },
+            assess,
+        )
+
+        dry_log = io.StringIO()
+        sheets = HeTransport(HeResponse(200, "OK"))
+
+        def report(dry):
+            target = dry_log if dry else io.StringIO()
+
+            with contextlib.redirect_stdout(target):
+                run_agent_job(dry=dry)
+
+        common = {
+            "run_weather_agent": lambda: (decision, used),
+            "HTTP": sheets,
+            "SHEET_URL": "https://sheet.invalid/exec",
+            "require_configuration": lambda require_sheet=False: None,
+        }
+        he_override(common, lambda: report(True))
+        he_override(common, lambda: report(False))
+
+        return {
+            "decision": decision,
+            "groq": groq,
+            "pipeline_log": pipeline_log.getvalue(),
+            "dry_log": dry_log.getvalue(),
+            "sheets_payloads": sheets.payloads,
+        }
+
+    he_bodies = {
+        "failed_generation": (400, json.dumps({"error": {
+            "message": "max completion tokens reached HE-MARK-MSG1",
+            "type": "invalid_request_error",
+            "code": "json_validate_failed",
+            "failed_generation": "{\"advice\": \"HE-MARK-FG no official "
+                                 "advisory is in effect\"",
+        }}), {}),
+        "error.message": (400, json.dumps({"error": {
+            "message": "HE-MARK-MSG2 provider supplied text",
+            "type": "invalid_request_error",
+        }}), {}),
+        "unexpected nested fields": (500, json.dumps({
+            "error": {
+                "type": "server_error",
+                "details": {"trace": ["HE-MARK-NEST"]},
+                "param": "HE-MARK-PARAM",
+            },
+            "extra": {"deep": [{"x": "HE-MARK-TOP"}]},
+        }), {}),
+        "malformed JSON": (
+            502, '{"error": {"message": "HE-MARK-BAD", "code": ', {}
+        ),
+        "plain text": (503, "HE-MARK-PLAIN service unavailable", {}),
+        "unsafe identifiers and header": (429, json.dumps({"error": {
+            "code": "HE-MARK-CODE not an identifier",
+            "type": "HE_MARK_" + "t" * 80,
+        }}), {"retry-after": "HE-MARK-RETRY"}),
+    }
+
+    he_results = {
+        label: he_run(HeResponse(status, text, headers))
+        for label, (status, text, headers) in he_bodies.items()
+    }
+
+    for label, result in he_results.items():
+        decision = result["decision"]
+        surfaces = {
+            "logs": result["pipeline_log"] + result["dry_log"],
+            "reasoning": decision["reasoning"],
+            "limitations": json_text(decision["limitations"]),
+            "payloads": json_text(result["sheets_payloads"]),
+        }
+        leaked = [
+            surface for surface, text in surfaces.items()
+            if "HE-MARK" in text or "HE_MARK" in text
+        ]
+
+        check(
+            f"Provider error body never leaks ({label})",
+            leaked == []
+            and len(result["sheets_payloads"]) == 1
+            and "OUTPUT PAYLOAD" in result["dry_log"],
+        )
+
+        check(
+            f"Provider error fails closed ({label})",
+            len(result["groq"].payloads) == 1
+            and decision["assessment_status"] == "INCOMPLETE"
+            and decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and decision["risk_band"] == "UNASSESSED"
+            and decision["send_alert"] is False
+            and decision["notification_status"] == "NOT_SENT"
+            and [r["code"] for r in decision["incomplete_reasons"]]
+            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            and "gsk_he_test_key" not in json_text(result["sheets_payloads"])
+            + result["pipeline_log"] + result["dry_log"],
+        )
+
+    known = he_results["failed_generation"]["decision"]["reasoning"]
+
+    check(
+        "Known provider code stays diagnosable with a fixed description",
+        "HTTP 400" in known
+        and "code=json_validate_failed" in known
+        and "type=invalid_request_error" in known
+        and GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"] in known,
+    )
+
+    check(
+        "Sanitised description is identical in reasoning and limitations",
+        all(
+            result["decision"]["limitations"][0]
+            == result["decision"]["reasoning"]
+            for result in he_results.values()
+        ),
+    )
+
+    def he_describe(status, body, headers=None):
+        return describe_groq_http_error(
+            status, HeResponse(status, body, headers)
+        )
+
+    unknown = he_describe(400, json.dumps({"error": {
+        "code": "some_new_code", "type": "invalid_request_error",
+        "message": "HE-MARK-UNKNOWN",
+    }}))
+
+    check(
+        "Unrecognised but well-formed code is named with the generic text",
+        "code=some_new_code" in unknown
+        and GROQ_GENERIC_ERROR_DESCRIPTION in unknown
+        and "HE-MARK" not in unknown,
+    )
+
+    check(
+        "Malformed, plain-text and unsafe values are withheld",
+        all(
+            "code=unavailable, type=unavailable" in result["decision"][
+                "reasoning"
+            ]
+            for label, result in he_results.items()
+            if label in ("malformed JSON", "plain text",
+                         "unsafe identifiers and header")
+        )
+        and "retry-after" not in he_results[
+            "unsafe identifiers and header"
+        ]["decision"]["reasoning"],
+    )
+
+    check(
+        "Numeric retry-after and documented statuses remain",
+        "retry-after 12s" in he_describe(429, "{}", {"retry-after": "12"})
+        and "rate or token limit" in he_describe(429, "{}")
+        and "request too large" in he_describe(413, "{}")
+        and "provider unavailable" in he_describe(503, "not json")
+        and "(request failed)" in he_describe(418, "{}"),
+    )
+
+    check(
+        "Error description never reads the raw response text",
+        "HE-MARK" not in he_describe(
+            400, json.dumps({"error": {"type": "invalid_request_error"}})
+            + "HE-MARK-TRAILING"
+        ),
+    )
+
+    # History-dependent coverage: a request with worst-case history
+    # still fits (no hazards) and completes a real round trip.
+    he_history = [{
+        "timestamp": "t" * 60, "city": "c" * 60, "advice": "a" * 500,
+        "alert_sent": False, "alert_message": "m" * 500,
+    }] * MAX_HISTORY_RECORDS
+    he_reply = json_text({
+        "hazard_type": "NONE",
+        "likelihood_score": 1, "likelihood_reason": "lr",
+        "severity_score": 1, "severity_reason": "sr",
+        "exposure_score": None, "exposure_reason": "er",
+        "duration_score": None, "duration_reason": "dr",
+        "geographic_impact_score": None,
+        "geographic_impact_reason": "gr",
+        "alert_recommendation": "UNABLE_TO_ASSESS",
+        "advice": "Official warning status was not checked.",
+        "reasoning": "r", "recommended_actions": [],
+        "sources": ["16. Final Decision Rule"],
+    })
+
+    class HeOk(HeResponse):
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": he_reply},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    with_history = he_run(HeOk(200, ""), history=he_history)
+    sent_prompt = json_text(with_history["groq"].payloads[0]["messages"]) \
+        if with_history["groq"].payloads else ""
+
+    check(
+        "Worst-case history request reaches Groq and is assessed",
+        len(with_history["groq"].payloads) == 1
+        and with_history["decision"]["history_status"] == "AVAILABLE"
+        and "recent_agent_history" in sent_prompt
+        and "a" * 120 in sent_prompt
+        and with_history["decision"]["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED"
+        in [r["code"] for r in with_history["decision"]["incomplete_reasons"]],
+    )
+
+    # ------------------------------------------------------------
+    # Realistic-history heat assessment and history-error
+    # sanitisation (self-contained, offline).
+    # ------------------------------------------------------------
+    def fz_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def fz_heat_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        hours = []
+
+        for h in range(24):
+            phase = math.cos((h + 1) / 24 * 2 * math.pi)
+            hours.append({
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": round(31.0 + 4.0 * phase, 1),
+                "apparent_temperature": round(33.5 + 4.5 * phase, 1),
+                "humidity": int(60 - 10 * phase),
+                "precipitation": 0.0,
+                "wind": round(12.0 + 5.0 * phase, 1),
+                "gust": round(24.0 + 9.0 * phase, 1),
+                "visibility": 24140.0,
+                "weather_code": 1,
+                "cape": 0.0,
+            })
+
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "interval": 900,
+                "temperature_2m": 33.4, "relative_humidity_2m": 58,
+                "apparent_temperature": 36.1, "precipitation": 0.0,
+                "wind_speed_10m": 14.2, "wind_gusts_10m": 27.0,
+                "visibility": 24140.0, "weather_code": 1, "cape": 0.0,
+            },
+            "today_forecast": {"high": 35.0, "low": 27.2, "wind": 17.0,
+                               "gust": 33.0, "precipitation": 0.0},
+            "previous_days": [
+                {"date": f"2026-11-0{d}", "high": 34.6, "low": 26.9,
+                 "wind": 16.1, "gust": 30.4, "precipitation": 0.0}
+                for d in (5, 6, 7)
+            ],
+            "hourly_forecast_next_24h": hours,
+            "history_summary": {"average_high": 34.5,
+                                "average_low": 26.8, "peak_wind": 17.2},
+        }
+
+    fz_history = [{
+        "timestamp": f"2026-11-0{d}T04:00:12.345Z",
+        "city": "Dubai",
+        "advice": "Limit strenuous outdoor activity at midday and stay "
+                  "hydrated. Official warning status was not checked.",
+        "alert_sent": False,
+        "alert_message": "",
+    } for d in (5, 6, 7)]
+
+    fz_reply = json_text({
+        "hazard_type": "Extreme Heat",
+        "likelihood_score": 3,
+        "likelihood_reason": "Apparent temperature near 38 C forecast.",
+        "severity_score": 3,
+        "severity_reason": "Heat stress for outdoor activity.",
+        "exposure_score": 2,
+        "exposure_reason": "Outdoor workers during the afternoon.",
+        "duration_score": 3,
+        "duration_reason": "About five hours above 35 C apparent.",
+        "geographic_impact_score": 2,
+        "geographic_impact_reason": "City-wide forecast point only.",
+        "alert_recommendation": "MONITOR",
+        "advice": "Limit strenuous outdoor activity in the afternoon. "
+                  "Official warning status was not checked.",
+        "reasoning": "Heat screening triggered by the forecast.",
+        "recommended_actions": ["Schedule outdoor work for mornings"],
+        "sources": ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"],
+    })
+
+    class FzResponse:
+        def __init__(self, status_code=200, payload=None, text="",
+                     json_error=None):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+            self.headers = {}
+            self._json_error = json_error
+
+        def json(self):
+            if self._json_error is not None:
+                raise self._json_error
+
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    def fz_groq_ok():
+        return FzResponse(payload={
+            "choices": [{
+                "message": {"content": fz_reply},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 4100, "completion_tokens": 640,
+                      "total_tokens": 4740,
+                      "completion_tokens_details": {"reasoning_tokens": 120}},
+        })
+
+    class FzTransport:
+        """Groq POSTs answered offline; history GETs answered or failed."""
+
+        def __init__(self, history_get=None):
+            self.history_get = history_get
+            self.posts = []
+            self.gets = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append({"url": url, "json": json})
+            return fz_groq_ok()
+
+        def get(self, url, params=None, timeout=None):
+            self.gets.append(url)
+            return self.history_get(url, params)
+
+    def fz_pipeline(transport, sheet_url, history_patch=None):
+        printed = io.StringIO()
+        settings = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_fz_test_key",
+            "SHEET_URL": sheet_url,
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: fz_heat_weather(),
+            "EVIDENCE_GATED_DIMENSIONS": {},
+        }
+
+        if history_patch is not None:
+            settings["tool_get_history"] = history_patch
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = fz_override(settings, run)
+
+        dry_log = io.StringIO()
+        dry_transport = FzTransport()
+
+        def dry_run():
+            with contextlib.redirect_stdout(dry_log):
+                run_agent_job(dry=True)
+
+        fz_override(
+            {
+                "run_weather_agent": lambda: (decision, used),
+                "HTTP": dry_transport,
+                "SHEET_URL": sheet_url,
+            },
+            dry_run,
+        )
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "dry_log": dry_log.getvalue(),
+            "dry_posts": dry_transport.posts,
+        }
+
+    # A. Realistic three-record history + heat: fits, strict request,
+    # validates locally, no external writes or email.
+    fz_ok_transport = FzTransport(
+        history_get=lambda url, params: FzResponse(payload=fz_history)
+    )
+    fz_ok = fz_pipeline(fz_ok_transport, "https://sheet.invalid/exec")
+    fz_decision = fz_ok["decision"]
+    fz_payload = (
+        fz_ok_transport.posts[0]["json"] if fz_ok_transport.posts else {}
+    )
+    fz_request = serialized_request(fz_payload.get("messages", []))
+
+    check(
+        "Realistic-history heat request is within every budget",
+        set(fz_decision["hazard_screening"]) == {"HEAT"}
+        and fz_decision["history_status"] == "AVAILABLE"
+        and len(fz_ok_transport.posts) == 1
+        and len(fz_request) <= MAX_REQUEST_CHARS
+        and estimate_tokens(fz_request) + MAX_COMPLETION_TOKENS
+        <= MAX_ESTIMATED_REQUEST_TOKENS
+        and fz_decision["groq_usage"]["estimated_input_tokens"]
+        + fz_decision["groq_usage"]["completion_allowance"]
+        <= MAX_ESTIMATED_REQUEST_TOKENS,
+    )
+
+    check(
+        "Realistic-history heat request uses the strict schema settings",
+        fz_payload.get("response_format") == RESPONSE_FORMAT
+        and fz_payload["response_format"]["json_schema"]["strict"] is True
+        and fz_payload.get("max_completion_tokens") == 1000
+        and fz_payload.get("reasoning_effort") == "low"
+        and fz_payload.get("include_reasoning") is False
+        and fz_payload.get("model") == MODEL,
+    )
+
+    check(
+        "Realistic-history heat request carries the history evidence",
+        "recent_agent_history" in fz_request
+        and "Limit strenuous outdoor activity at midday" in fz_request
+        and "6.1 Extreme Heat" in fz_request,
+    )
+
+    check(
+        "Realistic-history heat response validates and is scored",
+        fz_decision["risk_score"] == 7.5
+        and fz_decision["risk_band"] == "MODERATE"
+        and fz_decision["response_diagnostics"] == {}
+        and fz_decision["sources"]
+        == ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"]
+        and fz_decision["alert_recommendation"] == "MONITOR"
+        and fz_decision["assessment_status"] == "INCOMPLETE"
+        and [r["code"] for r in fz_decision["incomplete_reasons"]]
+        == ["OFFICIAL_WARNINGS_NOT_VERIFIED"],
+    )
+
+    check(
+        "Realistic-history heat run makes no external write or email",
+        fz_ok["dry_posts"] == []
+        and fz_decision["send_alert"] is False
+        and fz_decision["notification_status"] == "NOT_SENT"
+        and "DRY RUN: No data was sent to Google Sheets." in fz_ok["dry_log"]
+        and "DRY RUN: No email was sent." in fz_ok["dry_log"]
+        and "gsk_fz_test_key" not in fz_ok["log"] + fz_ok["dry_log"],
+    )
+
+    # B. A synthetic secret SHEET_URL inside requests exceptions never
+    # reaches logs or assessment output.
+    fz_secret_url = (
+        "https://script.google.com/macros/s/FZ-SECRET-SHEET-MARKER/exec"
+    )
+    fz_with_query = fz_secret_url + "?action=history&n=3&FZ-QUERY-MARKER=1"
+
+    def fz_http_error():
+        response = FzResponse(status_code=404)
+        return requests.HTTPError(
+            f"404 Client Error: Not Found for url: {fz_with_query}",
+            response=response,
+        )
+
+    fz_failures = {
+        "HTTP error": (lambda: fz_http_error(),
+                       "history service returned HTTP 404"),
+        "connection error": (
+            lambda: requests.ConnectionError(
+                "HTTPSConnectionPool(host='script.google.com', port=443): "
+                f"Max retries exceeded with url: {fz_with_query}"
+            ),
+            "history service could not be reached",
+        ),
+        "timeout": (
+            lambda: requests.Timeout(f"Read timed out: {fz_with_query}"),
+            "history request timed out",
+        ),
+        "generic request error": (
+            lambda: requests.RequestException(f"failed {fz_with_query}"),
+            "history request failed",
+        ),
+    }
+
+    def fz_marker_free(text):
+        return "FZ-SECRET" not in text and "FZ-QUERY" not in text
+
+    for label, (make_error, expected) in fz_failures.items():
+        def failing_get(url, params, make_error=make_error):
+            raise make_error()
+
+        direct = fz_override(
+            {"SHEET_URL": fz_secret_url,
+             "HTTP": FzTransport(history_get=failing_get)},
+            tool_get_history,
+        )
+        run = fz_pipeline(FzTransport(history_get=failing_get),
+                          fz_secret_url)
+        surfaces = (
+            run["log"] + run["dry_log"] + json_text(run["decision"])
+        )
+
+        check(
+            f"History {label}: sanitised description only",
+            direct == {"error": expected},
+        )
+
+        check(
+            f"History {label}: secret URL never reaches logs or output",
+            fz_marker_free(surfaces)
+            and f"History unavailable: {expected}" in run["log"]
+            and run["decision"]["history_status"] == "UNAVAILABLE"
+            and any(
+                "history was unavailable" in item
+                for item in run["decision"]["limitations"]
+            )
+            and run["dry_posts"] == [],
+        )
+
+    def fz_bad_json(url, params):
+        return FzResponse(json_error=ValueError(
+            f"Expecting value near {fz_with_query}"
+        ))
+
+    fz_json = fz_override(
+        {"SHEET_URL": fz_secret_url, "HTTP": FzTransport(fz_bad_json)},
+        tool_get_history,
+    )
+
+    check(
+        "History invalid JSON: sanitised description only",
+        fz_json == {"error": "history response could not be read as JSON"}
+        and fz_marker_free(json_text(fz_json)),
+    )
+
+    check(
+        "History error descriptions never use the exception text",
+        describe_history_error(
+            requests.RequestException(fz_with_query)
+        ) == "history request failed"
+        and describe_history_error(
+            requests.HTTPError(fz_with_query)
+        ) == "history service returned an HTTP error"
+        and fz_marker_free(
+            describe_history_error(ValueError(fz_with_query))
+        ),
+    )
+
+    check(
+        "json_validate_failed description does not infer a cause",
+        "completion" not in GROQ_ERROR_CODE_DESCRIPTIONS[
+            "json_validate_failed"
+        ]
+        and "allowance" not in GROQ_ERROR_CODE_DESCRIPTIONS[
+            "json_validate_failed"
+        ]
+        and "validate against the response schema"
+        in GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"],
+    )
+
+    # ------------------------------------------------------------
+    # Policy source citations resolve only to retrieved sections
+    # (self-contained, offline).
+    # ------------------------------------------------------------
+    with contextlib.redirect_stdout(io.StringIO()):
+        sr_policy = load_guidelines()
+        sr_hazards = {"HEAT": ["t"]}
+        sr_required = select_hazard_guidance(sr_policy, sr_hazards)
+        sr_required += select_conditional_sections(
+            sr_policy, sr_hazards, {"current": {"time": "2026-11-08T12:00"}}
+        )
+        sr_sections = search_guidelines(
+            sr_policy, "x", k=0, required_sections=sr_required
+        )
+
+    sr_titles = [section["section"] for section in sr_sections]
+
+    check(
+        "Source fixture matches the failing run's nine sections",
+        sr_titles == [
+            "4. Risk Assessment Dimensions",
+            "13. Advice and Communication Requirements",
+            "8. Alert Decision Framework",
+            "9. Official Warning Override",
+            "14. Human Approval and Notification Governance",
+            "16. Final Decision Rule",
+            "6. Weather Hazard Assessment",
+            "6.1 Extreme Heat",
+            "7. Regulatory and Workplace Compliance",
+        ],
+    )
+
+    for label, citation, expected in (
+        ("exact title", "6.1 Extreme Heat", "6.1 Extreme Heat"),
+        ("header prefix", "POLICY SECTION: 6.1 Extreme Heat",
+         "6.1 Extreme Heat"),
+        ("whole header line", "=== POLICY SECTION: 6.1 Extreme Heat ===",
+         "6.1 Extreme Heat"),
+        ("heading without number", "Extreme Heat", "6.1 Extreme Heat"),
+        ("number only", "6.1", "6.1 Extreme Heat"),
+        ("number with dot", "8.", "8. Alert Decision Framework"),
+        ("Section prefix", "Section 6.1 Extreme Heat", "6.1 Extreme Heat"),
+        ("section sign", "§ 9. Official Warning Override",
+         "9. Official Warning Override"),
+        ("markdown heading", "## 4. Risk Assessment Dimensions",
+         "4. Risk Assessment Dimensions"),
+        ("different case", "6.1 extreme heat", "6.1 Extreme Heat"),
+        ("quoted", "'16. Final Decision Rule'", "16. Final Decision Rule"),
+        ("numbered sub-heading", "4.1 Likelihood (L)",
+         "4. Risk Assessment Dimensions"),
+        ("parent of hazard subsection", "Weather Hazard Assessment",
+         "6. Weather Hazard Assessment"),
+    ):
+        check(
+            f"Citation resolves to its canonical title: {label}",
+            resolve_policy_sources([citation], sr_sections) == [expected],
+        )
+
+    for label, citation in (
+        ("section not retrieved", "5. Risk Calculation Model"),
+        ("unretrieved number", "5"),
+        ("unnumbered enum sub-heading", "MONITOR"),
+        ("policy name", "Dubai Weather Safety Guidelines"),
+        ("arbitrary text", "NCM website"),
+        ("partial heading", "Heat"),
+        ("empty string", ""),
+    ):
+        check(
+            f"Citation stays rejected: {label}",
+            resolve_policy_sources([citation], sr_sections) == [],
+        )
+
+    for label, citation in (
+        ("numbered sub-heading", "4.1 Likelihood (L)"),
+        ("numbered sub-heading as markdown", "### 4.4 Duration (D)"),
+        ("sub-heading number only", "4.3"),
+    ):
+        check(
+            f"Numbered sub-heading resolves to its parent: {label}",
+            resolve_policy_sources([citation], sr_sections)
+            == ["4. Risk Assessment Dimensions"],
+        )
+
+    for label, citation in (
+        ("enum sub-heading", "MONITOR"),
+        ("enum sub-heading as markdown", "### ADVISORY_RECOMMENDED"),
+        ("enum sub-heading lower case", "escalate_for_review"),
+        ("numbered sub-heading without its number", "Likelihood (L)"),
+        ("another unnumbered form", "Duration (D)"),
+        ("unnumbered parent-section sub-heading", "Risk bands"),
+    ):
+        check(
+            f"Unnumbered sub-heading is rejected: {label}",
+            resolve_policy_sources([citation], sr_sections) == []
+            and resolve_citation(citation, sr_sections)[0] is None,
+        )
+
+    check(
+        "Unnumbered sub-headings alone cannot make sources valid",
+        resolve_policy_sources(
+            ["MONITOR", "Likelihood (L)", "### ESCALATE_FOR_REVIEW"],
+            sr_sections,
+        ) == [],
+    )
+
+    check(
+        "Ambiguous numbered sub-heading is rejected",
+        resolve_policy_sources(["2.1 Shared"], [
+            {"section": "1. A", "text": "### 2.1 Shared\nx"},
+            {"section": "3. B", "text": "### 2.1 Shared\ny"},
+        ]) == [],
+    )
+
+    sr_prompt_messages = []
+
+    def sr_capture(messages, temperature=0.1):
+        sr_prompt_messages.append(messages)
+        raise RuntimeError("captured")
+
+    sr_saved_ask = globals()["ask_groq"]
+    globals()["ask_groq"] = sr_capture
+
+    try:
+        assess_weather(
+            {"city": CITY, "source": "Open-Meteo", "retrieved_at": "x",
+             "current": {}, "hourly_forecast_next_24h": []},
+            [], sr_policy, sr_sections,
+        )
+    except RuntimeError:
+        pass
+    finally:
+        globals()["ask_groq"] = sr_saved_ask
+
+    sr_user_prompt = (
+        sr_prompt_messages[0][1]["content"] if sr_prompt_messages else ""
+    )
+    sr_clarification = (
+        "In sources, give each title exactly as it appears after "
+        "'POLICY SECTION:' in a block header (for example '6.1 Extreme "
+        "Heat'), without the prefix or the '===' markers."
+    )
+
+    check(
+        "Prompt carries the source-citation clarification exactly once",
+        sr_user_prompt.count(sr_clarification) == 1
+        and "Cite section titles exactly as written in the section "
+        "headers" not in sr_user_prompt
+        and "In sources, cite exact policy section titles"
+        in " ".join(SYSTEM_PROMPT.split()),
+    )
+
+    sr_ambiguous = [
+        {"section": "1. Heat Advice", "text": "x"},
+        {"section": "2. Heat Advice", "text": "y"},
+    ]
+
+    check(
+        "Ambiguous citation stays rejected",
+        resolve_policy_sources(["Heat Advice"], sr_ambiguous) == []
+        and resolve_citation("Heat Advice", sr_ambiguous)
+        == (None, "ambiguous"),
+    )
+
+    check(
+        "Mixed citations keep only resolved canonical titles, once",
+        resolve_policy_sources(
+            ["Extreme Heat", "MONITOR", "6.1", "8. Alert Decision Framework",
+             "5. Risk Calculation Model", "6.1 Extreme Heat"],
+            sr_sections,
+        ) == ["6.1 Extreme Heat", "8. Alert Decision Framework"],
+    )
+
+    def sr_response(sources):
+        return {
+            "hazard_type": "HEAT",
+            "likelihood_score": 2, "likelihood_reason": "r",
+            "severity_score": 2, "severity_reason": "r",
+            "exposure_score": None, "exposure_reason": "r",
+            "duration_score": None, "duration_reason": "r",
+            "geographic_impact_score": None,
+            "geographic_impact_reason": "r",
+            "alert_recommendation": "UNABLE_TO_ASSESS",
+            "advice": "Official warning status was not checked.",
+            "reasoning": "r", "recommended_actions": [],
+            "sources": sources,
+        }
+
+    def sr_validate_error_only(sources):
+        try:
+            validate_decision(sr_response(sources), sr_sections)
+            return ""
+        except ValueError as exc:
+            return str(exc)
+
+    def sr_validate(sources):
+        try:
+            return validate_decision(sr_response(sources), sr_sections)
+        except ValueError as exc:
+            return str(exc)
+
+    sr_near_miss = sr_validate(
+        ["POLICY SECTION: 6.1 Extreme Heat", "Extreme Heat"]
+    )
+
+    check(
+        "Validator stores canonical titles for near-miss citations",
+        isinstance(sr_near_miss, dict)
+        and sr_near_miss["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    check(
+        "Validator fails closed when only unnumbered sub-headings are cited",
+        sr_validate_error_only(["MONITOR", "Likelihood (L)"])
+        == "Assessment did not identify a valid retrieved policy section.",
+    )
+
+    check(
+        "No resolvable citation still fails closed with the same error",
+        sr_validate(["5. Risk Calculation Model", "MONITOR", "NCM"])
+        == "Assessment did not identify a valid retrieved policy section."
+        and sr_validate([])
+        == "Assessment did not identify a valid retrieved policy section.",
+    )
+
+    sr_diag = source_resolution_diagnostics(
+        ["6.1 Extreme Heat", "Extreme Heat", "SR-MARKER-TEXT",
+         "5. Risk Calculation Model", "4.1 Likelihood (L)"],
+        sr_sections,
+    )
+
+    check(
+        "Source diagnostics are counts per rule, never citation text",
+        sr_diag == {
+            "source_count": 5,
+            "resolution_counts": {
+                "exact": 1, "heading": 1, "sub_heading": 1,
+                "unmatched": 1, "unretrieved_section_reference": 1,
+            },
+        }
+        and "SR-MARKER" not in json_text(sr_diag),
+    )
+
+    # Real pipeline: an unresolvable response fails closed and records
+    # the counts; a near-miss response is accepted canonically.
+    def sr_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    class SrResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class SrTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return SrResponse(self.content)
+
+    def sr_pipeline(sources):
+        transport = SrTransport(json_text(sr_response(sources)))
+        printed = io.StringIO()
+        saved = {name: globals()[name] for name in (
+            "HTTP", "GROQ_API_KEY", "require_configuration",
+            "get_weather", "tool_get_history",
+        )}
+        globals().update({
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_sr_test_key",
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: sr_weather(),
+            "tool_get_history": lambda n=3: [],
+        })
+
+        try:
+            with contextlib.redirect_stdout(printed):
+                decision = run_weather_agent()[0]
+        finally:
+            globals().update(saved)
+
+        return decision, printed.getvalue(), transport
+
+    sr_bad, sr_bad_log, sr_bad_transport = sr_pipeline(
+        ["SR-MARKER-ONE", "5. Risk Calculation Model"]
+    )
+
+    check(
+        "Real path: unresolvable sources fail closed with counts only",
+        len(sr_bad_transport.posts) == 1
+        and sr_bad["assessment_status"] == "INCOMPLETE"
+        and sr_bad["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and sr_bad["send_alert"] is False
+        and "did not identify a valid retrieved policy section"
+        in sr_bad["reasoning"]
+        and sr_bad["response_diagnostics"]["source_resolution"] == {
+            "source_count": 2,
+            "resolution_counts": {
+                "unmatched": 1, "unretrieved_section_reference": 1,
+            },
+        }
+        and "SR-MARKER" not in sr_bad_log + json_text(sr_bad),
+    )
+
+    sr_good, _, _ = sr_pipeline(
+        ["=== POLICY SECTION: 6.1 Extreme Heat ===", "4.4 Duration (D)"]
+    )
+
+    check(
+        "Real path: near-miss citations are accepted as canonical titles",
+        sr_good["sources"]
+        == ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"]
+        and sr_good["response_diagnostics"] == {}
+        and sr_good["assessment_status"] == "INCOMPLETE",
+    )
+
+    sr_claim, _, _ = sr_pipeline(
+        ["6.1 Extreme Heat", "No official heat advisory is in effect"]
+    )
+
+    check(
+        "Claim text in an unresolvable source never reaches the output",
+        "advisory is in effect" not in json_text(sr_claim)
+        and sr_claim["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    # ------------------------------------------------------------
+    # Evidence gate (exposure, geographic impact), risk-score notice
+    # and dry-run audit summary (self-contained, offline).
+    # ------------------------------------------------------------
+    def eg_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def eg_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def eg_reply(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 4,
+            "exposure_reason": "EG-MARK-EXP large population and "
+                               "outdoor workforce",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 4,
+            "geographic_impact_reason": "EG-MARK-GEO city-wide",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity. Official "
+                      "warning status was not checked.",
+            "reasoning": "Heat screening triggered. EG-MARK-REASONING",
+            "recommended_actions": [],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return json_text(body)
+
+    class EgResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class EgTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return EgResponse(self.content)
+
+    def eg_run(content, gate=None, dry=True):
+        transport = EgTransport(content)
+        printed = io.StringIO()
+        settings = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_eg_test_key",
+            "require_configuration": lambda require_sheet=False: None,
+            "get_weather": lambda city: eg_weather(),
+            "tool_get_history": lambda n=3: [],
+        }
+
+        if gate is not None:
+            settings["EVIDENCE_GATED_DIMENSIONS"] = gate
+
+        def run():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = eg_override(settings, run)
+        report = io.StringIO()
+        sheets = EgTransport("OK")
+
+        def job():
+            with contextlib.redirect_stdout(report):
+                run_agent_job(dry=True)
+
+        eg_override(
+            {"run_weather_agent": lambda: (decision, used),
+             "HTTP": sheets},
+            job,
+        )
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "report": report.getvalue(),
+            "sheet_posts": sheets.posts,
+        }
+
+    # P1-1: Exposure 4 and Geographic Impact 4 are overridden.
+    eg_four = eg_run(eg_reply())
+    eg_d = eg_four["decision"]
+
+    check(
+        "Model Exposure 4 and Geographic Impact 4 are both overridden",
+        eg_d["exposure_score"] is None
+        and eg_d["geographic_impact_score"] is None
+        and eg_d["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and eg_d["likelihood_score"] == 3
+        and eg_d["severity_score"] == 3
+        and eg_d["duration_score"] == 3,
+    )
+
+    check(
+        "Overridden dimensions carry fixed program reasons, not model text",
+        eg_d["exposure_reason"]
+        == EVIDENCE_GATED_DIMENSIONS.get("exposure_score", (None, None))[1]
+        and eg_d["geographic_impact_reason"]
+        == EVIDENCE_GATED_DIMENSIONS.get(
+            "geographic_impact_score", (None, None)
+        )[1]
+        and eg_d["exposure_reason"] is not None
+        and "EG-MARK-EXP" not in json_text(eg_d)
+        and "EG-MARK-GEO" not in json_text(eg_d)
+        and "EG-MARK-EXP" not in eg_four["log"] + eg_four["report"]
+        and "EG-MARK-GEO" not in eg_four["log"] + eg_four["report"],
+    )
+
+    # P1-3: no numerical classification or HIGH band.
+    check(
+        "Missing dimensions give no risk score and no band (not HIGH)",
+        eg_d["risk_score"] is None
+        and eg_d["risk_band"] == "UNASSESSED"
+        and "10.5" not in eg_four["report"]
+        and "HIGH" not in eg_four["report"].split("RISK BAND:")[1][:12]
+        and eg_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and eg_d["assessment_status"] == "INCOMPLETE"
+        and eg_d["send_alert"] is False,
+    )
+
+    check(
+        "Missing dimensions are recorded with the supported reason code",
+        [r["code"] for r in eg_d["incomplete_reasons"]]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and eg_d["incomplete_reasons"][0]["detail"]
+        == "exposure_score, geographic_impact_score"
+        and any(
+            "exposure_score" in item and "geographic_impact_score" in item
+            for item in eg_d["missing_evidence"]
+        ),
+    )
+
+    # P1-2: other numerical values are overridden too.
+    for exposure, geographic in ((1, 1), (2, 3), (5, 5)):
+        run = eg_run(eg_reply(
+            exposure_score=exposure, geographic_impact_score=geographic
+        ))
+
+        check(
+            f"Model values ({exposure}, {geographic}) are overridden "
+            "and no band results",
+            run["decision"]["exposure_score"] is None
+            and run["decision"]["geographic_impact_score"] is None
+            and run["decision"]["risk_band"] == "UNASSESSED"
+            and run["decision"]["risk_score"] is None,
+        )
+
+    only_null = eg_run(eg_reply(
+        exposure_score=None, geographic_impact_score=None
+    ))
+
+    check(
+        "Model nulls need no override and stay unassessed",
+        only_null["decision"]["evidence_gate_overrides"] == []
+        and only_null["decision"]["risk_band"] == "UNASSESSED",
+    )
+
+    # Strictness is preserved: the gate never creates missing keys.
+    def eg_without(key):
+        body = json.loads(eg_reply())
+        del body[key]
+        return json_text(body)
+
+    for key in ("exposure_score", "geographic_impact_score",
+                "exposure_reason"):
+        run = eg_run(eg_without(key))
+
+        check(
+            f"Gate does not mask a missing key: {key}",
+            "Missing assessment fields: " + key
+            in run["decision"]["reasoning"]
+            and run["decision"]["assessment_status"] == "INCOMPLETE",
+        )
+
+    # P1-4: the model cannot supply program-owned gate fields.
+    for label, extra in (
+        ("overrides list", {"evidence_gate_overrides": []}),
+        ("incomplete reasons", {"incomplete_reasons": [
+            {"code": "NONE", "detail": "all clear"}]}),
+        ("risk score", {"risk_score": 10.5}),
+        ("risk band", {"risk_band": "HIGH"}),
+    ):
+        run = eg_run(eg_reply(**extra))
+
+        check(
+            f"Model cannot inject program-owned values: {label}",
+            "program-owned fields" in run["decision"]["reasoning"]
+            and run["decision"]["risk_band"] == "UNASSESSED"
+            and all(
+                r["code"] != "NONE"
+                for r in run["decision"]["incomplete_reasons"]
+            ),
+        )
+
+    # The gate cannot be bypassed by wrong types in gated fields.
+    garbage = eg_run(eg_reply(
+        exposure_score="4", geographic_impact_score=99
+    ))
+
+    check(
+        "Malformed gated values are discarded, never scored",
+        garbage["decision"]["exposure_score"] is None
+        and garbage["decision"]["geographic_impact_score"] is None
+        and garbage["decision"]["risk_band"] == "UNASSESSED",
+    )
+
+    # P1-5: fully assessed calculations are unchanged.
+    check(
+        "With no gated dimension the formula still scores and bands",
+        eg_run(eg_reply(), gate={})["decision"]["risk_score"] == 10.5
+        and eg_run(eg_reply(), gate={})["decision"]["risk_band"] == "HIGH",
+    )
+
+    check(
+        "Gate covers exactly exposure and geographic impact",
+        set(EVIDENCE_GATED_DIMENSIONS)
+        == {"exposure_score", "geographic_impact_score"}
+        and all(
+            reason_field.endswith("_reason") and len(text) > 40
+            for reason_field, text in EVIDENCE_GATED_DIMENSIONS.values()
+        ),
+    )
+
+    check(
+        "evidence_gate_overrides is a program-owned field",
+        "evidence_gate_overrides" in PROGRAM_OWNED_FIELDS,
+    )
+
+    check(
+        "Apply-gate is a no-op for non-dict output and for absent keys",
+        apply_evidence_gate([1, 2]) == []
+        and apply_evidence_gate({"likelihood_score": 3}) == []
+        and apply_evidence_gate({"exposure_score": 3})
+        == ["exposure_score"],
+    )
+
+    # P2: the notice no longer points at an unsent section.
+    eg_sent = []
+
+    def eg_capture(messages, temperature=0.1):
+        eg_sent.append(messages)
+        raise RuntimeError("captured")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        eg_policy = load_guidelines()
+
+    try:
+        eg_override(
+            {"ask_groq": eg_capture},
+            lambda: assess_weather(
+                eg_weather(), [], eg_policy,
+                [{"section": "6.1 Extreme Heat", "text": "x"}],
+            ),
+        )
+    except RuntimeError:
+        pass
+
+    eg_user = eg_sent[0][1]["content"] if eg_sent else ""
+
+    check(
+        "Risk-score notice no longer references guidelines.md section 5",
+        "risk_score_notice" in eg_user
+        and "guidelines.md" not in eg_user.split("EVIDENCE AND STATUS")[1]
+        and "section 5" not in eg_user.split("EVIDENCE AND STATUS")[1]
+        and "internal provisional calculation made by the program"
+        in eg_user
+        and "not an official UAE or NCM classification" in eg_user
+        and "must not be treated as validated for automated public "
+        "notifications" in eg_user,
+    )
+
+    # P3: audit summary appears in the dry-run output.
+    eg_summary = None
+
+    for line in eg_four["report"].splitlines():
+        if line.startswith("{") and "risk_score_calculated" in line:
+            eg_summary = json.loads(line)
+
+    check(
+        "Dry-run audit summary lists the safe audit fields",
+        eg_summary is not None
+        and "AUDIT SUMMARY (program-generated)" in eg_four["report"]
+        and eg_summary["sources"] == ["6.1 Extreme Heat"]
+        and eg_summary["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and eg_summary["assessment_status"] == "INCOMPLETE"
+        and eg_summary["risk_score_calculated"] is False
+        and eg_summary["risk_band"] == "UNASSESSED"
+        and eg_summary["incomplete_reason_codes"]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and eg_summary["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and eg_summary["hazards_screened"] == ["HEAT"],
+    )
+
+    eg_scored = eg_run(eg_reply(), gate={})
+    eg_scored_summary = json.loads(next(
+        line for line in eg_scored["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    ))
+
+    check(
+        "Audit summary reports when a score was calculated",
+        eg_scored_summary["risk_score_calculated"] is True
+        and eg_scored_summary["risk_band"] == "HIGH"
+        and eg_scored_summary["alert_recommendation"] == "MONITOR",
+    )
+
+    eg_failed = eg_run(
+        json_text({"not": "the schema"})
+    )
+    eg_failed_summary = json.loads(next(
+        line for line in eg_failed["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    ))
+
+    check(
+        "Audit summary on a failed assessment holds no model text",
+        eg_failed_summary["sources"] == []
+        and eg_failed_summary["risk_score_calculated"] is False
+        and eg_failed_summary["assessment_status"] == "INCOMPLETE"
+        and eg_failed_summary["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and "ASSESSMENT_ERROR"
+        in eg_failed_summary["incomplete_reason_codes"],
+    )
+
+    audit_text = "".join(
+        line for line in eg_four["report"].splitlines()
+        if line.startswith("{") and "risk_score_calculated" in line
+    )
+
+    check(
+        "Audit summary has exactly the approved keys and no model text",
+        sorted(eg_summary or {}) == sorted([
+            "sources", "alert_recommendation", "assessment_status",
+            "risk_score_calculated", "risk_band",
+            "incomplete_reason_codes", "evidence_gate_overrides",
+            "warning_claim_diagnostic", "hazards_screened",
+        ])
+        and "EG-MARK" not in audit_text
+        and "Heat screening" not in audit_text
+        and "Limit strenuous" not in audit_text,
+    )
+
+    check(
+        "Audit output contains no weather payload, secret or Sheets write",
+        "gsk_eg_test_key" not in eg_four["log"] + eg_four["report"]
+        and "temperature" not in audit_text
+        and eg_four["sheet_posts"] == [],
+    )
+
+    # ------------------------------------------------------------
+    # Warning-claim failure diagnostics (self-contained, offline).
+    # ------------------------------------------------------------
+    def cl_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def cl_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    def cl_body(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 4, "exposure_reason": "CL-MARK-EXP",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 4,
+            "geographic_impact_reason": "CL-MARK-GEO",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit outdoor activity. Official warning status "
+                      "was not checked.",
+            "reasoning": "Heat screening triggered.",
+            "recommended_actions": [],
+            "sources": ["POLICY SECTION: 6.1 Extreme Heat",
+                        "Extreme Heat", "CL-MARK-SRC"],
+        }
+        body.update(changes)
+        return body
+
+    class ClResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class ClTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return ClResponse(self.content)
+
+    def cl_run(body):
+        transport = ClTransport(json_text(body))
+        printed = io.StringIO()
+        report = io.StringIO()
+        sheets = ClTransport("OK")
+
+        def assess():
+            with contextlib.redirect_stdout(printed):
+                return run_weather_agent()
+
+        decision, used = cl_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_cl_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: cl_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            assess,
+        )
+
+        def job():
+            with contextlib.redirect_stdout(report):
+                run_agent_job(dry=True)
+
+        cl_override(
+            {"run_weather_agent": lambda: (decision, used),
+             "HTTP": sheets},
+            job,
+        )
+
+        summary = json.loads(next(
+            line for line in report.getvalue().splitlines()
+            if line.startswith("{") and "risk_score_calculated" in line
+        ))
+
+        return {
+            "decision": decision,
+            "log": printed.getvalue(),
+            "report": report.getvalue(),
+            "summary": summary,
+            "sheet_posts": sheets.posts,
+        }
+
+    # 1. Each of the five patterns records its own number and field.
+    cl_samples = {
+        1: ("reasoning", "No official heat advisory is in effect."),
+        2: ("advice", "There are no active warnings."),
+        3: ("duration_reason", "No official warnings were checked."),
+        4: ("likelihood_reason", "A heat warning is currently in effect."),
+        5: ("recommended_actions", ["NCM has not issued any warning."]),
+    }
+
+    for number, (field, value) in cl_samples.items():
+        text = value if isinstance(value, str) else value[0]
+
+        check(
+            f"Pattern {number} is identified by number",
+            find_unverified_warning_claim_pattern(text) == number
+            and find_unverified_warning_claim(text) is True,
+        )
+
+        run = cl_run(cl_body(**{field: value}))
+        decision = run["decision"]
+        expected = f"field={field};pattern={number}"
+        reasons = {
+            r["code"]: r["detail"] for r in decision["incomplete_reasons"]
+        }
+
+        check(
+            f"Pattern {number} in {field} records {expected}",
+            reasons.get("UNVERIFIED_WARNING_CLAIM") == expected
+            and decision.get("warning_claim_diagnostic") == expected
+            and run["summary"].get("warning_claim_diagnostic") == expected
+            and f"INCOMPLETE REASON: UNVERIFIED_WARNING_CLAIM | {expected}"
+            in run["report"],
+        )
+
+    # Non-schema key names are labelled, never echoed.
+    cl_outside = cl_run(cl_body(**{
+        "CL-MARK-KEY": "There are no active warnings."
+    }))
+
+    check(
+        "Claim outside the schema records field=outside_schema",
+        cl_outside["decision"].get("warning_claim_diagnostic")
+        == "field=outside_schema;pattern=2"
+        and "CL-MARK-KEY" not in json_text(cl_outside["decision"])
+        + cl_outside["log"] + cl_outside["report"],
+    )
+
+    check(
+        "Diagnostic is built from fixed values even if metadata is bad",
+        UnverifiedWarningClaim("m", field_label="CL-MARK-LABEL",
+                               pattern_number=99).diagnostic()
+        == "field=unknown;pattern=None"
+        and UnverifiedWarningClaim("m", "advice", 3).diagnostic()
+        == "field=advice;pattern=3"
+        and UnverifiedWarningClaim("m", "outside_schema", 5).diagnostic()
+        == "field=outside_schema;pattern=5",
+    )
+
+    # 2-3. Validated sources and override names survive the failure.
+    cl_run_one = cl_run(cl_body(reasoning="No official heat advisory is "
+                                          "in effect."))
+    cl_d = cl_run_one["decision"]
+
+    check(
+        "Canonical validated sources survive the warning-claim failure",
+        cl_d["sources"] == ["6.1 Extreme Heat"]
+        and cl_run_one["summary"]["sources"] == ["6.1 Extreme Heat"],
+    )
+
+    check(
+        "Both evidence-gate override names survive the failure",
+        cl_d.get("evidence_gate_overrides")
+        == ["exposure_score", "geographic_impact_score"]
+        and cl_run_one["summary"]["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"],
+    )
+
+    # 4. No model-generated text anywhere in the failure output.
+    cl_everything = (
+        json_text(cl_d) + cl_run_one["log"] + cl_run_one["report"]
+        + json_text(cl_run_one["summary"])
+    )
+
+    check(
+        "No model text, marker or unvalidated source leaks",
+        "CL-MARK" not in cl_everything
+        and "advisory is in effect" not in cl_everything
+        and "POLICY SECTION: 6.1" not in cl_everything
+        and "gsk_cl_test_key" not in cl_everything,
+    )
+
+    check(
+        "Limitations and missing evidence hold no model text",
+        all(
+            "advisory" not in item.lower() or "official" in item.lower()
+            for item in cl_d["limitations"] + cl_d["missing_evidence"]
+        )
+        and "CL-MARK" not in json_text(
+            cl_d["limitations"] + cl_d["missing_evidence"]
+        ),
+    )
+
+    # 5. The fail-closed decision keeps every required value.
+    check(
+        "Warning-claim failure is fully fail-closed",
+        cl_d["assessment_status"] == "INCOMPLETE"
+        and cl_d["risk_score"] is None
+        and cl_d["risk_band"] == "UNASSESSED"
+        and cl_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and cl_d["send_alert"] is False
+        and cl_d["alert_message"] == ""
+        and cl_d["approval_status"] == "NOT_AUTHORIZED"
+        and cl_d["notification_status"] == "NOT_SENT"
+        and cl_d["official_warning_status"] == "NOT_CHECKED"
+        and cl_d["exposure_score"] is None
+        and cl_d["geographic_impact_score"] is None
+        and [r["code"] for r in cl_d["incomplete_reasons"]]
+        == ["UNVERIFIED_WARNING_CLAIM", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        and cl_run_one["sheet_posts"] == [],
+    )
+
+    check(
+        "Audit summary on the failure has exactly the approved keys",
+        sorted(cl_run_one["summary"]) == sorted([
+            "sources", "alert_recommendation", "assessment_status",
+            "risk_score_calculated", "risk_band",
+            "incomplete_reason_codes", "evidence_gate_overrides",
+            "warning_claim_diagnostic", "hazards_screened",
+        ])
+        and cl_run_one["summary"]["risk_score_calculated"] is False
+        and cl_run_one["summary"]["alert_recommendation"]
+        == "UNABLE_TO_ASSESS",
+    )
+
+    # Failures that are not claims carry no claim diagnostic and no
+    # unvalidated sources.
+    cl_other = cl_run({"not": "the schema"})
+
+    check(
+        "Non-claim failure has no claim diagnostic, sources or overrides",
+        "warning_claim_diagnostic" in cl_other["summary"]
+        and cl_other["summary"]["warning_claim_diagnostic"] is None
+        and cl_other["summary"]["sources"] == []
+        and cl_other["summary"]["evidence_gate_overrides"] == []
+        and "ASSESSMENT_ERROR"
+        in cl_other["summary"]["incomplete_reason_codes"],
+    )
+
+    check(
+        "Model cannot supply the claim diagnostic field",
+        "warning_claim_diagnostic" in PROGRAM_OWNED_FIELDS
+        and "program-owned fields" in cl_run(cl_body(
+            warning_claim_diagnostic="field=advice;pattern=1"
+        ))["decision"]["reasoning"],
+    )
+
+    # 6. Genuine claims stay blocked (including previously flagged
+    # compliant-looking wording: the guard is unchanged).
+    for text in (
+        "No official heat advisory is in effect.",
+        "There are no active warnings.",
+        "A heat warning is currently in effect.",
+        "NCM has not issued any warning.",
+        "No official warnings were checked.",
+        "Official advisories are currently unverified.",
+    ):
+        check(
+            f"Claim stays blocked: {text}",
+            find_unverified_warning_claim(text),
+        )
+
+    for text in (
+        "Official warning status was not checked.",
+        "Official warning status was not checked; consult NCM for "
+        "official warnings.",
+    ):
+        check(
+            f"Approved wording is not a claim: {text[:48]}",
+            not find_unverified_warning_claim(text),
+        )
+
+    check(
+        "The five warning-claim patterns are unchanged",
+        len(UNVERIFIED_WARNING_CLAIM_PATTERNS) == 5
+        and hashlib.sha256(
+            "\n".join(
+                f"{p.flags}:{p.pattern}"
+                for p in UNVERIFIED_WARNING_CLAIM_PATTERNS
+            ).encode("utf-8")
+        ).hexdigest()
+        == "faf42abf70960e9c7116daae877fb39a37d224d44d65268889a9bf9c9519cd87",
+    )
+
+    # ------------------------------------------------------------
+    # Text-free shape diagnostic for pattern 3 matches.
+    # ------------------------------------------------------------
+    def cl_shape(qualifier, term, between, following):
+        return {
+            "qualifier": qualifier, "term_class": term,
+            "words_between": between, "following_word_class": following,
+        }
+
+    cl_shape_cases = (
+        ("No current advisory is warranted.",
+         cl_shape("current", "advisory", 0, "auxiliary")),
+        ("No existing warnings.",
+         cl_shape("existing", "warning", 0, "punctuation")),
+        ("No official heat advisories were considered.",
+         cl_shape("official", "advisory", 1, "auxiliary")),
+        ("No current alert or advisory is justified.",
+         cl_shape("current", "advisory", 2, "auxiliary")),
+        ("No official emergency instructions for Dubai.",
+         cl_shape("official", "emergency_instruction", 0, "preposition")),
+        ("NO ACTIVE WARNING and monitoring continues.",
+         cl_shape("active", "warning", 0, "conjunction")),
+        ("No official warning information was retrieved.",
+         cl_shape("official", "warning", 0, "other_word")),
+        ("Heat is high; no active advisory",
+         cl_shape("active", "advisory", 0, "end")),
+        ("No active warning-level hazard is indicated.",
+         cl_shape("active", "warning", 0, "punctuation")),
+        ("No\u200b active warning \u2019s",
+         cl_shape("active", "warning", 0, "punctuation")),
+    )
+
+    for text, expected_shape in cl_shape_cases:
+        check(
+            f"Pattern 3 shape classified: {expected_shape['qualifier']}/"
+            f"{expected_shape['term_class']}/"
+            f"{expected_shape['words_between']}/"
+            f"{expected_shape['following_word_class']}",
+            find_unverified_warning_claim_pattern(text) == 3
+            and find_unverified_warning_claim_shape(text) == expected_shape,
+        )
+
+    check(
+        "No shape for conditional, non-matching or empty text",
+        find_unverified_warning_claim_shape(
+            "Verify whether no active warning exists later."
+        ) is None
+        and find_unverified_warning_claim_shape("") is None
+        and find_unverified_warning_claim_shape(
+            "Official warning status was not checked."
+        ) is None,
+    )
+
+    # Unknown or malformed shape values fail safely.
+    cl_unknown = cl_shape("unknown", "unknown", None, "unknown")
+
+    for label, bad in (
+        ("missing", None),
+        ("not a dict", "CL-MARK-SHAPE"),
+        ("empty", {}),
+        ("free text", cl_shape("CL-MARK-Q", "CL-MARK-T", 1, "CL-MARK-F")),
+        ("bad counts", cl_shape("active", "warning", 99, "end")),
+    ):
+        got = UnverifiedWarningClaim(
+            "m", field_label="reasoning", pattern_number=3, shape=bad
+        ).shape_diagnostic()
+        want = {
+            "bad counts": cl_shape("active", "warning", None, "end"),
+            "free text": cl_shape("unknown", "unknown", 1, "unknown"),
+        }.get(label, cl_unknown)
+
+        check(
+            f"Malformed shape fails safely: {label}",
+            got == want and "CL-MARK" not in json_text(got),
+        )
+
+    for bad_count in (True, "2", -1, 3, 1.0):
+        check(
+            f"Words-between value rejected: {bad_count!r}",
+            UnverifiedWarningClaim(
+                "m", "reasoning", 3, cl_shape("active", "warning", bad_count,
+                                              "end")
+            ).shape_diagnostic()["words_between"] is None,
+        )
+
+    check(
+        "Shape is only reported for pattern 3",
+        all(
+            UnverifiedWarningClaim(
+                "m", "reasoning", number,
+                cl_shape("active", "warning", 0, "end"),
+            ).shape_diagnostic() is None
+            for number in (1, 2, 4, 5, None)
+        ),
+    )
+
+    # End to end: marker phrase in reasoning never reaches any output.
+    cl_marker = "CL-SHAPE-MARK-4417"
+    cl_leak = cl_run(cl_body(
+        reasoning=f"{cl_marker} says no current advisory is warranted today."
+    ))
+    cl_leak_dec = cl_leak["decision"]
+    cl_shape_out = cl_leak_dec["response_diagnostics"].get(
+        "warning_claim_shape"
+    )
+    cl_everything = (
+        json_text(cl_leak_dec) + json.dumps(cl_leak["summary"])
+        + cl_leak["log"] + cl_leak["report"]
+    )
+
+    try:
+        reject_unverified_warning_claims(
+            {"reasoning": f"{cl_marker} no current advisory is warranted."},
+            "NOT_CHECKED",
+        )
+        cl_exc = None
+    except UnverifiedWarningClaim as claim:
+        cl_exc = claim
+
+    check(
+        "Claim failure populates response_diagnostics with the shape",
+        cl_shape_out == cl_shape("current", "advisory", 0, "auxiliary")
+        and cl_leak_dec["warning_claim_diagnostic"]
+        == "field=reasoning;pattern=3"
+        and "RESPONSE SHAPE DIAGNOSTICS" in cl_leak["log"]
+        and "warning_claim_shape" in cl_leak["log"],
+    )
+
+    check(
+        "Shape diagnostic holds only fixed-vocabulary values",
+        isinstance(cl_shape_out, dict)
+        and cl_shape_out["qualifier"] in _CLAIM_QUALIFIERS
+        and cl_shape_out["term_class"] in _CLAIM_TERM_CLASSES
+        and cl_shape_out["following_word_class"] in _CLAIM_FOLLOW_CLASSES
+        and cl_shape_out["words_between"] in (0, 1, 2)
+        and set(cl_shape_out) == {
+            "qualifier", "term_class", "words_between",
+            "following_word_class",
+        },
+    )
+
+    check(
+        "Marker phrase never appears in outputs, logs or the exception",
+        cl_marker not in cl_everything
+        and cl_exc is not None
+        and cl_marker not in str(cl_exc) + repr(cl_exc)
+        + json_text(cl_exc.shape_diagnostic())
+        + cl_exc.diagnostic()
+        and "advisory is warranted" not in cl_everything
+        and "today" not in json_text(cl_shape_out),
+    )
+
+    check(
+        "Fail-closed behaviour is unchanged by the shape diagnostic",
+        cl_leak_dec["assessment_status"] == "INCOMPLETE"
+        and cl_leak_dec["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and cl_leak_dec["send_alert"] is False
+        and cl_leak_dec["approval_status"] == "NOT_AUTHORIZED"
+        and cl_leak_dec["risk_score"] is None
+        and cl_leak["summary"]["assessment_status"] == "INCOMPLETE"
+        and cl_leak["summary"]["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and "UNVERIFIED_WARNING_CLAIM"
+        in [r["code"] for r in cl_leak_dec["incomplete_reasons"]],
+    )
+
+    cl_other_dec = cl_run(cl_body(
+        advice="There are no active warnings."
+    ))["decision"]
+
+    check(
+        "Other patterns fill response_diagnostics without a shape",
+        "warning_claim_shape" not in cl_other_dec["response_diagnostics"]
+        and cl_other_dec["response_diagnostics"].get("missing_required")
+        == []
+        and cl_other_dec["warning_claim_diagnostic"]
+        == "field=advice;pattern=2",
+    )
+
+    # Shape diagnostics belong to pattern 3 alone: patterns 1, 2, 4 and
+    # 5 never carry one, at the guard, at the exception and end to end.
+    # Patterns 1 and 2 are the dangerous cases: their sample texts also
+    # match pattern 3, so a shape would be available to attach.
+    for number, (field, value) in cl_samples.items():
+        text = value if isinstance(value, str) else value[0]
+
+        try:
+            reject_unverified_warning_claims({field: value}, "NOT_CHECKED")
+            cl_claim = None
+        except UnverifiedWarningClaim as claim:
+            cl_claim = claim
+
+        cl_end = cl_run(cl_body(**{field: value}))
+        cl_end_diag = cl_end["decision"]["response_diagnostics"]
+        cl_has_shape = number == 3
+
+        check(
+            f"Pattern {number}: shape attached only for pattern 3",
+            cl_claim is not None
+            and cl_claim.pattern_number == number
+            and (cl_claim.shape is not None) is cl_has_shape
+            and (cl_claim.shape_diagnostic() is not None) is cl_has_shape
+            and ("warning_claim_shape" in cl_end_diag) is cl_has_shape
+            and ("warning_claim_shape" in cl_end["log"]) is cl_has_shape
+            and (
+                find_unverified_warning_claim_shape(text) is not None
+            ) is (number in (1, 2, 3)),
+        )
+
+    # The shape finder follows the pattern 3 guard exactly, including
+    # its exclusion list and the whether/if exemption.
+    def cl_p3_hit(text):
+        text = text.translate(_INVISIBLE)
+
+        for match in UNVERIFIED_WARNING_CLAIM_PATTERNS[2].finditer(text):
+            lead = text[max(0, match.start() - 40):match.start()]
+
+            if not _CONDITIONAL_LEAD.search(lead):
+                return True
+
+        return False
+
+    cl_corpus_total = 0
+    cl_corpus_bad = []
+
+    for lead_in in ("", "Verify whether ", "If ", "Note: ", "Heat is high. "):
+        for no_word in ("no", "No", "NO"):
+            for qualifier in ("active", "Current", "official", "existing",
+                              "heat", "immediate"):
+                for between in ("", "heat ", "alert or ", "emergency ",
+                                "very heat alert ", "a b c "):
+                    for term in ("warning", "warnings", "advisory",
+                                 "advisories", "emergency instruction",
+                                 "Emergency  Instructions"):
+                        for tail in ("", " is in effect", " feed", " level",
+                                     " thresholds apply", ".", " for Dubai",
+                                     " and", "-level", " data source",
+                                     " was issued"):
+                            text = (
+                                f"{lead_in}{no_word} {qualifier} "
+                                f"{between}{term}{tail}"
+                            )
+                            number = find_unverified_warning_claim_pattern(
+                                text
+                            )
+                            found = find_unverified_warning_claim_shape(text)
+                            hit = cl_p3_hit(text)
+                            cl_corpus_total += 1
+
+                            if (found is not None) is not hit or (
+                                number == 3 and found is None
+                            ) or (
+                                number in (4, 5, None) and found is not None
+                            ) or (
+                                found is not None
+                                and (
+                                    "unknown" in found.values()
+                                    or found["words_between"]
+                                    not in (0, 1, 2)
+                                    or found["qualifier"]
+                                    not in _CLAIM_QUALIFIERS
+                                    or found["term_class"]
+                                    not in _CLAIM_TERM_CLASSES
+                                    or found["following_word_class"]
+                                    not in _CLAIM_FOLLOW_CLASSES
+                                )
+                            ):
+                                cl_corpus_bad.append(len(cl_corpus_bad))
+
+    check(
+        f"Shape finder matches the pattern 3 guard on {cl_corpus_total} "
+        "generated phrases",
+        cl_corpus_total > 10000 and cl_corpus_bad == [],
+    )
+
+    # ------------------------------------------------------------
+    # limitations and missing_evidence are program-owned.
+    # ------------------------------------------------------------
+    po_fields = ("limitations", "missing_evidence")
+    po_schema = RESPONSE_FORMAT["json_schema"]["schema"]
+    po_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Model schema no longer requests either program-owned field",
+        all(
+            field not in RESPONSE_FIELDS
+            and field not in LIST_FIELDS
+            and field not in po_schema["properties"]
+            and field not in po_schema["required"]
+            and f'"{field}"' not in json_text(RESPONSE_FORMAT)
+            for field in po_fields
+        )
+        and len(RESPONSE_FIELDS) == 16
+        and sorted(po_schema["properties"]) == sorted(RESPONSE_FIELDS)
+        and po_schema["additionalProperties"] is False,
+    )
+
+    check(
+        "Both fields are program-owned and the prompt no longer asks "
+        "for them",
+        all(field in PROGRAM_OWNED_FIELDS for field in po_fields)
+        and "and limitations" not in po_prompt
+        and "in limitations" not in po_prompt
+        and "9. Explain missing evidence. The assessment is never a "
+        "completed safety clearance." in po_prompt
+        and "explain why in its rationale." in po_prompt,
+    )
+
+    # Model-supplied versions are rejected as unexpected fields.
+    po_mark = "PO-MARK-5521"
+
+    for field in po_fields:
+        po_direct = adv_error({**adv_response(), field: [po_mark]})
+        po_bad = cl_run(cl_body(**{field: [po_mark]}))
+        po_bad_d = po_bad["decision"]
+
+        check(
+            f"Model-supplied {field} is rejected as program-owned",
+            po_direct
+            == f"Model output sets program-owned fields: {field}"
+            and [r["code"] for r in po_bad_d["incomplete_reasons"]]
+            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            and f"program-owned fields: {field}" in po_bad_d["reasoning"]
+            and po_bad_d["assessment_status"] == "INCOMPLETE"
+            and po_bad_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and po_bad_d["send_alert"] is False
+            and po_mark not in json_text(po_bad_d) + po_bad["log"]
+            + po_bad["report"],
+        )
+
+    # The program fills both lists deterministically.
+    po_expected_limitations = [
+        "Risk score not calculated because these dimensions could not "
+        "be assessed: exposure_score, geographic_impact_score.",
+        "The five-dimension risk score is the provisional internal "
+        "model in guidelines.md section 5. It is not an official "
+        "UAE/NCM classification.",
+        "Official NCM and emergency authority warnings were not "
+        "retrieved or verified by this implementation.",
+    ]
+    po_expected_missing = [
+        "Evidence required to score: exposure_score, "
+        "geographic_impact_score.",
+        "Current official NCM and relevant UAE emergency authority "
+        "warning status has not been retrieved and verified.",
+    ]
+    po_run_a = cl_run(cl_body())
+    po_run_b = cl_run(cl_body(
+        advice="Avoid outdoor work at midday.",
+        reasoning="PO-MARK-REASON " + "Heat screening triggered.",
+        recommended_actions=["PO-MARK-ACTION"],
+    ))
+    po_a, po_b = po_run_a["decision"], po_run_b["decision"]
+
+    check(
+        "Program populates both lists deterministically from evidence "
+        "and validation results",
+        po_a["limitations"] == po_expected_limitations
+        and po_a["missing_evidence"] == po_expected_missing
+        and po_b["limitations"] == po_a["limitations"]
+        and po_b["missing_evidence"] == po_a["missing_evidence"]
+        and "PO-MARK" not in json_text(
+            po_b["limitations"] + po_b["missing_evidence"]
+        )
+        and po_a["evidence_gate_overrides"]
+        == ["exposure_score", "geographic_impact_score"]
+        and [r["code"] for r in po_a["incomplete_reasons"]]
+        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
+    )
+
+    # Present and correctly typed in every kind of assessment.
+    po_claim = cl_run(cl_body(reasoning="There are no active warnings."))
+    po_error = cl_run(cl_body(**{"limitations": ["x"]}))
+    po_incomplete = incomplete_assessment("Assessment could not run.")
+
+    for label, assessment in (
+        ("assessment", po_a),
+        ("claim failure", po_claim["decision"]),
+        ("rejected response", po_error["decision"]),
+        ("incomplete_assessment()", po_incomplete),
+    ):
+        check(
+            f"Program-owned lists are present and typed: {label}",
+            all(
+                type(assessment.get(field)) is list
+                and all(type(item) is str for item in assessment[field])
+                for field in po_fields
+            )
+            and assessment["limitations"] != [],
+        )
+
+    check(
+        "Existing program explanations survive a claim failure",
+        po_claim["decision"]["official_warning_status"] == "NOT_CHECKED"
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
+        in [r["code"] for r in po_claim["decision"]["incomplete_reasons"]]
+        and any(
+            "unverified official-warning claim in reasoning" in item
+            for item in po_claim["decision"]["limitations"]
+        )
+        and po_claim["decision"]["warning_claim_diagnostic"]
+        == "field=reasoning;pattern=2",
+    )
+
+    # Both lists reach the console report and the Sheets payload.
+    po_payload = json.loads(
+        po_run_a["report"].split("OUTPUT PAYLOAD:", 1)[1].strip()
+    )
+    po_report = po_run_a["report"]
+
+    check(
+        "Both lists reach the console report and the Sheets payload",
+        json.loads(po_payload["limitations"]) == po_expected_limitations
+        and json.loads(po_payload["missing_evidence"])
+        == po_expected_missing
+        and "LIMITATIONS:" in po_report
+        and "MISSING EVIDENCE:" in po_report
+        and all(
+            f"- {item}" in po_report
+            for item in po_expected_limitations + po_expected_missing
+        ),
+    )
+
+    # The guard still scans every remaining model free-text field.
+    for field, value in (
+        ("hazard_type", "No official warning is in effect"),
+        ("advice", "There are no active warnings."),
+        ("reasoning", "No official heat advisory is in effect."),
+        ("likelihood_reason", "A heat warning is currently in effect."),
+        ("severity_reason", "NCM has not issued any warning."),
+        ("duration_reason", "No official warnings were checked."),
+        ("recommended_actions", ["There are no warnings."]),
+    ):
+        po_g = cl_run(cl_body(**{field: value}))["decision"]
+
+        check(
+            f"Claim in remaining model field still fails closed: {field}",
+            po_g["warning_claim_diagnostic"] is not None
+            and po_g["warning_claim_diagnostic"].startswith(
+                f"field={field};"
+            )
+            and "UNVERIFIED_WARNING_CLAIM"
+            in [r["code"] for r in po_g["incomplete_reasons"]]
+            and po_g["assessment_status"] == "INCOMPLETE"
+            and po_g["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and po_g["send_alert"] is False
+            and po_g["approval_status"] == "NOT_AUTHORIZED",
+        )
+
+    # Prompt: approved sentence and rules present exactly once.
+    cl_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    check(
+        "Prompt carries the warning-mention ban and status rule once",
+        cl_prompt.count("Official warning status is NOT_CHECKED "
+                        "(program-reported)") == 1
+        and cl_prompt.count("Free text must not use warning, warnings, "
+                            "advisory or advisories, or claim their "
+                            "existence, absence, availability or "
+                            "status") == 1
+        and "Do not mention official warnings" not in cl_prompt
+        and "Never write the words" not in cl_prompt
+        and cl_prompt.count("Open-Meteo is not an official UAE warning "
+                            "authority") == 1
+        and "Official warning status was not checked" not in cl_prompt
+        and "if mentioned" not in cl_prompt
+        and "active or inactive" not in cl_prompt,
+    )
+
+    # 7. Budgets: the limits are unchanged. The revised prompt's fit is
+    # proved by the realistic-history heat checks above, which build
+    # their request with this SYSTEM_PROMPT.
+    check(
+        "Request and token budgets are unchanged by the prompt revision",
+        MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500
+        and MAX_COMPLETION_TOKENS == 1000,
+    )
+
+    # ------------------------------------------------------------
+    # Variant B: the model is told not to discuss official warnings;
+    # the program reports the status (self-contained, offline).
+    # ------------------------------------------------------------
+    def vb_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+    def vb_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+        return {
+            "city": CITY, "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:00:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "apparent_temperature": 36, "precipitation": 0,
+                "wind_speed_10m": 10, "wind_gusts_10m": 20,
+                "visibility": 24140, "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {"high": 35, "low": 27, "wind": 14,
+                               "gust": 25, "precipitation": 0},
+            "previous_days": [],
+            "hourly_forecast_next_24h": [{
+                "time": (start + timedelta(hours=h)).strftime(
+                    "%Y-%m-%dT%H:%M"
+                ),
+                "temperature": 33, "apparent_temperature": 36,
+                "humidity": 55, "precipitation": 0, "wind": 10,
+                "gust": 20, "visibility": 24140, "weather_code": 1,
+                "cape": 0,
+            } for h in range(24)],
+            "history_summary": {},
+        }
+
+    vb_sent = []
+
+    def vb_capture(messages, temperature=0.1):
+        vb_sent.append(messages)
+        raise RuntimeError("captured")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        vb_policy = load_guidelines()
+        vb_required = select_hazard_guidance(vb_policy, {"HEAT": ["t"]})
+        vb_required += select_conditional_sections(
+            vb_policy, {"HEAT": ["t"]},
+            {"current": {"time": "2026-11-08T12:00"}},
+        )
+        vb_sections = search_guidelines(
+            vb_policy, "x", k=0, required_sections=vb_required
+        )
+
+    try:
+        vb_override(
+            {"ask_groq": vb_capture},
+            lambda: assess_weather(vb_weather(), [], vb_policy, vb_sections),
+        )
+    except RuntimeError:
+        pass
+
+    vb_user = vb_sent[0][1]["content"] if vb_sent else ""
+    vb_lead_in = vb_user.split("\n\n=== POLICY SECTION")[0]
+    vb_evidence = json.loads(vb_user.split("EVIDENCE AND STATUS (JSON):\n")[1])
+    vb_prompt = " ".join(SYSTEM_PROMPT.split())
+
+    # Prompt instruction validation.
+    check(
+        "Rule 4 wording is exactly the approved text",
+        "4. Official warning status is NOT_CHECKED (program-reported). "
+        "Free text must not use warning, warnings, advisory or "
+        "advisories, or claim their existence, absence, availability or "
+        "status; describe evidence limits without that. Follow the "
+        "schema. Open-Meteo is not an official UAE warning authority. "
+        "5. " in vb_prompt,
+    )
+
+    # Evidence status validation.
+    check(
+        "Evidence status is the short program-reported value",
+        vb_evidence["official_warning_status"]
+        == "NOT_CHECKED (program-reported)"
+        and "feed" not in json_text(vb_evidence["official_warning_status"])
+        and "No NCM" not in vb_user,
+    )
+
+    # Nothing the model is shown trips the unchanged guard.
+    vb_fixed_text = " ".join(
+        [SYSTEM_PROMPT, vb_lead_in]
+        + [json_text({
+            key: value for key, value in vb_evidence.items()
+            if key not in ("weather", "recent_agent_history")
+        })]
+    )
+    vb_sentences = re.split(r"(?<=[.!?])\s+", " ".join(vb_fixed_text.split()))
+
+    check(
+        "No fixed prompt or evidence sentence is flagged by the guard",
+        [s for s in vb_sentences
+         if find_unverified_warning_claim_pattern(s)] == [],
+    )
+
+    check(
+        "No retrieved policy line or canonical title is flagged",
+        [
+            line for section in vb_sections
+            for line in section["text"].splitlines()
+            if find_unverified_warning_claim_pattern(line)
+        ] == []
+        and [
+            section["section"] for section in vb_sections
+            if find_unverified_warning_claim_pattern(section["section"])
+        ] == [],
+    )
+
+    # Known false-positive paraphrases stay flagged (guard unchanged).
+    vb_known = (
+        ("No official warning information is integrated.", 3),
+        ("No official warnings are integrated.", 3),
+        ("No official warning is integrated, so status is unknown.", 3),
+        ("Official warning status is NOT_CHECKED, so no official "
+         "warnings are claimed.", 3),
+        ("No official heat advisories were available for review.", 3),
+        ("No official heat advisory information was retrieved.", 3),
+        ("No official emergency instructions were retrieved.", 3),
+        ("We do not claim any official warning is active or inactive.", 4),
+    )
+
+    for text, number in vb_known:
+        check(
+            f"Known paraphrase stays flagged (pattern {number}): "
+            f"{text[:46]}",
+            find_unverified_warning_claim_pattern(text) == number,
+        )
+
+    for text in (
+        "No official warning feed is integrated.",
+        "Official warning status is unknown.",
+        "Warnings have not been verified by this program.",
+    ):
+        check(
+            f"Wording outside the patterns still passes: {text[:46]}",
+            find_unverified_warning_claim_pattern(text) is None,
+        )
+
+    # Genuine warning claims remain blocked.
+    for text in (
+        "No official heat advisory is in effect.",
+        "There are no active warnings.",
+        "A heat warning is currently in effect.",
+        "NCM has not issued any warning.",
+    ):
+        check(
+            f"Genuine claim stays blocked: {text}",
+            find_unverified_warning_claim(text),
+        )
+
+    # Program-generated status survives a response with no warning
+    # wording, and the unchanged guard still rejects wording about it.
+    class VbResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def __init__(self, content):
+            self.content = content
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }
+
+    class VbTransport:
+        def __init__(self, content):
+            self.content = content
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(url)
+            return VbResponse(self.content)
+
+    def vb_reply(**changes):
+        body = {
+            "hazard_type": "Extreme Heat",
+            "likelihood_score": 3, "likelihood_reason": "lr",
+            "severity_score": 3, "severity_reason": "sr",
+            "exposure_score": 3, "exposure_reason": "er",
+            "duration_score": 3, "duration_reason": "dr",
+            "geographic_impact_score": 3,
+            "geographic_impact_reason": "gr",
+            "alert_recommendation": "MONITOR",
+            "advice": "Limit strenuous outdoor activity in the afternoon.",
+            "reasoning": "Apparent temperature reaches the heat "
+                         "screening value.",
+            "recommended_actions": ["Schedule outdoor work in the morning"],
+            "sources": ["6.1 Extreme Heat"],
+        }
+        body.update(changes)
+        return json_text(body)
+
+    def vb_run(content):
+        transport = VbTransport(content)
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                return run_weather_agent()[0]
+
+        return vb_override(
+            {
+                "HTTP": transport,
+                "GROQ_API_KEY": "gsk_vb_test_key",
+                "require_configuration": (
+                    lambda require_sheet=False: None
+                ),
+                "get_weather": lambda city: vb_weather(),
+                "tool_get_history": lambda n=3: [],
+            },
+            run,
+        )
+
+    vb_ok = vb_run(vb_reply())
+
+    check(
+        "Program-generated warning status is kept without model wording",
+        vb_ok["official_warning_status"] == "NOT_CHECKED"
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
+        in [r["code"] for r in vb_ok["incomplete_reasons"]]
+        and any(
+            "warnings were not retrieved or verified" in item
+            for item in vb_ok["limitations"]
+        )
+        and any(
+            "warning status has not been retrieved and verified" in item
+            for item in vb_ok["missing_evidence"]
+        )
+        and vb_ok["assessment_status"] == "INCOMPLETE"
+        and vb_ok["send_alert"] is False
+        and vb_ok["response_diagnostics"] == {},
+    )
+
+    check(
+        "Response with no warning wording passes the guard",
+        "UNVERIFIED_WARNING_CLAIM"
+        not in [r["code"] for r in vb_ok["incomplete_reasons"]]
+        and vb_ok["advice"]
+        == "Limit strenuous outdoor activity in the afternoon.",
+    )
+
+    vb_bad = vb_run(vb_reply(
+        reasoning="No official warnings are integrated, so none apply."
+    ))
+
+    check(
+        "Warning wording in reasoning still fails closed with a diagnostic",
+        vb_bad.get("warning_claim_diagnostic") == "field=reasoning;pattern=3"
+        and vb_bad["assessment_status"] == "INCOMPLETE"
+        and vb_bad["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and vb_bad["risk_score"] is None
+        and vb_bad["send_alert"] is False,
+    )
+
+    # Budgets with the revised prompt.
+    check(
+        "Budget limits are unchanged by Variant B",
+        MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500
+        and MAX_COMPLETION_TOKENS == 1000,
     )
 
     # agent-dry must not POST to Sheets or send email.
