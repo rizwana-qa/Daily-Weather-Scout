@@ -20,10 +20,17 @@ import requests
 
 CITY = os.getenv("WEATHER_CITY", "Dubai")
 
+# The guidelines are Dubai-specific, so Dubai is the only location this
+# program may assess. The request asks Open-Meteo for this timezone
+# explicitly instead of "auto".
+DUBAI_LOCATION = {
+    "city": "Dubai",
+    "latitude": 25.20,
+    "longitude": 55.27,
+    "timezone": "Asia/Dubai",
+}
+
 CITIES = {
-    "Lahore": (31.52, 74.32),
-    "Karachi": (24.86, 67.01),
-    "Islamabad": (33.69, 73.05),
     "Dubai": (25.20, 55.27),
 }
 
@@ -75,15 +82,23 @@ HTTP = requests.Session()
 
 def require_configuration(require_sheet=False):
     if CITY not in CITIES:
-        raise ValueError(
+        raise ConfigurationError(
             f"Unsupported city: {CITY}. Allowed cities: {list(CITIES)}"
         )
 
+    if CITY != DUBAI_LOCATION["city"] or CITIES[CITY] != (
+        DUBAI_LOCATION["latitude"], DUBAI_LOCATION["longitude"]
+    ):
+        raise ConfigurationError(
+            "The configured location does not match the approved Dubai "
+            "coordinates."
+        )
+
     if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY is not configured.")
+        raise ConfigurationError("GROQ_API_KEY is not configured.")
 
     if require_sheet and not SHEET_URL:
-        raise ValueError("SHEET_URL is not configured.")
+        raise ConfigurationError("SHEET_URL is not configured.")
 
 
 def safe_number(value):
@@ -152,9 +167,83 @@ def estimate_tokens(text):
 # 3. WEATHER DATA
 # ============================================================
 
+# ============================================================
+# 2a. CLASSIFIED FAILURES
+# ============================================================
+
+class ClassifiedFailure:
+    """
+    Mixin for failures whose cause is known. outcome uses the guidelines
+    section 11 vocabulary (INVALID or UNAVAILABLE) and failure_code is a
+    fixed label. baseline_name is the exception name these failures were
+    reported under before they were typed, so report text is unchanged.
+    An exception without this mixin is an INTERNAL_ERROR, never one of
+    these causes.
+    """
+
+    outcome = "INVALID"
+    failure_code = "INTERNAL_ERROR"
+    baseline_name = "Exception"
+
+
+class ConfigurationError(ClassifiedFailure, ValueError):
+    outcome = "INVALID"
+    failure_code = "CONFIGURATION_INVALID"
+    baseline_name = "ValueError"
+
+
+class PolicyUnavailableError(ClassifiedFailure, FileNotFoundError):
+    # Guidelines section 10: a missing policy file gives assessment_status
+    # UNAVAILABLE, which is also this run outcome.
+    outcome = "UNAVAILABLE"
+    failure_code = "POLICY_UNAVAILABLE"
+    baseline_name = "FileNotFoundError"
+
+
+class PolicyInvalidError(ClassifiedFailure, ValueError):
+    outcome = "INVALID"
+    failure_code = "POLICY_INVALID"
+    baseline_name = "ValueError"
+
+
+class WeatherUnavailableError(ClassifiedFailure, ValueError):
+    outcome = "UNAVAILABLE"
+    failure_code = "WEATHER_UNAVAILABLE"
+    baseline_name = "ValueError"
+
+    def __init__(self, message, baseline_name=None):
+        super().__init__(message)
+
+        if baseline_name is not None:
+            self.baseline_name = baseline_name
+
+
+class RequestBudgetError(ClassifiedFailure, ValueError):
+    outcome = "UNAVAILABLE"
+    failure_code = "REQUEST_BUDGET_EXCEEDED"
+    baseline_name = "ValueError"
+
+
+class ResponseInvalidError(ClassifiedFailure, ValueError):
+    outcome = "INVALID"
+    failure_code = "RESPONSE_INVALID"
+    baseline_name = "ValueError"
+
+
+def exception_label(exc):
+    """
+    The exception name used in report text: the baseline name for a
+    classified failure, so wording is unchanged, else the type name.
+    """
+    if isinstance(exc, ClassifiedFailure):
+        return exc.baseline_name
+
+    return type(exc).__name__
+
+
 def get_weather(city):
     if city not in CITIES:
-        raise ValueError(f"City not allowed: {city}")
+        raise ConfigurationError(f"City not allowed: {city}")
 
     latitude, longitude = CITIES[city]
 
@@ -194,24 +283,29 @@ def get_weather(city):
         ),
         "past_days": 5,
         "forecast_days": 2,
-        "timezone": "auto",
+        "timezone": DUBAI_LOCATION["timezone"],
     }
 
-    response = HTTP.get(
-        url,
-        params=params,
-        timeout=WEATHER_TIMEOUT,
-    )
-    response.raise_for_status()
-
-    raw = response.json()
+    try:
+        response = HTTP.get(
+            url,
+            params=params,
+            timeout=WEATHER_TIMEOUT,
+        )
+        response.raise_for_status()
+        raw = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        # Same report text as before; the cause is now classified.
+        raise WeatherUnavailableError(
+            str(exc), baseline_name=type(exc).__name__
+        ) from exc
 
     if not isinstance(raw, dict):
-        raise ValueError("Weather API returned an invalid response.")
+        raise WeatherUnavailableError("Weather API returned an invalid response.")
 
     for key in ("current", "hourly", "daily"):
         if not isinstance(raw.get(key), dict):
-            raise ValueError(
+            raise WeatherUnavailableError(
                 f"Weather API response is missing '{key}'."
             )
 
@@ -222,7 +316,7 @@ def get_weather(city):
     current_time = local_datetime(current.get("time"))
 
     if current_time is None:
-        raise ValueError(
+        raise WeatherUnavailableError(
             "Weather API returned an invalid current timestamp."
         )
 
@@ -326,7 +420,7 @@ def get_weather(city):
         break
 
     if not hourly_forecast and today_forecast is None:
-        raise ValueError("No usable current or forecast weather data.")
+        raise WeatherUnavailableError("No usable current or forecast weather data.")
 
     previous_winds = [
         day["wind"]
@@ -341,6 +435,7 @@ def get_weather(city):
             "longitude": longitude,
         },
         "timezone": raw.get("timezone"),
+        "location_observation": observe_location(raw),
         "source": "Open-Meteo",
         "source_type": (
             "Weather API, not an official UAE warning source"
@@ -359,6 +454,44 @@ def get_weather(city):
             ),
             "peak_wind": max(previous_winds, default=None),
         },
+    }
+
+
+# An IANA-style zone name ("Area/City"); anything else is not reported.
+_TIMEZONE_NAME = re.compile(
+    r"[A-Za-z][A-Za-z0-9_+-]{0,30}(?:/[A-Za-z0-9_+-]{1,30}){0,2}"
+)
+
+
+def observe_location(raw):
+    """
+    Observe-only record of where Open-Meteo says the data is for. It is
+    reported, never enforced: no tolerance for returned coordinates and
+    no utc_offset_seconds value has been verified against a real
+    response. Values are reduced to fixed shapes (a zone name, rounded
+    numbers, booleans), so no other provider text is copied.
+    """
+    zone = raw.get("timezone")
+    zone = (
+        zone if isinstance(zone, str) and _TIMEZONE_NAME.fullmatch(zone)
+        else None
+    )
+
+    def coordinate(key):
+        value = raw.get(key)
+
+        if type(value) in (int, float) and math.isfinite(value):
+            return round(float(value), 3)
+
+        return None
+
+    return {
+        "requested_timezone": DUBAI_LOCATION["timezone"],
+        "returned_timezone": zone,
+        "timezone_matches_request": zone == DUBAI_LOCATION["timezone"],
+        "returned_latitude": coordinate("latitude"),
+        "returned_longitude": coordinate("longitude"),
+        "utc_offset_seconds_present": "utc_offset_seconds" in raw,
     }
 
 
@@ -499,6 +632,22 @@ GROQ_ERROR_CODE_DESCRIPTIONS = {
 
 GROQ_GENERIC_ERROR_DESCRIPTION = "provider details withheld"
 
+# json_validate_failed has been observed with a provider message saying
+# the completion limit was reached before a valid document was generated
+# (a truncated generation). That message is matched against a closed
+# pattern and reduced to a fixed label; its text is never copied. Any
+# other message keeps the generic description above.
+_COMPLETION_LIMIT_MESSAGE = re.compile(
+    r"max completion tokens reached", re.IGNORECASE
+)
+
+GROQ_ERROR_REASON_DESCRIPTIONS = {
+    "completion_limit_reached": (
+        "the provider reported that the completion limit was reached "
+        "before a valid document was generated"
+    ),
+}
+
 # Provider identifiers (error.code, error.type) are passed on only when
 # they look like machine identifiers; anything else is withheld.
 _PROVIDER_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -535,6 +684,115 @@ def provider_error_fields(response):
     )
 
 
+def provider_error_reason(response):
+    """
+    A fixed reason label for a provider error, else None. Only
+    error.message is examined, only its first 300 characters, and only
+    to match the closed pattern above; the result is a key of
+    GROQ_ERROR_REASON_DESCRIPTIONS, never provider text.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+
+    if isinstance(message, str) and _COMPLETION_LIMIT_MESSAGE.search(
+        message[:300]
+    ):
+        return "completion_limit_reached"
+
+    return None
+
+
+# Fixed provider-error categories and the guidelines section 11 outcome
+# each maps to: problems with the generated output are INVALID; anything
+# that left the provider unable to answer is UNAVAILABLE.
+PROVIDER_ERROR_CATEGORIES = {
+    "AUTHENTICATION_FAILED": "UNAVAILABLE",
+    "REQUEST_TOO_LARGE": "UNAVAILABLE",
+    "RATE_LIMITED": "UNAVAILABLE",
+    "INVALID_REQUEST": "UNAVAILABLE",
+    "PROVIDER_UNAVAILABLE": "UNAVAILABLE",
+    "NETWORK_ERROR": "UNAVAILABLE",
+    "PROVIDER_ERROR_UNCLASSIFIED": "UNAVAILABLE",
+    "OUTPUT_TRUNCATED": "INVALID",
+    "OUTPUT_VALIDATION_UNSPECIFIED": "INVALID",
+    "RESPONSE_MALFORMED": "INVALID",
+}
+
+
+def provider_error_category(status_code, code, reason):
+    """
+    Fixed category for a Groq HTTP error, from the status, the validated
+    error code and the closed reason label only. A json_validate_failed
+    error without the completion-limit reason is not called a schema
+    failure: its cause is unspecified.
+    """
+    status = status_code if type(status_code) is int else None
+
+    if code == "json_validate_failed":
+        return (
+            "OUTPUT_TRUNCATED"
+            if reason == "completion_limit_reached"
+            else "OUTPUT_VALIDATION_UNSPECIFIED"
+        )
+
+    if status in (401, 403):
+        return "AUTHENTICATION_FAILED"
+
+    if status == 413:
+        return "REQUEST_TOO_LARGE"
+
+    if status in (429, 498):
+        return "RATE_LIMITED"
+
+    if status is not None and (status == 424 or 500 <= status <= 599):
+        return "PROVIDER_UNAVAILABLE"
+
+    if status is not None and 400 <= status <= 499:
+        return "INVALID_REQUEST"
+
+    return "PROVIDER_ERROR_UNCLASSIFIED"
+
+
+class ProviderError(ClassifiedFailure, RuntimeError):
+    """
+    A Groq request that produced no usable assessment. Holds only fixed
+    or validated values (category, status, identifier-shaped code and
+    type, closed reason label); never provider text.
+    """
+
+    failure_code = "PROVIDER_ERROR"
+    baseline_name = "RuntimeError"
+
+    def __init__(self, message, category, http_status=None, code=None,
+                 error_type=None, reason=None):
+        super().__init__(message)
+        self.category = (
+            category if category in PROVIDER_ERROR_CATEGORIES
+            else "PROVIDER_ERROR_UNCLASSIFIED"
+        )
+        self.outcome = PROVIDER_ERROR_CATEGORIES[self.category]
+        self.http_status = http_status if type(http_status) is int else None
+        self.code = safe_provider_identifier(code)
+        self.error_type = safe_provider_identifier(error_type)
+        self.reason = (
+            reason if reason in GROQ_ERROR_REASON_DESCRIPTIONS else None
+        )
+
+    def diagnostic(self):
+        return {
+            "category": self.category,
+            "http_status": self.http_status,
+            "code": self.code,
+            "type": self.error_type,
+            "reason": self.reason,
+        }
+
+
 def describe_groq_http_error(status_code, response):
     """
     Program-generated description of a Groq HTTP error. It contains only
@@ -543,6 +801,10 @@ def describe_groq_http_error(status_code, response):
     """
     status = status_code if type(status_code) is int else None
     code, error_type = provider_error_fields(response)
+    reason = (
+        provider_error_reason(response)
+        if code == "json_validate_failed" else None
+    )
 
     headers = getattr(response, "headers", None)
     retry_after = headers.get("retry-after") if hasattr(
@@ -561,7 +823,12 @@ def describe_groq_http_error(status_code, response):
         message
         + f"; provider code={code or 'unavailable'}, "
         f"type={error_type or 'unavailable'}: "
-        + GROQ_ERROR_CODE_DESCRIPTIONS.get(code, GROQ_GENERIC_ERROR_DESCRIPTION)
+        + (
+            GROQ_ERROR_REASON_DESCRIPTIONS.get(reason)
+            or GROQ_ERROR_CODE_DESCRIPTIONS.get(
+                code, GROQ_GENERIC_ERROR_DESCRIPTION
+            )
+        )
     )
 
 
@@ -569,7 +836,7 @@ def ask_groq(messages, temperature=0.1):
     LAST_GROQ_USAGE.clear()
 
     if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY is missing.")
+        raise ConfigurationError("GROQ_API_KEY is missing.")
 
     # Both guards measure the messages and the response schema.
     request_text = serialized_request(messages)
@@ -587,14 +854,14 @@ def ask_groq(messages, temperature=0.1):
     print("Response schema characters:", len(json_text(RESPONSE_FORMAT)))
 
     if len(request_text) > MAX_REQUEST_CHARS:
-        raise ValueError(
+        raise RequestBudgetError(
             "Groq request blocked: request (messages and response "
             f"schema) exceeds the configured {MAX_REQUEST_CHARS}-"
             "character limit."
         )
 
     if estimated_total > MAX_ESTIMATED_REQUEST_TOKENS:
-        raise ValueError(
+        raise RequestBudgetError(
             "Groq request blocked: estimated token usage exceeds "
             f"the configured {MAX_ESTIMATED_REQUEST_TOKENS}-token budget."
         )
@@ -612,19 +879,38 @@ def ask_groq(messages, temperature=0.1):
         "response_format": RESPONSE_FORMAT,
     }
 
-    response = HTTP.post(
-        GROQ_URL,
-        headers={
-            "Authorization": "Bearer " + GROQ_API_KEY,
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=GROQ_TIMEOUT,
-    )
+    try:
+        response = HTTP.post(
+            GROQ_URL,
+            headers={
+                "Authorization": "Bearer " + GROQ_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=GROQ_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        # Fixed text: the library message is not copied.
+        raise ProviderError(
+            "Groq request failed before a response was received ("
+            + type(exc).__name__ + ").",
+            "NETWORK_ERROR",
+        ) from exc
 
     if response.status_code != 200:
-        raise RuntimeError(
-            describe_groq_http_error(response.status_code, response)
+        code, error_type = provider_error_fields(response)
+        reason = (
+            provider_error_reason(response)
+            if code == "json_validate_failed" else None
+        )
+
+        raise ProviderError(
+            describe_groq_http_error(response.status_code, response),
+            provider_error_category(response.status_code, code, reason),
+            http_status=response.status_code,
+            code=code,
+            error_type=error_type,
+            reason=reason,
         )
 
     try:
@@ -634,8 +920,9 @@ def ask_groq(messages, temperature=0.1):
         finish_reason = choice.get("finish_reason")
     except (ValueError, KeyError, IndexError, TypeError,
             AttributeError) as exc:
-        raise RuntimeError(
-            "Groq returned an unexpected response structure."
+        raise ProviderError(
+            "Groq returned an unexpected response structure.",
+            "RESPONSE_MALFORMED",
         ) from exc
 
     usage = result.get("usage")
@@ -662,14 +949,18 @@ def ask_groq(messages, temperature=0.1):
         print(f"{key}: {value}")
 
     if finish_reason != "stop":
-        raise RuntimeError(
+        raise ProviderError(
             "Groq response is incomplete or was cut off: "
             f"finish_reason={finish_reason!r}. The completion allowance "
-            f"is {MAX_COMPLETION_TOKENS} tokens."
+            f"is {MAX_COMPLETION_TOKENS} tokens.",
+            "OUTPUT_TRUNCATED" if finish_reason == "length"
+            else "RESPONSE_MALFORMED",
         )
 
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("Groq returned an empty response.")
+        raise ProviderError(
+            "Groq returned an empty response.", "RESPONSE_MALFORMED"
+        )
 
     return content
 
@@ -684,12 +975,12 @@ def parse_json_response(response_text):
     try:
         result = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(
+        raise ResponseInvalidError(
             f"Groq returned invalid JSON: {exc}"
         ) from exc
 
     if not isinstance(result, dict):
-        raise ValueError("Groq response must be a JSON object.")
+        raise ResponseInvalidError("Groq response must be a JSON object.")
 
     return result
 
@@ -728,14 +1019,14 @@ def load_guidelines():
     print("File exists:", GUIDELINES_PATH.is_file())
 
     if not GUIDELINES_PATH.is_file():
-        raise FileNotFoundError(
+        raise PolicyUnavailableError(
             f"guidelines.md not found at {GUIDELINES_PATH}"
         )
 
     content = GUIDELINES_PATH.read_text(encoding="utf-8")
 
     if not content.strip():
-        raise ValueError("guidelines.md is empty.")
+        raise PolicyInvalidError("guidelines.md is empty.")
 
     chunks = {}
 
@@ -753,14 +1044,14 @@ def load_guidelines():
             continue
 
         if title in chunks:
-            raise ValueError(
+            raise PolicyInvalidError(
                 f"Duplicate policy heading found: {title}"
             )
 
         chunks[title] = body.strip()
 
     if not chunks:
-        raise ValueError(
+        raise PolicyInvalidError(
             "No Markdown sections found. "
             "Expected headings beginning with ##"
         )
@@ -1254,7 +1545,7 @@ def select_conditional_sections(policy, hazards, weather):
     )
 
     if missing:
-        raise ValueError(
+        raise PolicyInvalidError(
             "Conditional policy section is missing from "
             "guidelines.md: " + "; ".join(missing)
         )
@@ -1277,7 +1568,7 @@ def parse_hazard_sections(policy):
     )
 
     if parent is None:
-        raise ValueError(
+        raise PolicyInvalidError(
             "Weather hazard guidance is missing from guidelines.md: "
             "Weather Hazard Assessment"
         )
@@ -1291,7 +1582,7 @@ def parse_hazard_sections(policy):
         title = title.strip()
 
         if not title or title in blocks:
-            raise ValueError(
+            raise PolicyInvalidError(
                 f"Invalid or duplicate hazard heading: {title!r}"
             )
 
@@ -1339,7 +1630,7 @@ def select_hazard_guidance(policy, hazards):
             selected.append(title)
 
     if missing:
-        raise ValueError(
+        raise PolicyInvalidError(
             "Hazard guidance is missing from guidelines.md: "
             + "; ".join(missing)
         )
@@ -1374,14 +1665,14 @@ def search_guidelines(policy, query, k=1, required_sections=None):
     character budget is exceeded.
     """
     if not isinstance(policy, dict) or not policy.get("sections"):
-        raise ValueError("Loaded policy is invalid or empty.")
+        raise PolicyInvalidError("Loaded policy is invalid or empty.")
 
     chunks = policy["sections"]
 
     mandatory, missing = find_mandatory_sections(chunks)
 
     if missing:
-        raise ValueError(
+        raise PolicyInvalidError(
             "Required policy headings are missing from guidelines.md: "
             + "; ".join(missing)
         )
@@ -1489,7 +1780,7 @@ def search_guidelines(policy, query, k=1, required_sections=None):
 
     # Never silently remove mandatory policy content.
     if mandatory_chars > MAX_POLICY_CHARS:
-        raise ValueError(
+        raise RequestBudgetError(
             "Mandatory and hazard-relevant policy sections exceed the "
             f"{MAX_POLICY_CHARS}-character budget. "
             f"Required characters: {mandatory_chars}. "
@@ -1512,7 +1803,7 @@ def search_guidelines(policy, query, k=1, required_sections=None):
         total_chars = mandatory_chars + additional_chars
 
     if total_chars > MAX_POLICY_CHARS:
-        raise ValueError(
+        raise RequestBudgetError(
             "Policy retrieval exceeds the configured character budget. "
             "Mandatory safety sections have been preserved."
         )
@@ -1720,10 +2011,10 @@ def add_incomplete_reason(decision, code, detail=None):
 
 def validate_string_list(value, field_name):
     if not isinstance(value, list):
-        raise ValueError(f"{field_name} must be a list.")
+        raise ResponseInvalidError(f"{field_name} must be a list.")
 
     if any(not isinstance(item, str) for item in value):
-        raise ValueError(
+        raise ResponseInvalidError(
             f"{field_name} must contain only text values."
         )
 
@@ -2121,12 +2412,12 @@ def source_resolution_diagnostics(citations, retrieved_sections, policy=None):
 
 def validate_decision(decision, retrieved_sections):
     if not isinstance(decision, dict):
-        raise ValueError("AI returned an invalid assessment.")
+        raise ResponseInvalidError("AI returned an invalid assessment.")
 
     reserved = sorted(PROGRAM_OWNED_FIELDS & set(decision))
 
     if reserved:
-        raise ValueError(
+        raise ResponseInvalidError(
             "Model output sets program-owned fields: " + ", ".join(reserved)
         )
 
@@ -2138,14 +2429,14 @@ def validate_decision(decision, retrieved_sections):
     ]
 
     if missing:
-        raise ValueError(
+        raise ResponseInvalidError(
             "Missing assessment fields: " + ", ".join(missing)
         )
 
     recommendation = decision["alert_recommendation"]
 
     if recommendation not in VALID_RECOMMENDATIONS:
-        raise ValueError("Invalid alert recommendation.")
+        raise ResponseInvalidError("Invalid alert recommendation.")
 
     dimension_fields = (
         "likelihood_score",
@@ -2167,7 +2458,7 @@ def validate_decision(decision, retrieved_sections):
             decision[field] = None
             unassessed.append(field)
         elif type(value) is not int or not 1 <= value <= 5:
-            raise ValueError(
+            raise ResponseInvalidError(
                 f"Invalid risk dimension value: {field}"
             )
 
@@ -2184,17 +2475,17 @@ def validate_decision(decision, retrieved_sections):
             not isinstance(decision[field], str)
             or not decision[field].strip()
         ):
-            raise ValueError(f"Missing rationale: {field}")
+            raise ResponseInvalidError(f"Missing rationale: {field}")
 
     for field in ("hazard_type", "advice", "reasoning"):
         if not isinstance(decision[field], str):
-            raise ValueError(
+            raise ResponseInvalidError(
                 f"Invalid text field: {field} (expected text, "
                 f"received {type(decision[field]).__name__})"
             )
 
         if not decision[field].strip():
-            raise ValueError(f"Empty text field: {field}")
+            raise ResponseInvalidError(f"Empty text field: {field}")
 
     for field in (
         "recommended_actions",
@@ -2212,7 +2503,7 @@ def validate_decision(decision, retrieved_sections):
     )
 
     if not valid_sources:
-        raise ValueError(
+        raise ResponseInvalidError(
             "Assessment did not identify a valid retrieved policy section."
         )
 
@@ -2314,7 +2605,7 @@ def apply_evidence_gate(decision):
     return overridden
 
 
-class UnverifiedWarningClaim(ValueError):
+class UnverifiedWarningClaim(ClassifiedFailure, ValueError):
     """
     Model text asserts an official warning state that was not checked.
 
@@ -2334,6 +2625,10 @@ class UnverifiedWarningClaim(ValueError):
         self.shape = shape
         self.sources = []
         self.gate_overrides = []
+
+    outcome = "INVALID"
+    failure_code = "UNVERIFIED_WARNING_CLAIM"
+    baseline_name = "UnverifiedWarningClaim"
 
     def diagnostic(self):
         """"field=<label>;pattern=<n>" built from fixed values only."""
@@ -2495,6 +2790,8 @@ PROGRAM_OWNED_FIELDS = frozenset({
     "timezone", "history_checked", "history_status",
     "response_diagnostics", "evidence_gate_overrides",
     "warning_claim_diagnostic", "limitations", "missing_evidence",
+    "provider_error", "location_observation", "run_outcome",
+    "failure_code", "failure_stage",
 })
 
 
@@ -2721,18 +3018,31 @@ def model_strings(value):
             yield from model_strings(item)
 
 
+# Official warning verification, reported separately from assessment
+# validity. No warning provider is integrated, so NOT_CHECKED is the
+# only status this program produces; the other values are reserved for
+# a future, separately approved feed.
+WARNING_VERIFICATION_STATES = (
+    "NOT_CHECKED", "VERIFIED_NONE", "VERIFIED_ACTIVE", "UNAVAILABLE",
+)
+
+
+def official_warning_verification():
+    """The single source of the official warning verification state."""
+    return {"status": "NOT_CHECKED", "authority": None, "validity": None}
+
+
 def reject_unverified_warning_claims(decision, official_warning_status):
     """
     Fail closed when model text states that an official warning or
-    advisory is, or is not, in effect while official warnings have not
-    been verified. official_warning_status comes from the program,
-    never from the model. Every string in every model field is checked,
-    including keys outside the schema. The error names the field,
-    never its content.
+    advisory is, or is not, in effect. The check runs under every
+    verification status: no warning feed is integrated, so there is no
+    verified state to compare a claim against. official_warning_status
+    comes from the program, never from the model, and is only named in
+    the error. Every string in every model field is checked, including
+    keys outside the schema. The error names the field, never its
+    content.
     """
-    if official_warning_status == "VERIFIED":
-        return decision
-
     for field, value in decision.items():
         # Top-level key names are model text too. Only schema field
         # names are echoed in the error; any other key name is
@@ -2765,20 +3075,45 @@ def reject_unverified_warning_claims(decision, official_warning_status):
 
 def enforce_assessment_status(decision):
     """
-    Official warning verification is a required evidence dependency.
-    An assessment can only be COMPLETE when it has been VERIFIED;
-    any other warning status, including a missing one, forces
-    INCOMPLETE. No official warning feed is integrated today.
+    Assessment validity, independent of official warning verification
+    (guidelines section 11). An assessment is COMPLETE only when the
+    policy and the weather evidence are available, a risk score was
+    calculated and no incomplete reason is recorded. When the policy file
+    could not be retrieved the status is UNAVAILABLE (section 10); every
+    other case is INCOMPLETE. Official warning status is reported
+    separately and governs alert authorization, which this program never
+    grants.
     """
-    status = decision.get("official_warning_status")
+    complete = (
+        not decision.get("incomplete_reasons")
+        and decision.get("risk_score") is not None
+        and decision.get("policy_status") == "AVAILABLE"
+        and decision.get("weather_retrieval_status") == "AVAILABLE"
+    )
 
-    if status != "VERIFIED":
-        decision["assessment_status"] = "INCOMPLETE"
-        add_incomplete_reason(
-            decision,
-            "OFFICIAL_WARNINGS_NOT_VERIFIED",
-            f"official_warning_status={status}",
-        )
+    decision["assessment_status"] = (
+        "COMPLETE" if complete
+        else "UNAVAILABLE" if decision.get("policy_status") == "UNAVAILABLE"
+        else "INCOMPLETE"
+    )
+
+    return decision
+
+
+def apply_alert_authorization(decision, assessment_failed):
+    """
+    The only place the decision's alert fields are set. This program
+    never authorizes an alert: send_alert is always False and no message
+    is prepared. A failed assessment is NOT_AUTHORIZED; any other result
+    waits for human review (guidelines section 14). The output payload
+    separately hard-codes send_alert False.
+    """
+    decision["approval_status"] = (
+        "NOT_AUTHORIZED" if assessment_failed else "PENDING_REVIEW"
+    )
+    decision["send_alert"] = False
+    decision["alert_message"] = ""
+    decision["notification_status"] = "NOT_SENT"
 
     return decision
 
@@ -2817,7 +3152,9 @@ def apply_official_warning_guard(decision):
         "UAE/NCM classification."
     )
 
-    decision["official_warning_status"] = "NOT_CHECKED"
+    decision["official_warning_status"] = (
+        official_warning_verification()["status"]
+    )
     enforce_assessment_status(decision)
 
     decision["missing_evidence"].append(
@@ -2880,7 +3217,7 @@ def format_policy_text(sections):
             or POLICY_BLOCK_END in item["text"]
             or "\n" in item["section"]
         ):
-            raise ValueError(
+            raise PolicyInvalidError(
                 "Policy section cannot be rendered safely: "
                 + item["section"]
             )
@@ -2902,7 +3239,9 @@ def assess_weather(weather, history, policy, retrieved_sections):
         "weather": compact_weather,
         "recent_agent_history": compact_history,
         "policy_version": policy["version"],
-        "official_warning_status": "NOT_CHECKED (program-reported)",
+        "official_warning_status": (
+            official_warning_verification()["status"] + " (program-reported)"
+        ),
         "risk_score_notice": (
             "Any risk score is an internal provisional calculation made "
             "by the program, not an official UAE or NCM classification, "
@@ -2967,7 +3306,9 @@ def assess_weather(weather, history, policy, retrieved_sections):
     # Checked on the model's own text, before the guard adds ours. The
     # warning status is the program's: no official feed is integrated.
     try:
-        decision = reject_unverified_warning_claims(decision, "NOT_CHECKED")
+        decision = reject_unverified_warning_claims(
+            decision, official_warning_verification()["status"]
+        )
     except UnverifiedWarningClaim as claim:
         # Validation has already run: the sources are canonical retrieved
         # titles and the override names are fixed program values.
@@ -3050,19 +3391,26 @@ def run_weather_agent():
 
     history_status = "NOT_CHECKED"
 
+    # Recorded for diagnosis only; the failure classification comes from
+    # the exception type, never from the stage.
+    stage = "configuration"
+
     try:
         # A sheet URL is optional for a dry-run assessment.
         require_configuration(require_sheet=False)
 
         # Load policy.
+        stage = "policy"
         policy = load_guidelines()
         used.append("load_guidelines")
 
         # Retrieve weather.
+        stage = "weather"
         weather = get_weather(CITY)
         used.append("get_weather")
 
         # Retrieve recent history if a sheet URL is available.
+        stage = "history"
         history_result = tool_get_history(MAX_HISTORY_RECORDS)
         used.append("get_history")
 
@@ -3083,10 +3431,12 @@ def run_weather_agent():
         # Identify hazards from the retrieved weather evidence and
         # attach the complete matching section 6 guidance. Anything
         # that cannot fit the budget raises and fails safely.
+        stage = "screening"
         hazards = identify_hazards(weather)
         used.append("identify_hazards")
         print("Hazards identified:", sorted(hazards))
 
+        stage = "retrieval"
         hazard_sections = select_hazard_guidance(policy, hazards)
         conditional_sections = select_conditional_sections(
             policy, hazards, weather
@@ -3104,8 +3454,9 @@ def run_weather_agent():
         used.append("search_guidelines")
 
         if not retrieved_sections:
-            raise ValueError("No policy sections were retrieved.")
+            raise PolicyInvalidError("No policy sections were retrieved.")
 
+        stage = "assessment"
         decision = assess_weather(
             weather,
             history,
@@ -3113,9 +3464,14 @@ def run_weather_agent():
             retrieved_sections,
         )
 
+        stage = "finalize"
+
         # Explicitly record evidence limitations.
-        decision["official_warning_status"] = "NOT_CHECKED"
-        decision["official_warning_authority"] = None
+        warning_verification = official_warning_verification()
+        decision["official_warning_status"] = warning_verification["status"]
+        decision["official_warning_authority"] = (
+            warning_verification["authority"]
+        )
 
         decision["evidence_quality"] = "E3"
         decision["evidence_confidence"] = "LOW"
@@ -3138,6 +3494,9 @@ def run_weather_agent():
         decision["tools_used"] = used
 
         decision["weather_summary"] = summarize_weather(weather)
+        decision["location_observation"] = weather.get(
+            "location_observation"
+        )
         decision["hazard_screening"] = hazards
         decision["groq_usage"] = dict(LAST_GROQ_USAGE)
         decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
@@ -3162,17 +3521,22 @@ def run_weather_agent():
 
         # An assessment with unverified official warnings cannot
         # authorize a notification.
-        decision["approval_status"] = "PENDING_REVIEW"
-        decision["send_alert"] = False
-        decision["alert_message"] = ""
-        decision["notification_status"] = "NOT_SENT"
+        apply_alert_authorization(decision, assessment_failed=False)
 
         enforce_assessment_status(decision)
+
+        decision["run_outcome"] = (
+            "COMPLETE" if decision["assessment_status"] == "COMPLETE"
+            else "INCOMPLETE"
+        )
+        decision["failure_code"] = None
+        decision["failure_stage"] = None
 
         return decision, used
 
     except Exception as exc:
-        error_message = f"{type(exc).__name__}: {exc}"
+        run_outcome, run_failure_code = classify_failure(exc)
+        error_message = f"{exception_label(exc)}: {exc}"
 
         print("\nASSESSMENT ERROR:", error_message)
 
@@ -3180,7 +3544,7 @@ def run_weather_agent():
 
         if isinstance(exc, UnverifiedWarningClaim):
             failure_code = "UNVERIFIED_WARNING_CLAIM"
-        elif isinstance(exc, FileNotFoundError):
+        elif isinstance(exc, PolicyUnavailableError):
             failure_code = "POLICY_UNAVAILABLE"
         else:
             failure_code = "ASSESSMENT_ERROR"
@@ -3190,7 +3554,7 @@ def run_weather_agent():
             failure_code,
             exc.diagnostic()
             if isinstance(exc, UnverifiedWarningClaim)
-            else type(exc).__name__,
+            else exception_label(exc),
         )
 
         if isinstance(exc, UnverifiedWarningClaim):
@@ -3203,7 +3567,10 @@ def run_weather_agent():
             ]
             decision["warning_claim_diagnostic"] = exc.diagnostic()
 
-        if isinstance(exc, FileNotFoundError):
+        if isinstance(exc, ProviderError):
+            decision["provider_error"] = exc.diagnostic()
+
+        if isinstance(exc, PolicyUnavailableError):
             decision["policy_status"] = "UNAVAILABLE"
         elif policy is not None:
             decision["policy_status"] = "AVAILABLE"
@@ -3220,7 +3587,9 @@ def run_weather_agent():
 
         decision["policy_path"] = str(GUIDELINES_PATH)
 
-        decision["official_warning_status"] = "NOT_CHECKED"
+        decision["official_warning_status"] = (
+            official_warning_verification()["status"]
+        )
         decision["groq_usage"] = dict(LAST_GROQ_USAGE)
         decision["response_diagnostics"] = dict(LAST_RESPONSE_DIAGNOSTICS)
         decision["hazard_screening"] = hazards
@@ -3229,14 +3598,13 @@ def run_weather_agent():
         decision["evidence_confidence"] = "NONE"
 
         enforce_assessment_status(decision)
-
-        decision["approval_status"] = "NOT_AUTHORIZED"
-        decision["send_alert"] = False
-        decision["alert_message"] = ""
-        decision["notification_status"] = "NOT_SENT"
+        apply_alert_authorization(decision, assessment_failed=True)
 
         decision["weather_retrieval_status"] = (
             "AVAILABLE" if weather else "UNAVAILABLE"
+        )
+        decision["location_observation"] = (
+            weather.get("location_observation") if weather else None
         )
 
         decision["history_status"] = history_status
@@ -3248,6 +3616,10 @@ def run_weather_agent():
         decision["city"] = CITY
         decision["tools_used"] = used
 
+        decision["run_outcome"] = run_outcome
+        decision["failure_code"] = run_failure_code
+        decision["failure_stage"] = stage
+
         return decision, used
 
 
@@ -3255,8 +3627,293 @@ def run_weather_agent():
 # 12. OUTPUT AND GOOGLE SHEETS INTEGRATION
 # ============================================================
 
+# ============================================================
+# 11a. RUN OUTCOME REPORTING
+# ============================================================
+
+# Exit code for each run outcome (guidelines section 11 vocabulary).
+# These are process exit codes: 0 means COMPLETE only, and the program
+# never reports INCOMPLETE as a success (it exits 2). The workflow step
+# turns exit code 2 into a passing job with one warning (weather.yml).
+RUN_OUTCOME_EXIT_CODES = {
+    "COMPLETE": 0,
+    "INCOMPLETE": 2,
+    "INVALID": 1,
+    "UNAVAILABLE": 1,
+}
+
+FAILURE_CODES = (
+    "CONFIGURATION_INVALID", "POLICY_UNAVAILABLE", "POLICY_INVALID",
+    "WEATHER_UNAVAILABLE", "REQUEST_BUDGET_EXCEEDED", "PROVIDER_ERROR",
+    "RESPONSE_INVALID", "UNVERIFIED_WARNING_CLAIM", "SHEETS_WRITE_FAILED",
+    "INTERNAL_ERROR",
+)
+
+RUN_STAGES = (
+    "configuration", "policy", "weather", "history", "screening",
+    "retrieval", "assessment", "finalize", "report", "sheets",
+)
+
+INCOMPLETE_REASON_CODES = (
+    "RISK_DIMENSIONS_UNASSESSED", "WEATHER_EVIDENCE_UNCERTAIN",
+    "ASSESSMENT_ERROR", "UNVERIFIED_WARNING_CLAIM", "POLICY_UNAVAILABLE",
+)
+
+ASSESSMENT_STATUSES = ("COMPLETE", "INCOMPLETE", "INVALID", "UNAVAILABLE")
+
+_CLAIM_DIAGNOSTIC_TEXT = re.compile(r"field=[a-z_]{1,40};pattern=[1-5]")
+
+
+class SheetsWriteError(ClassifiedFailure, RuntimeError):
+    outcome = "UNAVAILABLE"
+    failure_code = "SHEETS_WRITE_FAILED"
+    baseline_name = "RuntimeError"
+
+    def __init__(self, message, baseline_name=None):
+        super().__init__(message)
+
+        if baseline_name is not None:
+            self.baseline_name = baseline_name
+
+
+def classify_failure(exc):
+    """
+    (outcome, failure_code) for a failure. Only classified failures map
+    to a known cause; any other exception is an INTERNAL_ERROR, whatever
+    stage it was raised in.
+    """
+    if isinstance(exc, ClassifiedFailure):
+        outcome = (
+            exc.outcome if exc.outcome in ("INVALID", "UNAVAILABLE")
+            else "INVALID"
+        )
+        code = (
+            exc.failure_code if exc.failure_code in FAILURE_CODES
+            else "INTERNAL_ERROR"
+        )
+
+        return outcome, code
+
+    return "INVALID", "INTERNAL_ERROR"
+
+
+def run_outcome_of(decision):
+    """The decision's run outcome; anything unrecognised is INVALID."""
+    outcome = decision.get("run_outcome")
+
+    return outcome if outcome in RUN_OUTCOME_EXIT_CODES else "INVALID"
+
+
+def _fixed(value, allowed):
+    return value if value in allowed else "unknown"
+
+
+def outcome_fields(decision, outcome):
+    """
+    Fixed-vocabulary summary of a run for annotations and the step
+    summary. Every value is checked against a closed set (or is a count
+    or boolean); model text, provider text and weather values never
+    appear.
+    """
+    reasons = [
+        _fixed(reason.get("code"), INCOMPLETE_REASON_CODES)
+        for reason in decision.get("incomplete_reasons", [])
+        if isinstance(reason, dict)
+    ]
+    provider = decision.get("provider_error")
+    claim = decision.get("warning_claim_diagnostic")
+    observation = decision.get("location_observation")
+    sources = decision.get("sources")
+
+    def flag(key):
+        value = observation.get(key) if isinstance(observation, dict) else None
+        return value if type(value) is bool else None
+
+    return {
+        "outcome": _fixed(outcome, RUN_OUTCOME_EXIT_CODES),
+        "exit_code": RUN_OUTCOME_EXIT_CODES.get(outcome, 1),
+        "assessment_status": _fixed(
+            decision.get("assessment_status"), ASSESSMENT_STATUSES
+        ),
+        "alert_recommendation": _fixed(
+            decision.get("alert_recommendation"), VALID_RECOMMENDATIONS
+        ),
+        "incomplete_reasons": reasons,
+        "failure_code": (
+            _fixed(decision.get("failure_code"), FAILURE_CODES)
+            if decision.get("failure_code") is not None else "none"
+        ),
+        "failure_stage": (
+            _fixed(decision.get("failure_stage"), RUN_STAGES)
+            if decision.get("failure_stage") is not None else "none"
+        ),
+        "provider_category": (
+            _fixed(provider.get("category"), PROVIDER_ERROR_CATEGORIES)
+            if isinstance(provider, dict) else "none"
+        ),
+        "warning_claim": (
+            claim if isinstance(claim, str)
+            and _CLAIM_DIAGNOSTIC_TEXT.fullmatch(claim)
+            else "none" if claim is None else "unknown"
+        ),
+        "official_warning_status": _fixed(
+            decision.get("official_warning_status"),
+            WARNING_VERIFICATION_STATES,
+        ),
+        "hazards_screened": sorted(
+            code for code in (decision.get("hazard_screening") or {})
+            if code in HAZARD_POLICY_TITLES
+        ),
+        "policy_sources_cited": (
+            len(sources) if isinstance(sources, list) else 0
+        ),
+        "location_timezone_matches": flag("timezone_matches_request"),
+        "location_utc_offset_present": flag("utc_offset_seconds_present"),
+    }
+
+
+def _workflow_message(value):
+    """Escape a workflow-command message (GitHub Actions rules)."""
+    return (
+        str(value).replace("%", "%25").replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def outcome_annotation(fields):
+    """One GitHub Actions annotation line built from outcome_fields."""
+    outcome = fields["outcome"]
+
+    if outcome == "COMPLETE":
+        level = "notice"
+        message = (
+            f"exit_code={fields['exit_code']}"
+            f" | recommendation={fields['alert_recommendation']}"
+        )
+    elif outcome == "INCOMPLETE":
+        # A notice, not a warning: under GitHub Actions the workflow step
+        # raises the single INCOMPLETE warning from the exit code, so a
+        # passing run can never lack one. This line keeps the reasons.
+        level = "notice"
+        message = (
+            f"exit_code={fields['exit_code']}"
+            f" | reasons={','.join(fields['incomplete_reasons']) or 'none'}"
+            f" | warnings={fields['official_warning_status']}"
+        )
+    else:
+        level = "error"
+        message = (
+            f"exit_code={fields['exit_code']}"
+            f" | failure={fields['failure_code']}"
+            f" | stage={fields['failure_stage']}"
+            f" | provider={fields['provider_category']}"
+            f" | claim={fields['warning_claim']}"
+        )
+
+    return (
+        f"::{level} title=Assessment {outcome}::"
+        + _workflow_message(message)
+    )
+
+
+def outcome_summary_markdown(fields):
+    """Step-summary table built from outcome_fields only."""
+    def show(value):
+        if value is True:
+            return "yes"
+
+        if value is False:
+            return "no"
+
+        if value is None:
+            return "unknown"
+
+        if isinstance(value, list):
+            return ", ".join(value) or "none"
+
+        return str(value)
+
+    rows = (
+        ("Outcome", fields["outcome"]),
+        ("Exit code", fields["exit_code"]),
+        ("Assessment status", fields["assessment_status"]),
+        ("Recommendation", fields["alert_recommendation"]),
+        ("Incomplete reasons", fields["incomplete_reasons"]),
+        ("Failure code", fields["failure_code"]),
+        ("Failure stage", fields["failure_stage"]),
+        ("Provider error", fields["provider_category"]),
+        ("Warning claim", fields["warning_claim"]),
+        ("Official warning status", fields["official_warning_status"]),
+        ("Hazards screened", fields["hazards_screened"]),
+        ("Policy sources cited", fields["policy_sources_cited"]),
+        ("Location timezone matches request",
+         fields["location_timezone_matches"]),
+        ("UTC offset field present", fields["location_utc_offset_present"]),
+    )
+
+    return (
+        "### Weather assessment run\n\n| Field | Value |\n|---|---|\n"
+        + "".join(f"| {name} | {show(value)} |\n" for name, value in rows)
+        + "\n"
+    )
+
+
+def emit_outcome(decision, outcome):
+    """
+    Report the run outcome: always as one program-generated log line;
+    under GitHub Actions also as one annotation and a step-summary
+    table. Writes only to stdout and the runner's local summary file.
+    A summary write failure never changes the outcome.
+    """
+    fields = outcome_fields(decision, outcome)
+    print("\nRUN OUTCOME (program-generated):", json_text(fields))
+
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return fields
+
+    print(outcome_annotation(fields))
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(outcome_summary_markdown(fields))
+        except OSError:
+            print("STEP SUMMARY: not written (file error).")
+
+    return fields
+
+
+# Assessment status of the run that run_agent_job is currently reporting,
+# so a failure while reporting can name it. Reset at the start of every
+# run; None until that run has an assessment.
+LAST_REPORTED_ASSESSMENT = {"status": None}
+
+
+def emit_unhandled_failure(exc):
+    """Report a failure raised outside run_weather_agent, then let it
+    propagate (exit 1, traceback kept)."""
+    outcome, failure_code = classify_failure(exc)
+    stage = (
+        "sheets" if isinstance(exc, SheetsWriteError)
+        else "configuration" if isinstance(exc, ConfigurationError)
+        else "report"
+    )
+
+    return emit_outcome(
+        {
+            "run_outcome": outcome, "failure_code": failure_code,
+            "failure_stage": stage,
+            "assessment_status": LAST_REPORTED_ASSESSMENT.get("status"),
+        },
+        outcome,
+    )
+
+
 def run_agent_job(dry=False):
+    LAST_REPORTED_ASSESSMENT["status"] = None
     decision, used = run_weather_agent()
+    LAST_REPORTED_ASSESSMENT["status"] = decision.get("assessment_status")
 
     print("\n========== WEATHER ASSESSMENT ==========")
 
@@ -3328,6 +3985,10 @@ def run_agent_job(dry=False):
         decision.get("official_warning_status"),
     )
     print("ALERT AUTHORIZED:", decision.get("send_alert"))
+    print(
+        "LOCATION OBSERVATION (program-generated; not enforced):",
+        json_text(decision.get("location_observation")),
+    )
     print("NOTIFICATION:", decision.get("notification_status"))
 
     print("\nLIMITATIONS:")
@@ -3403,31 +4064,43 @@ def run_agent_job(dry=False):
         ),
     }
 
+    outcome = run_outcome_of(decision)
+
     if dry:
         print("\nDRY RUN: No data was sent to Google Sheets.")
         print("DRY RUN: No email was sent.")
+        # The payload stays the last output, as before.
+        emit_outcome(decision, outcome)
         print("\nOUTPUT PAYLOAD:")
         print(json_text(payload))
-        return
+        return outcome
 
     # A normal agent run can write to Sheets, but only after
     # the explicit configuration check below.
     require_configuration(require_sheet=True)
 
-    response = HTTP.post(
-        SHEET_URL,
-        json=payload,
-        timeout=SHEET_TIMEOUT,
-    )
+    try:
+        response = HTTP.post(
+            SHEET_URL,
+            json=payload,
+            timeout=SHEET_TIMEOUT,
+        )
 
-    print("\nSHEET RESPONSE:", response.status_code, response.text)
+        print("\nSHEET RESPONSE:", response.status_code, response.text)
 
-    response.raise_for_status()
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise SheetsWriteError(
+            str(exc), baseline_name=type(exc).__name__
+        ) from exc
 
     if response.text.strip() != "OK":
-        raise SystemExit(
+        raise SheetsWriteError(
             "Google Apps Script did not confirm success."
         )
+
+    emit_outcome(decision, outcome)
+    return outcome
 
 
 # ============================================================
@@ -3437,6 +4110,12 @@ def run_agent_job(dry=False):
 def run_tests():
     passed = 0
     failed = 0
+
+    # Tests must never write workflow annotations or a step summary.
+    saved_actions_env = {
+        name: os.environ.pop(name, None)
+        for name in ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")
+    }
 
     def check(name, condition):
         nonlocal passed, failed
@@ -3533,7 +4212,7 @@ def run_tests():
     )
 
     check(
-        "Status helper only allows COMPLETE when warnings verified",
+        "Status helper never accepts a claimed COMPLETE or VERIFIED label",
         enforce_assessment_status({
             "assessment_status": "COMPLETE",
             "official_warning_status": "NOT_CHECKED",
@@ -3544,7 +4223,7 @@ def run_tests():
         and enforce_assessment_status({
             "assessment_status": "COMPLETE",
             "official_warning_status": "VERIFIED",
-        })["assessment_status"] == "COMPLETE",
+        })["assessment_status"] == "INCOMPLETE",
     )
 
     # Band boundaries from guidelines.md section 5.
@@ -4554,11 +5233,14 @@ def run_tests():
     )
 
     check(
-        "Benign weather completes retrieval and stays INCOMPLETE",
+        "Benign weather with every dimension evidenced is COMPLETE, no alert",
         benign_decision["hazard_screening"] == {}
-        and benign_decision["assessment_status"] == "INCOMPLETE"
+        and benign_decision["assessment_status"] == "COMPLETE"
+        and benign_decision.get("incomplete_reasons", []) == []
+        and benign_decision["official_warning_status"] == "NOT_CHECKED"
         and benign_decision["alert_recommendation"] == "MONITOR"
         and benign_decision["send_alert"] is False
+        and benign_decision["approval_status"] == "PENDING_REVIEW"
         and len(sent_messages) == 1
         and len(serialized_request(sent_messages[0])) <= MAX_REQUEST_CHARS,
     )
@@ -5047,11 +5729,13 @@ def run_tests():
         Path(__file__).resolve().parent
         / ".github" / "workflows" / "weather.yml"
     )
-    workflow_commands = [
-        line.strip() for line in
-        workflow_path.read_text(encoding="utf-8").splitlines()
-        if "weather_log.py" in line
-    ] if workflow_path.is_file() else []
+    workflow_text = (
+        workflow_path.read_text(encoding="utf-8")
+        if workflow_path.is_file() else ""
+    )
+    workflow_modes = re.findall(
+        r"python\s+weather_log\.py\s+(\S+)", workflow_text
+    )
 
     original_directory = os.getcwd()
 
@@ -5068,11 +5752,251 @@ def run_tests():
     check(
         "Workflow runs this weather_log.py in dry-run mode only and "
         "the policy loads from beside the script",
-        workflow_commands == ["- run: python weather_log.py agent-dry"]
+        workflow_modes == ["agent-dry"]
+        and not re.search(r"weather_log\.py\s+agent(?!-dry)", workflow_text)
         and Path(loaded_elsewhere["path"]).resolve()
         == (Path(__file__).resolve().parent / "guidelines.md")
         and loaded_elsewhere["hash"] == hazard_policy["hash"],
     )
+
+    # ------------------------------------------------------------
+    # Workflow exit-code handling. weather_log.py exits 0 (COMPLETE),
+    # 2 (INCOMPLETE), or 1 (INVALID, UNAVAILABLE, INTERNAL_ERROR); the
+    # dry-run step must pass 0, warn on 2, and fail on everything else.
+    # ------------------------------------------------------------
+    def wf_run_block():
+        lines = workflow_text.splitlines()
+
+        for index, line in enumerate(lines):
+            if line.strip() == "run: |":
+                indent = len(line) - len(line.lstrip())
+                body = []
+
+                for item in lines[index + 1:]:
+                    if item.strip() and len(item) - len(item.lstrip()) <= indent:
+                        break
+
+                    body.append(item[indent + 2:] if item.strip() else "")
+
+                return "\n".join(body).rstrip() + "\n"
+
+        return ""
+
+    wf_script = wf_run_block()
+    wf_warning_text = (
+        "::warning title=Weather assessment INCOMPLETE::The program reported "
+        "an INCOMPLETE assessment (exit code 2). This is an expected "
+        "outcome, not an execution failure. This dry run sends no alert. "
+        "See the job summary for the reasons."
+    )
+
+    check(
+        "Workflow: exit codes 0, 1, 2 and any other are handled explicitly",
+        wf_script.count("python weather_log.py agent-dry") == 1
+        and "code=0\n" in wf_script
+        and re.search(r'python weather_log\.py agent-dry \|\| code=\$\?', wf_script)
+        is not None
+        and 'case "$code" in' in wf_script
+        and re.search(r"^\s*0\) ;;$", wf_script, re.M) is not None
+        and re.search(r"^\s*1\) exit 1 ;;$", wf_script, re.M) is not None
+        and re.search(
+            r'^\s*2\) echo "::warning [^"]*" ;;$', wf_script, re.M
+        ) is not None
+        and re.search(
+            r'^\s*\*\) echo "::error [^"]*"; exit "\$code" ;;$',
+            wf_script, re.M,
+        ) is not None,
+    )
+
+    check(
+        "Workflow: no continue-on-error, error suppression or forced success",
+        wf_script != ""
+        and not any(
+            fragment in workflow_text
+            for fragment in (
+                "continue-on-error", "|| true", "set +e", "/dev/null",
+                "exit 0", "2>&1", "| tee",
+            )
+        ),
+    )
+
+    wf_annotations = [
+        line.strip() for line in wf_script.splitlines() if "::" in line
+    ]
+    wf_warnings = [line for line in wf_annotations if '"::warning ' in line]
+
+    check(
+        "Workflow: INCOMPLETE gives exactly one fixed warning, never COMPLETE",
+        len(wf_warnings) == 1
+        and wf_script.count("::warning ") == 1
+        and wf_warning_text in wf_warnings[0]
+        and "$" not in wf_warnings[0]
+        and "INCOMPLETE" in wf_warnings[0]
+        and re.search(r"\bCOMPLETE\b", wf_warnings[0]) is None,
+    )
+
+    check(
+        "Workflow: failure annotations are fixed text apart from the exit code",
+        len([line for line in wf_annotations if '"::error ' in line]) == 2
+        and wf_script.count("::error ") == 2
+        and all(
+            re.sub(r"\$code\b", "", line.split("::error", 1)[1]).count("$") == 0
+            for line in wf_annotations if '"::error ' in line
+        ),
+    )
+
+    check(
+        "Workflow: the job summary is left to the program",
+        "GITHUB_STEP_SUMMARY" not in workflow_text
+        and wf_warning_text.count("job summary") == 1,
+    )
+
+    check(
+        "Workflow: setup steps, secrets and dry-run mode are unchanged",
+        re.findall(r"uses: (\S+)", workflow_text)
+        == ["actions/checkout@v4", "actions/setup-python@v5"]
+        and 'python-version: "3.12"' in workflow_text
+        and "- run: pip install requests" in workflow_text
+        and re.findall(r"secrets\.(\w+)", workflow_text)
+        == ["SHEET_URL", "GROQ_API_KEY"]
+        and "SHEET_URL: ${{ secrets.SHEET_URL }}" in workflow_text
+        and "GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}" in workflow_text,
+    )
+
+    import shutil
+    import subprocess
+
+    # These behaviour checks need a POSIX bash on PATH (Git Bash on
+    # Windows). Without one they are skipped and listed at the end.
+    wf_bash = shutil.which("bash")
+    wf_skipped = []
+
+    def wf_run_step(exit_code, with_script=True, emit=None):
+        """Run the extracted step under `bash -e` with a stub python.
+        `emit` lines are printed by the stub, as the program would."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "bin").mkdir()
+            shim = work / "bin" / "python"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'echo "$*" > args.txt\n'
+                "[ -f emit.txt ] && cat emit.txt\n"
+                "echo PYTHON-STDOUT-MARK\n"
+                "echo PYTHON-STDERR-MARK >&2\n"
+                'exit "$FAKE_PYTHON_EXIT"\n',
+                encoding="utf-8", newline="\n",
+            )
+            shim.chmod(0o755)
+            (work / "step.sh").write_text(
+                wf_script, encoding="utf-8", newline="\n"
+            )
+            (work / "summary.md").write_text("PRE\n", encoding="utf-8")
+
+            if emit:
+                (work / "emit.txt").write_text(
+                    "\n".join(emit) + "\n", encoding="utf-8", newline="\n"
+                )
+
+            if with_script:
+                (work / "weather_log.py").write_text("", encoding="utf-8")
+
+            env = dict(os.environ)
+            env.update(
+                PATH=str(work / "bin") + os.pathsep + env.get("PATH", ""),
+                FAKE_PYTHON_EXIT=str(exit_code),
+                GITHUB_STEP_SUMMARY="summary.md",
+            )
+            done = subprocess.run(
+                [wf_bash, "-e", "step.sh"], cwd=work, env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            args = work / "args.txt"
+
+            return {
+                "code": done.returncode,
+                "stdout": done.stdout,
+                "stderr": done.stderr,
+                "args": args.read_text().strip() if args.exists() else None,
+                "summary": (work / "summary.md").read_text(),
+                "annotations": [
+                    line.strip() for line in done.stdout.splitlines()
+                    if line.startswith("::")
+                ],
+            }
+
+    wf_probe = None
+
+    if wf_bash and wf_script:
+        try:
+            wf_probe = wf_run_step(3)
+        except (OSError, subprocess.SubprocessError):
+            wf_probe = None
+
+    if wf_probe is None or wf_probe["args"] != "weather_log.py agent-dry":
+        wf_skipped.append("workflow step behaviour")
+        print(
+            "SKIP: workflow step behaviour checks (no usable POSIX bash). "
+            "Exit-code handling is then covered structurally only."
+        )
+    else:
+        wf_results = {
+            code: wf_run_step(code) for code in (0, 1, 2, 3, 127, 139)
+        }
+
+        check(
+            "Workflow step: exit 0 passes with no annotation",
+            wf_results[0]["code"] == 0 and wf_results[0]["annotations"] == [],
+        )
+
+        check(
+            "Workflow step: exit 2 passes with one fixed INCOMPLETE warning",
+            wf_results[2]["code"] == 0
+            and wf_results[2]["annotations"] == [wf_warning_text],
+        )
+
+        check(
+            "Workflow step: exit 1 fails the step",
+            wf_results[1]["code"] == 1 and wf_results[1]["annotations"] == [],
+        )
+
+        check(
+            "Workflow step: unexpected exit codes fail with that code",
+            all(
+                wf_results[code]["code"] == code
+                and wf_results[code]["annotations"] == [
+                    "::error title=Weather assessment::Unexpected exit code "
+                    f"{code} from weather_log.py (expected 0, 1 or 2)."
+                ]
+                for code in (3, 127, 139)
+            ),
+        )
+
+        check(
+            "Workflow step: python output is never suppressed",
+            all(
+                "PYTHON-STDOUT-MARK" in result["stdout"]
+                and "PYTHON-STDERR-MARK" in result["stderr"]
+                and result["args"] == "weather_log.py agent-dry"
+                for result in wf_results.values()
+            ),
+        )
+
+        check(
+            "Workflow step: the job summary is never written by the step",
+            all(result["summary"] == "PRE\n" for result in wf_results.values()),
+        )
+
+        wf_missing = wf_run_step(2, with_script=False)
+
+        check(
+            "Workflow step: a missing script is a failure, never INCOMPLETE",
+            wf_missing["code"] == 1
+            and wf_missing["args"] is None
+            and wf_missing["annotations"] == [
+                "::error title=Weather assessment::weather_log.py was not found."
+            ],
+        )
 
     # ------------------------------------------------------------
     # Regression: dry run failed with "ValueError: Invalid text
@@ -5728,12 +6652,18 @@ def run_tests():
             and "heat advisory" not in message,
         )
 
-    check(
-        "Claim check is skipped only for VERIFIED warning status",
+    try:
         reject_unverified_warning_claims(
             {"advice": "No official heat advisory is in effect."},
             "VERIFIED",
-        )["advice"] == "No official heat advisory is in effect.",
+        )
+        verified_claim_skipped = True
+    except UnverifiedWarningClaim:
+        verified_claim_skipped = False
+
+    check(
+        "Claim check is never skipped, even for a VERIFIED status",
+        not verified_claim_skipped,
     )
 
     check(
@@ -5763,7 +6693,7 @@ def run_tests():
             and claimed["send_alert"] is False
             and claimed["official_warning_status"] == "NOT_CHECKED"
             and "UNVERIFIED_WARNING_CLAIM" in abc_codes(claimed)
-            and "OFFICIAL_WARNINGS_NOT_VERIFIED" in abc_codes(claimed)
+            and "OFFICIAL_WARNINGS_NOT_VERIFIED" not in abc_codes(claimed)
             and "heat advisory is in effect"
             not in json_text(claimed) + claimed_output
             and "gsk_abc_test_key_not_real" not in claimed_output,
@@ -5908,11 +6838,10 @@ def run_tests():
 
     # C. Structured incomplete reasons.
     check(
-        "Incident shape records warnings and unassessed dimensions",
-        abc_codes(neutral_result)[:2] == [
-            "RISK_DIMENSIONS_UNASSESSED",
-            "OFFICIAL_WARNINGS_NOT_VERIFIED",
-        ]
+        "Incident shape records unassessed dimensions; warnings separately",
+        abc_codes(neutral_result)[:1] == ["RISK_DIMENSIONS_UNASSESSED"]
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED" not in abc_codes(neutral_result)
+        and neutral_result["official_warning_status"] == "NOT_CHECKED"
         and next(
             r["detail"] for r in neutral_result["incomplete_reasons"]
             if r["code"] == "RISK_DIMENSIONS_UNASSESSED"
@@ -5945,7 +6874,7 @@ def run_tests():
     )
 
     def missing_policy():
-        raise FileNotFoundError("guidelines.md not found")
+        raise PolicyUnavailableError("guidelines.md not found")
 
     no_policy, _, _ = abc_pipeline(
         abc_reply(), load_guidelines=missing_policy
@@ -5954,12 +6883,8 @@ def run_tests():
 
     check(
         "Failures record POLICY_UNAVAILABLE or ASSESSMENT_ERROR",
-        abc_codes(no_policy) == [
-            "POLICY_UNAVAILABLE", "OFFICIAL_WARNINGS_NOT_VERIFIED",
-        ]
-        and abc_codes(budget_failure) == [
-            "ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED",
-        ]
+        abc_codes(no_policy) == ["POLICY_UNAVAILABLE"]
+        and abc_codes(budget_failure) == ["ASSESSMENT_ERROR"]
         and next(
             r["detail"] for r in budget_failure["incomplete_reasons"]
             if r["code"] == "ASSESSMENT_ERROR"
@@ -5978,10 +6903,12 @@ def run_tests():
     )
 
     check(
-        "No decision is COMPLETE while warnings are unverified",
+        "None of these decisions is COMPLETE or records a warning reason",
         all(
-            decision["assessment_status"] == "INCOMPLETE"
-            and "OFFICIAL_WARNINGS_NOT_VERIFIED" in abc_codes(decision)
+            decision["assessment_status"] == (
+                "UNAVAILABLE" if decision is no_policy else "INCOMPLETE"
+            )
+            and "OFFICIAL_WARNINGS_NOT_VERIFIED" not in abc_codes(decision)
             for decision in (
                 neutral_result, uncertain_result, no_policy,
                 budget_failure, sent_request,
@@ -6014,8 +6941,7 @@ def run_tests():
 
     check(
         "Dry run prints incomplete reasons and makes no POST",
-        "INCOMPLETE REASON: OFFICIAL_WARNINGS_NOT_VERIFIED"
-        in dry_output.getvalue()
+        "OFFICIAL WARNING: NOT_CHECKED" in dry_output.getvalue()
         and "INCOMPLETE REASON: RISK_DIMENSIONS_UNASSESSED"
         in dry_output.getvalue()
         and no_post.posts == [],
@@ -6375,7 +7301,7 @@ def run_tests():
             or "character limit" in four_decision["reasoning"]
         )
         and [r["code"] for r in four_decision["incomplete_reasons"]]
-        == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
+        == ["ASSESSMENT_ERROR"],
     )
 
     check(
@@ -6546,7 +7472,7 @@ def run_tests():
         )
 
     rv_known_codes = {
-        "OFFICIAL_WARNINGS_NOT_VERIFIED", "RISK_DIMENSIONS_UNASSESSED",
+        "RISK_DIMENSIONS_UNASSESSED",
         "WEATHER_EVIDENCE_UNCERTAIN", "UNVERIFIED_WARNING_CLAIM",
         "POLICY_UNAVAILABLE", "ASSESSMENT_ERROR",
     }
@@ -6667,6 +7593,133 @@ def run_tests():
             "type", "properties", "required", "additionalProperties",
             "items", "enum",
         },
+    )
+
+    # The documented strict-mode rules (Groq Structured Outputs, "Schema
+    # Requirements"), applied to any schema so that valid and invalid
+    # structures can both be exercised.
+    ss_types = {
+        "string", "number", "boolean", "integer", "object", "array", "null",
+    }
+    ss_allowed = {
+        "type", "properties", "required", "additionalProperties", "items",
+        "enum", "description", "anyOf", "$defs", "$ref",
+    }
+
+    def ss_problems(node, path="schema"):
+        if not isinstance(node, dict):
+            return [f"{path}: not an object"]
+
+        problems = [
+            f"{path}: keyword {key} is outside the documented subset"
+            for key in node if key not in ss_allowed
+        ]
+        declared = node.get("type")
+        kinds = declared if isinstance(declared, list) else [declared]
+
+        if "type" in node and not (
+            kinds and all(kind in ss_types for kind in kinds)
+        ):
+            problems.append(f"{path}: undocumented type")
+
+        if "object" in kinds or "properties" in node:
+            properties = node.get("properties", {})
+
+            if node.get("additionalProperties") is not False:
+                problems.append(f"{path}: additionalProperties must be false")
+
+            if set(node.get("required", [])) != set(properties):
+                problems.append(f"{path}: every property must be required")
+
+            for name, child in properties.items():
+                problems += ss_problems(child, f"{path}.{name}")
+
+        if "array" in kinds:
+            if "items" not in node:
+                problems.append(f"{path}: array needs items")
+            else:
+                problems += ss_problems(node["items"], f"{path}[]")
+
+        if "enum" in node and not (
+            isinstance(node["enum"], list) and node["enum"]
+        ):
+            problems.append(f"{path}: enum must be a non-empty list")
+
+        for index, branch in enumerate(node.get("anyOf", [])):
+            problems += ss_problems(branch, f"{path}|{index}")
+
+        return problems
+
+    ss_good = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "nickname": {"type": ["string", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "level": {"type": "string", "enum": ["low", "high"]},
+            "nested": {
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["name", "nickname", "tags", "level", "nested"],
+        "additionalProperties": False,
+    }
+
+    check(
+        "Documented strict-mode rules accept valid structures and the "
+        "response schema",
+        ss_problems(ss_good) == [] and ss_problems(ss_schema) == [],
+    )
+
+    def ss_variant(change):
+        schema = json.loads(json.dumps(ss_schema))
+        change(schema)
+        return ss_problems(schema)
+
+    def ss_drop_required(schema):
+        schema["required"].remove("advice")
+
+    def ss_open_object(schema):
+        schema["additionalProperties"] = True
+
+    def ss_omit_closed(schema):
+        del schema["additionalProperties"]
+
+    def ss_add_bound(schema):
+        schema["properties"]["likelihood_score"]["minimum"] = 1
+
+    def ss_untyped_array(schema):
+        del schema["properties"]["sources"]["items"]
+
+    def ss_bad_type(schema):
+        schema["properties"]["advice"]["type"] = "text"
+
+    def ss_empty_enum(schema):
+        schema["properties"]["alert_recommendation"]["enum"] = []
+
+    def ss_optional_field(schema):
+        schema["properties"]["extra"] = {"type": "string"}
+
+    def ss_nested_open(schema):
+        schema["properties"]["advice"] = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+        }
+
+    check(
+        "Documented strict-mode rules reject each invalid structure",
+        all(
+            ss_variant(change) != []
+            for change in (
+                ss_drop_required, ss_open_object, ss_omit_closed,
+                ss_add_bound, ss_untyped_array, ss_bad_type,
+                ss_empty_enum, ss_optional_field, ss_nested_open,
+            )
+        ),
     )
 
     # Schema types and the validator's type checks agree, field by field.
@@ -7382,6 +8435,12 @@ def run_tests():
             "message": "HE-MARK-MSG2 provider supplied text",
             "type": "invalid_request_error",
         }}), {}),
+        "json_validate_failed, other message": (400, json.dumps({"error": {
+            "message": "HE-MARK-MSG3 Generated JSON does not match",
+            "type": "invalid_request_error",
+            "code": "json_validate_failed",
+            "failed_generation": "HE-MARK-FG3",
+        }}), {}),
         "unexpected nested fields": (500, json.dumps({
             "error": {
                 "type": "server_error",
@@ -7434,7 +8493,7 @@ def run_tests():
             and decision["send_alert"] is False
             and decision["notification_status"] == "NOT_SENT"
             and [r["code"] for r in decision["incomplete_reasons"]]
-            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            == ["ASSESSMENT_ERROR"]
             and "gsk_he_test_key" not in json_text(result["sheets_payloads"])
             + result["pipeline_log"] + result["dry_log"],
         )
@@ -7446,7 +8505,20 @@ def run_tests():
         "HTTP 400" in known
         and "code=json_validate_failed" in known
         and "type=invalid_request_error" in known
-        and GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"] in known,
+        and GROQ_ERROR_REASON_DESCRIPTIONS["completion_limit_reached"]
+        in known,
+    )
+
+    jr_other = he_results["json_validate_failed, other message"][
+        "decision"
+    ]["reasoning"]
+
+    check(
+        "A json_validate_failed error without the known message keeps the "
+        "generic description",
+        GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"] in jr_other
+        and GROQ_ERROR_REASON_DESCRIPTIONS["completion_limit_reached"]
+        not in jr_other,
     )
 
     check(
@@ -7473,6 +8545,97 @@ def run_tests():
         "code=some_new_code" in unknown
         and GROQ_GENERIC_ERROR_DESCRIPTION in unknown
         and "HE-MARK" not in unknown,
+    )
+
+    # json_validate_failed: the provider's stated reason is reduced to a
+    # closed label and never copied, so a truncated generation can be
+    # told apart from schema non-conformance without exposing text.
+    def jr_body(message, code="json_validate_failed"):
+        return json.dumps({"error": {
+            "message": message, "type": "invalid_request_error",
+            "code": code,
+        }})
+
+    jr_truncated = GROQ_ERROR_REASON_DESCRIPTIONS["completion_limit_reached"]
+    jr_generic = GROQ_ERROR_CODE_DESCRIPTIONS["json_validate_failed"]
+    jr_observed = (
+        "max completion tokens reached before generating a valid document"
+    )
+    jr_text = he_describe(400, jr_body(jr_observed))
+
+    check(
+        "Observed truncation message is reported as a completion-limit "
+        "reason",
+        "HTTP 400" in jr_text
+        and "code=json_validate_failed" in jr_text
+        and "type=invalid_request_error" in jr_text
+        and jr_text.endswith(jr_truncated)
+        and jr_generic not in jr_text,
+    )
+
+    check(
+        "The completion-limit reason is matched case-insensitively",
+        he_describe(400, jr_body(jr_observed.upper())).endswith(jr_truncated),
+    )
+
+    jr_other_messages = (
+        "Generated JSON does not match the expected schema. Please adjust "
+        "your prompt.",
+        "HE-MARK-JR provider supplied text",
+        "",
+        "x" * 400 + " max completion tokens reached",
+        None,
+        7,
+        ["max completion tokens reached"],
+    )
+
+    check(
+        "Any other json_validate_failed message keeps the generic "
+        "description",
+        all(
+            he_describe(400, jr_body(message)).endswith(jr_generic)
+            and jr_truncated not in he_describe(400, jr_body(message))
+            for message in jr_other_messages
+        ),
+    )
+
+    check(
+        "The completion-limit reason is not used for other error codes",
+        all(
+            jr_truncated not in he_describe(400, jr_body(jr_observed, code))
+            for code in ("some_new_code", None, "rate_limit_exceeded")
+        ),
+    )
+
+    jr_marked = he_describe(
+        400, jr_body("max completion tokens reached HE-MARK-JR suffix")
+    )
+
+    check(
+        "The provider reason never copies provider text",
+        "HE-MARK" not in jr_marked and jr_marked.endswith(jr_truncated),
+    )
+
+    check(
+        "provider_error_reason returns only a fixed label or None",
+        provider_error_reason(HeResponse(400, jr_body(jr_observed)))
+        == "completion_limit_reached"
+        and all(
+            provider_error_reason(HeResponse(400, body)) is None
+            for body in (
+                jr_body("HE-MARK-JR"),
+                "not json",
+                "[]",
+                "null",
+                "",
+                json.dumps({"error": "max completion tokens reached"}),
+                json.dumps({"error": {"message": {
+                    "x": "max completion tokens reached"
+                }}}),
+            )
+        )
+        and provider_error_reason(object()) is None
+        and set(GROQ_ERROR_REASON_DESCRIPTIONS) == {"completion_limit_reached"},
     )
 
     check(
@@ -7777,9 +8940,10 @@ def run_tests():
         and fz_decision["sources"]
         == ["6.1 Extreme Heat", "4. Risk Assessment Dimensions"]
         and fz_decision["alert_recommendation"] == "MONITOR"
-        and fz_decision["assessment_status"] == "INCOMPLETE"
-        and [r["code"] for r in fz_decision["incomplete_reasons"]]
-        == ["OFFICIAL_WARNINGS_NOT_VERIFIED"],
+        and fz_decision["assessment_status"] == "COMPLETE"
+        and fz_decision.get("incomplete_reasons", []) == []
+        and fz_decision["official_warning_status"] == "NOT_CHECKED"
+        and fz_decision["approval_status"] == "PENDING_REVIEW",
     )
 
     check(
@@ -8438,7 +9602,7 @@ def run_tests():
     check(
         "Missing dimensions are recorded with the supported reason code",
         [r["code"] for r in eg_d["incomplete_reasons"]]
-        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        == ["RISK_DIMENSIONS_UNASSESSED"]
         and eg_d["incomplete_reasons"][0]["detail"]
         == "exposure_score, geographic_impact_score"
         and any(
@@ -8603,7 +9767,7 @@ def run_tests():
         and eg_summary["risk_score_calculated"] is False
         and eg_summary["risk_band"] == "UNASSESSED"
         and eg_summary["incomplete_reason_codes"]
-        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        == ["RISK_DIMENSIONS_UNASSESSED"]
         and eg_summary["evidence_gate_overrides"]
         == ["exposure_score", "geographic_impact_score"]
         and eg_summary["hazards_screened"] == ["HEAT"],
@@ -8914,7 +10078,7 @@ def run_tests():
         and cl_d["exposure_score"] is None
         and cl_d["geographic_impact_score"] is None
         and [r["code"] for r in cl_d["incomplete_reasons"]]
-        == ["UNVERIFIED_WARNING_CLAIM", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+        == ["UNVERIFIED_WARNING_CLAIM"]
         and cl_run_one["sheet_posts"] == [],
     )
 
@@ -9321,7 +10485,7 @@ def run_tests():
             po_direct
             == f"Model output sets program-owned fields: {field}"
             and [r["code"] for r in po_bad_d["incomplete_reasons"]]
-            == ["ASSESSMENT_ERROR", "OFFICIAL_WARNINGS_NOT_VERIFIED"]
+            == ["ASSESSMENT_ERROR"]
             and f"program-owned fields: {field}" in po_bad_d["reasoning"]
             and po_bad_d["assessment_status"] == "INCOMPLETE"
             and po_bad_d["alert_recommendation"] == "UNABLE_TO_ASSESS"
@@ -9367,7 +10531,7 @@ def run_tests():
         and po_a["evidence_gate_overrides"]
         == ["exposure_score", "geographic_impact_score"]
         and [r["code"] for r in po_a["incomplete_reasons"]]
-        == ["RISK_DIMENSIONS_UNASSESSED", "OFFICIAL_WARNINGS_NOT_VERIFIED"],
+        == ["RISK_DIMENSIONS_UNASSESSED"],
     )
 
     # Present and correctly typed in every kind of assessment.
@@ -9394,7 +10558,7 @@ def run_tests():
     check(
         "Existing program explanations survive a claim failure",
         po_claim["decision"]["official_warning_status"] == "NOT_CHECKED"
-        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
+        and "UNVERIFIED_WARNING_CLAIM"
         in [r["code"] for r in po_claim["decision"]["incomplete_reasons"]]
         and any(
             "unverified official-warning claim in reasoning" in item
@@ -9405,8 +10569,8 @@ def run_tests():
     )
 
     # Both lists reach the console report and the Sheets payload.
-    po_payload = json.loads(
-        po_run_a["report"].split("OUTPUT PAYLOAD:", 1)[1].strip()
+    po_payload, _ = json.JSONDecoder().raw_decode(
+        po_run_a["report"].split("OUTPUT PAYLOAD:", 1)[1].lstrip()
     )
     po_report = po_run_a["report"]
 
@@ -10010,8 +11174,10 @@ def run_tests():
     check(
         "Program-generated warning status is kept without model wording",
         vb_ok["official_warning_status"] == "NOT_CHECKED"
-        and "OFFICIAL_WARNINGS_NOT_VERIFIED"
-        in [r["code"] for r in vb_ok["incomplete_reasons"]]
+        and any(
+            "warning status has not been retrieved and verified" in item
+            for item in vb_ok["missing_evidence"]
+        )
         and any(
             "warnings were not retrieved or verified" in item
             for item in vb_ok["limitations"]
@@ -10233,10 +11399,1873 @@ def run_tests():
         print("Guidelines test error:", exc)
         check("Guidelines loading and retrieval", False)
 
+    # ------------------------------------------------------------
+    # B1. Preservation pins. Every expected value is a literal computed
+    # from an isolated copy of be5524a (git show), never from the code
+    # under test. Offline: transport-level stubs only.
+    # ------------------------------------------------------------
+    # Shared offline harness for the preservation pins and end-to-end tests.
+    # Transport-level stubs only: nothing here reaches a network. The
+    # latitude, longitude and utc_offset_seconds in ip_open_meteo() are
+    # synthetic test values, not evidence of what Open-Meteo returns.
+    IP_SHEET = "https://sheet.invalid/exec"
+    IP_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+    def ip_weather():
+        start = datetime(2026, 11, 8, 13, 0)
+
+        return {
+            "city": "Dubai",
+            "timezone": "Asia/Dubai",
+            "source": "Open-Meteo",
+            "retrieved_at": "2026-11-08T12:05:00+04:00",
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33,
+                "relative_humidity_2m": 55, "apparent_temperature": 36,
+                "precipitation": 0, "wind_speed_10m": 10,
+                "wind_gusts_10m": 20, "visibility": 24140,
+                "weather_code": 1, "cape": 0,
+            },
+            "today_forecast": {
+                "high": 35, "low": 27, "wind": 14, "gust": 25,
+                "precipitation": 0,
+            },
+            "previous_days": [],
+            "hourly_forecast_next_24h": [
+                {
+                    "time": (start + timedelta(hours=h)).strftime(
+                        "%Y-%m-%dT%H:%M"
+                    ),
+                    "temperature": 33, "apparent_temperature": 36,
+                    "humidity": 55, "precipitation": 0, "wind": 10,
+                    "gust": 20, "visibility": 24140, "weather_code": 1,
+                    "cape": 0,
+                }
+                for h in range(24)
+            ],
+            "history_summary": {},
+        }
+
+
+    def ip_open_meteo(timezone="Asia/Dubai"):
+        hours = [datetime(2026, 11, 8) + timedelta(hours=h) for h in range(48)]
+        days = [datetime(2026, 11, 3) + timedelta(days=d) for d in range(7)]
+        n = len(hours)
+
+        return {
+            "latitude": 25.2, "longitude": 55.25, "timezone": timezone,
+            "utc_offset_seconds": 14400,
+            "current": {
+                "time": "2026-11-08T12:00", "temperature_2m": 33.0,
+                "relative_humidity_2m": 55, "apparent_temperature": 36.0,
+                "precipitation": 0.0, "wind_speed_10m": 10.0,
+                "wind_gusts_10m": 20.0, "visibility": 24140.0,
+                "weather_code": 1, "cape": 0.0,
+            },
+            "hourly": {
+                "time": [h.strftime("%Y-%m-%dT%H:%M") for h in hours],
+                "temperature_2m": [33.0] * n,
+                "relative_humidity_2m": [55] * n,
+                "apparent_temperature": [36.0] * n,
+                "precipitation": [0.0] * n,
+                "wind_speed_10m": [10.0] * n,
+                "wind_gusts_10m": [20.0] * n,
+                "visibility": [24140.0] * n,
+                "weather_code": [1] * n,
+                "cape": [0.0] * n,
+            },
+            "daily": {
+                "time": [d.strftime("%Y-%m-%d") for d in days],
+                "temperature_2m_max": [35.0] * 7,
+                "temperature_2m_min": [27.0] * 7,
+                "wind_speed_10m_max": [14.0] * 7,
+                "wind_gusts_10m_max": [25.0] * 7,
+                "precipitation_sum": [0.0] * 7,
+            },
+        }
+
+
+    IP_REPLY = {
+        "hazard_type": "Extreme Heat",
+        "likelihood_score": 3,
+        "likelihood_reason": "Forecast highs reach 35 C.",
+        "severity_score": 3,
+        "severity_reason": "Heat stress is possible outdoors.",
+        "exposure_score": 4,
+        "exposure_reason": "Outdoor workers.",
+        "duration_score": 4,
+        "duration_reason": "Hot for most daylight hours.",
+        "geographic_impact_score": 4,
+        "geographic_impact_reason": "City-wide.",
+        "alert_recommendation": "MONITOR",
+        "advice": "Limit strenuous outdoor activity at midday.",
+        "reasoning": "Heat screening triggered by forecast highs.",
+        "recommended_actions": ["Drink water."],
+        "sources": ["6.1 Extreme Heat"],
+    }
+
+
+    class IpResponse:
+        def __init__(self, status_code, text, headers=None):
+            self.status_code = status_code
+            self.text = text
+            self.headers = headers or {}
+
+        def json(self):
+            return json.loads(self.text)
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"{self.status_code} error")
+
+
+    def ip_completion(body, finish_reason="stop"):
+        return IpResponse(200, json.dumps({
+            "choices": [{
+                "message": {"content": json.dumps(body)},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 4000, "completion_tokens": 600,
+                "total_tokens": 4600,
+            },
+        }))
+
+
+    def ip_provider_error(status, error):
+        return IpResponse(status, json.dumps({"error": error}))
+
+
+    class IpTransport:
+        def __init__(self, groq=None, weather=None, history="[]",
+                     sheets="OK", get_error=None, post_error=None):
+            self.groq = groq
+            self.weather = weather
+            self.history = history
+            self.sheets = sheets
+            self.get_error = get_error
+            self.post_error = post_error
+            self.calls = []
+            self.posts = []
+            self.weather_params = None
+
+        def get(self, url, params=None, timeout=None):
+            self.calls.append(("GET", url))
+
+            if url == IP_WEATHER_URL:
+                self.weather_params = dict(params or {})
+
+                if self.get_error is not None:
+                    raise self.get_error
+
+                return self.weather
+
+            return IpResponse(200, self.history)
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append(("POST", url))
+            self.posts.append((url, json))
+
+            if url == GROQ_URL:
+                if self.post_error is not None:
+                    raise self.post_error
+
+                return self.groq
+
+            return IpResponse(200, self.sheets)
+
+
+    def ip_override(overrides, function):
+        saved = {name: globals()[name] for name in overrides}
+        globals().update(overrides)
+
+        try:
+            return function()
+        finally:
+            globals().update(saved)
+
+
+    def ip_job(transport, dry=True, extra=None, stub_weather=True):
+        """Run run_agent_job offline. Returns stdout, payload and result."""
+        overrides = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_pin_test",
+            "SHEET_URL": None,
+        }
+
+        if stub_weather:
+            overrides["get_weather"] = lambda city: ip_weather()
+            overrides["tool_get_history"] = lambda n=3: []
+
+        overrides.update(extra or {})
+        out = io.StringIO()
+        result = {}
+
+        def run():
+            with contextlib.redirect_stdout(out):
+                result["value"] = run_agent_job(dry=dry)
+
+        ip_override(overrides, run)
+        text = out.getvalue()
+        payload = None
+
+        if "OUTPUT PAYLOAD:" in text:
+            payload, _ = json.JSONDecoder().raw_decode(
+                text.split("OUTPUT PAYLOAD:", 1)[1].lstrip()
+            )
+        else:
+            for url, body in transport.posts:
+                if url == IP_SHEET:
+                    payload = body
+
+        return {"stdout": text, "payload": payload, "value": result.get("value")}
+
+
+    def ip_payload_digest(payload):
+        stable = {
+            key: value for key, value in payload.items()
+            if key != "assessment_timestamp"
+        }
+
+        return hashlib.sha256(
+            json.dumps(stable, sort_keys=True, ensure_ascii=False)
+            .encode("utf-8")
+        ).hexdigest()
+
+
+    def ip_groq_body(transport):
+        for url, body in transport.posts:
+            if url == GROQ_URL:
+                return body
+
+        return None
+
+    def ip_agent(transport, extra=None):
+        overrides = {
+            "HTTP": transport,
+            "GROQ_API_KEY": "gsk_pin_test",
+            "SHEET_URL": None,
+            "get_weather": lambda city: ip_weather(),
+            "tool_get_history": lambda n=3: [],
+        }
+        overrides.update(extra or {})
+        holder = {}
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                holder["decision"] = run_weather_agent()[0]
+
+        ip_override(overrides, run)
+        return holder["decision"]
+
+    def ip_sha(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    IP_BASELINE = {
+        "system_prompt_sha": "7c3a87b5871a04dbd855c1f7fde4520a87c4fc90af591292be078deaa5739481",
+        "response_format_sha": "ca0d29d77c08dd5f0ea03ef140952e36187778a2abf5153d34e9fc4fa913f315",
+        "response_fields": ["hazard_type", "likelihood_score", "likelihood_reason", "severity_score", "severity_reason", "exposure_score", "exposure_reason", "duration_score", "duration_reason", "geographic_impact_score", "geographic_impact_reason", "alert_recommendation", "advice", "reasoning", "recommended_actions", "sources"],
+        "groq_params": {
+            "model": "openai/gpt-oss-20b",
+            "temperature": 0.1,
+            "max_completion_tokens": 1000,
+            "reasoning_effort": "low",
+            "include_reasoning": False,
+        },
+        "request_len": 15920,
+        "request_sha": "0813e66e657d3c5baad752378caa821afe270eb44e0bca4fb71abcb044223293",
+        "payload_keys": ["advice", "alert_message", "alert_recommendation", "approval_status", "assessment_status", "assessment_timestamp", "city", "duration_reason", "duration_score", "evidence_confidence", "evidence_quality", "exposure_reason", "exposure_score", "geographic_impact_reason", "geographic_impact_score", "hazard_type", "likelihood_reason", "likelihood_score", "limitations", "missing_evidence", "notification_status", "official_warning_status", "policy_hash", "policy_status", "policy_version", "reasoning", "risk_band", "risk_score", "send_alert", "severity_reason", "severity_score", "sources", "tools_used", "type"],
+        "success_payload_sha": "39871a324b2591bfc3cd2eef512c2ad10a87f3960c5efe4c421bada826b5c2bb",
+        "provider_payload_sha": "e2cb76ac2158e55b2d5deb156756e6d690e7272705022a9693517832f3d11307",
+        "claim_payload_sha": "6a67d857a282c9c4c6e12b0367d0ca5bc1dd3467f297423a6c32b25c6bd0683d",
+        "dry_calls": [
+            ("GET", "https://api.open-meteo.com/v1/forecast"),
+            ("GET", "https://sheet.invalid/exec"),
+            ("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        ],
+        "live_calls": [
+            ("GET", "https://api.open-meteo.com/v1/forecast"),
+            ("GET", "https://sheet.invalid/exec"),
+            ("POST", "https://api.groq.com/openai/v1/chat/completions"),
+            ("POST", "https://sheet.invalid/exec"),
+        ],
+    }
+
+    check(
+        "Pin: system prompt is byte-identical to be5524a",
+        ip_sha(SYSTEM_PROMPT) == IP_BASELINE["system_prompt_sha"],
+    )
+
+    check(
+        "Pin: response format is byte-identical to be5524a",
+        ip_sha(json_text(RESPONSE_FORMAT))
+        == IP_BASELINE["response_format_sha"],
+    )
+
+    check(
+        "Pin: the 16 response fields are unchanged",
+        list(RESPONSE_FIELDS) == IP_BASELINE["response_fields"]
+        and len(RESPONSE_FIELDS) == 16,
+    )
+
+    ip_ok_transport = IpTransport(groq=ip_completion(IP_REPLY))
+    ip_ok = ip_job(ip_ok_transport)
+    ip_ok_body = ip_groq_body(ip_ok_transport) or {}
+
+    check(
+        "Pin: Groq model, temperature and request parameters are unchanged",
+        {
+            key: value for key, value in ip_ok_body.items()
+            if key not in ("messages", "response_format")
+        } == IP_BASELINE["groq_params"]
+        and ip_sha(json_text(ip_ok_body.get("response_format")))
+        == IP_BASELINE["response_format_sha"]
+        and MODEL == "openai/gpt-oss-20b",
+    )
+
+    ip_request = serialized_request(ip_ok_body.get("messages", []))
+
+    check(
+        "Pin: frozen-fixture Groq request is byte-identical to be5524a",
+        len(ip_request) == IP_BASELINE["request_len"]
+        and ip_sha(ip_request) == IP_BASELINE["request_sha"],
+    )
+
+    check(
+        "Pin: payload keys are unchanged",
+        ip_ok["payload"] is not None
+        and sorted(ip_ok["payload"]) == IP_BASELINE["payload_keys"],
+    )
+
+    check(
+        "Pin: success payload values are unchanged",
+        ip_payload_digest(ip_ok["payload"])
+        == IP_BASELINE["success_payload_sha"],
+    )
+
+    ip_provider = ip_job(IpTransport(groq=ip_provider_error(400, {
+        "message": "IP-MARK provider text",
+        "type": "invalid_request_error",
+        "code": "json_validate_failed",
+        "failed_generation": "IP-MARK-FG",
+    })))
+
+    check(
+        "Pin: provider-error payload keys and values are unchanged",
+        sorted(ip_provider["payload"]) == IP_BASELINE["payload_keys"]
+        and ip_payload_digest(ip_provider["payload"])
+        == IP_BASELINE["provider_payload_sha"],
+    )
+
+    ip_claim = ip_job(IpTransport(groq=ip_completion(
+        dict(IP_REPLY, reasoning="No official warnings were checked.")
+    )))
+
+    check(
+        "Pin: warning-claim payload keys and values are unchanged",
+        sorted(ip_claim["payload"]) == IP_BASELINE["payload_keys"]
+        and ip_payload_digest(ip_claim["payload"])
+        == IP_BASELINE["claim_payload_sha"],
+    )
+
+    ip_payload_literal = {}
+
+    for node in ast.walk(ast.parse(Path(__file__).read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == "run_agent_job":
+            for item in ast.walk(node):
+                if (
+                    isinstance(item, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "payload"
+                        for target in item.targets
+                    )
+                    and isinstance(item.value, ast.Dict)
+                ):
+                    for key, value in zip(item.value.keys, item.value.values):
+                        if isinstance(key, ast.Constant):
+                            ip_payload_literal[key.value] = value
+
+    check(
+        "Pin: payload hard-codes send_alert False and an empty alert message",
+        isinstance(ip_payload_literal.get("send_alert"), ast.Constant)
+        and ip_payload_literal["send_alert"].value is False
+        and isinstance(ip_payload_literal.get("alert_message"), ast.Constant)
+        and ip_payload_literal["alert_message"].value == "",
+    )
+
+    ip_ok_decision = ip_agent(IpTransport(groq=ip_completion(IP_REPLY)))
+    ip_fail_decision = ip_agent(IpTransport(groq=ip_provider_error(500, {
+        "type": "server_error",
+    })))
+
+    check(
+        "Pin: success and failure decisions never authorize an alert",
+        ip_ok_decision["send_alert"] is False
+        and ip_ok_decision["approval_status"] == "PENDING_REVIEW"
+        and ip_ok_decision["notification_status"] == "NOT_SENT"
+        and ip_ok_decision["alert_message"] == ""
+        and ip_fail_decision["send_alert"] is False
+        and ip_fail_decision["approval_status"] == "NOT_AUTHORIZED"
+        and ip_fail_decision["notification_status"] == "NOT_SENT",
+    )
+
+    ip_forced = dict(ip_ok_decision)
+    ip_forced.update(
+        assessment_status="COMPLETE", send_alert=True,
+        alert_message="IP-MARK alert", approval_status="APPROVED",
+    )
+    ip_forced_run = ip_job(IpTransport(), extra={
+        "run_weather_agent": lambda: (dict(ip_forced), ["load_guidelines"]),
+    })
+
+    check(
+        "Pin: a forced COMPLETE and approved decision still sends no alert",
+        ip_forced_run["payload"]["send_alert"] is False
+        and ip_forced_run["payload"]["alert_message"] == ""
+        and "IP-MARK" not in json_text(ip_forced_run["payload"]),
+    )
+
+    ip_weather_ok = IpResponse(200, json.dumps(ip_open_meteo()))
+    ip_dry_transport = IpTransport(
+        groq=ip_completion(IP_REPLY), weather=ip_weather_ok
+    )
+    ip_dry = ip_job(
+        ip_dry_transport, stub_weather=False, extra={"SHEET_URL": IP_SHEET}
+    )
+
+    check(
+        "Pin: dry run calls weather, history and Groq only (no Sheets POST)",
+        ip_dry_transport.calls == IP_BASELINE["dry_calls"]
+        and ip_dry["payload"] is not None
+        and "DRY RUN: No data was sent to Google Sheets." in ip_dry["stdout"],
+    )
+
+    ip_live_transport = IpTransport(
+        groq=ip_completion(IP_REPLY), weather=ip_weather_ok
+    )
+    ip_job(
+        ip_live_transport, dry=False, stub_weather=False,
+        extra={"SHEET_URL": IP_SHEET},
+    )
+
+    check(
+        "Pin: live-mode control posts exactly once to Sheets",
+        ip_live_transport.calls == IP_BASELINE["live_calls"],
+    )
+
+    # ------------------------------------------------------------
+    # B2. Typed failures: built-in base classes and report text kept.
+    # ------------------------------------------------------------
+    b2_types = {
+        ConfigurationError: ValueError,
+        PolicyUnavailableError: FileNotFoundError,
+        PolicyInvalidError: ValueError,
+        WeatherUnavailableError: ValueError,
+        RequestBudgetError: ValueError,
+        ResponseInvalidError: ValueError,
+        UnverifiedWarningClaim: ValueError,
+    }
+
+    check(
+        "B2: every typed failure keeps its built-in base class",
+        all(
+            issubclass(cls, base) and issubclass(cls, ClassifiedFailure)
+            for cls, base in b2_types.items()
+        ),
+    )
+
+    check(
+        "B2: classified failures report under their baseline names",
+        all(
+            exception_label(cls("x")) == base.__name__
+            for cls, base in b2_types.items()
+            if cls is not UnverifiedWarningClaim
+        )
+        and exception_label(UnverifiedWarningClaim("x"))
+        == "UnverifiedWarningClaim"
+        and exception_label(TypeError("x")) == "TypeError"
+        and not isinstance(TypeError("x"), ClassifiedFailure),
+    )
+
+    def b2_raised(function):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                function()
+        except Exception as exc:
+            return exc
+
+        return None
+
+    b2_dir = Path(tempfile.mkdtemp())
+    (b2_dir / "empty.md").write_text("", encoding="utf-8")
+
+    b2_cases = {
+        "missing GROQ key": (
+            lambda: ip_override({"GROQ_API_KEY": None},
+                                lambda: require_configuration()),
+            ConfigurationError,
+        ),
+        "city outside the allowed list": (
+            lambda: get_weather("Atlantis"), ConfigurationError,
+        ),
+        "missing guidelines file": (
+            lambda: ip_override({"GUIDELINES_PATH": b2_dir / "none.md"},
+                                load_guidelines),
+            PolicyUnavailableError,
+        ),
+        "empty guidelines file": (
+            lambda: ip_override({"GUIDELINES_PATH": b2_dir / "empty.md"},
+                                load_guidelines),
+            PolicyInvalidError,
+        ),
+        "unparseable model JSON": (
+            lambda: parse_json_response("not json"), ResponseInvalidError,
+        ),
+        "invalid assessment object": (
+            lambda: validate_decision([], []), ResponseInvalidError,
+        ),
+        "request over the token budget": (
+            lambda: ip_override(
+                {"GROQ_API_KEY": "gsk_pin_test", "HTTP": IpTransport()},
+                lambda: ask_groq([{"role": "user", "content": "x" * 30000}]),
+            ),
+            RequestBudgetError,
+        ),
+        "weather response without hourly data": (
+            lambda: ip_override(
+                {"HTTP": IpTransport(weather=IpResponse(200, json.dumps(
+                    {"current": {"time": "2026-11-08T12:00"}, "daily": {}}
+                )))},
+                lambda: get_weather("Dubai"),
+            ),
+            WeatherUnavailableError,
+        ),
+    }
+
+    for label, (function, expected) in b2_cases.items():
+        found = b2_raised(function)
+        check(
+            f"B2: {label} raises {expected.__name__}",
+            type(found) is expected,
+        )
+
+    b2_network = requests.ConnectionError("IP-NET connection refused")
+    b2_wrapped = b2_raised(lambda: ip_override(
+        {"HTTP": IpTransport(get_error=b2_network)},
+        lambda: get_weather("Dubai"),
+    ))
+
+    check(
+        "B2: weather transport errors are classified with unchanged text",
+        isinstance(b2_wrapped, WeatherUnavailableError)
+        and exception_label(b2_wrapped) == "ConnectionError"
+        and str(b2_wrapped) == str(b2_network)
+        and b2_wrapped.__cause__ is b2_network,
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        b2_policy = load_guidelines()
+
+    b2_internal = b2_raised(
+        lambda: select_hazard_guidance(b2_policy, {"BOGUS": ["x"]})
+    )
+
+    check(
+        "B2: internal consistency checks stay unclassified",
+        type(b2_internal) is ValueError
+        and not isinstance(b2_internal, ClassifiedFailure),
+    )
+
+    # ------------------------------------------------------------
+    # B3. Provider classification through ask_groq (transport stub).
+    # ------------------------------------------------------------
+    def b3_ask(transport):
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                ask_groq([{"role": "user", "content": "x"}])
+
+        try:
+            ip_override(
+                {"HTTP": transport, "GROQ_API_KEY": "gsk_pin_test"}, run
+            )
+        except Exception as exc:
+            return exc
+
+        return None
+
+    def b3_error(code, message="IP-MARK provider text"):
+        return {
+            "message": message, "type": "invalid_request_error",
+            "code": code, "failed_generation": "IP-MARK-FG",
+        }
+
+    b3_cases = {
+        "completion-limit 400": (
+            ip_provider_error(400, b3_error(
+                "json_validate_failed", "max completion tokens reached "
+                "before generating a valid document IP-MARK")),
+            "OUTPUT_TRUNCATED", "INVALID", 400,
+        ),
+        "other json_validate_failed": (
+            ip_provider_error(400, b3_error("json_validate_failed")),
+            "OUTPUT_VALIDATION_UNSPECIFIED", "INVALID", 400,
+        ),
+        "401": (ip_provider_error(401, b3_error("invalid_api_key")),
+                "AUTHENTICATION_FAILED", "UNAVAILABLE", 401),
+        "403": (ip_provider_error(403, {}),
+                "AUTHENTICATION_FAILED", "UNAVAILABLE", 403),
+        "413": (ip_provider_error(413, {}),
+                "REQUEST_TOO_LARGE", "UNAVAILABLE", 413),
+        "429": (ip_provider_error(429, b3_error("rate_limit_exceeded")),
+                "RATE_LIMITED", "UNAVAILABLE", 429),
+        "498": (ip_provider_error(498, {}),
+                "RATE_LIMITED", "UNAVAILABLE", 498),
+        "422": (ip_provider_error(422, {}),
+                "INVALID_REQUEST", "UNAVAILABLE", 422),
+        "424": (ip_provider_error(424, {}),
+                "PROVIDER_UNAVAILABLE", "UNAVAILABLE", 424),
+        "500": (ip_provider_error(500, {"type": "server_error"}),
+                "PROVIDER_UNAVAILABLE", "UNAVAILABLE", 500),
+        "503 plain text": (IpResponse(503, "IP-MARK unavailable"),
+                           "PROVIDER_UNAVAILABLE", "UNAVAILABLE", 503),
+        "unknown status": (ip_provider_error(600, b3_error("weird_code")),
+                           "PROVIDER_ERROR_UNCLASSIFIED", "UNAVAILABLE", 600),
+        "finish_reason length": (ip_completion(IP_REPLY, "length"),
+                                 "OUTPUT_TRUNCATED", "INVALID", None),
+        "finish_reason other": (ip_completion(IP_REPLY, "content_filter"),
+                                "RESPONSE_MALFORMED", "INVALID", None),
+        "no choices": (IpResponse(200, json.dumps({"x": "IP-MARK"})),
+                       "RESPONSE_MALFORMED", "INVALID", None),
+        "empty content": (
+            IpResponse(200, json.dumps({"choices": [{
+                "message": {"content": "   "}, "finish_reason": "stop",
+            }]})),
+            "RESPONSE_MALFORMED", "INVALID", None,
+        ),
+    }
+
+    for label, (response, category, outcome, status) in b3_cases.items():
+        found = b3_ask(IpTransport(groq=response))
+        check(
+            f"B3: {label} is classified {category}",
+            isinstance(found, ProviderError)
+            and found.category == category
+            and found.outcome == outcome
+            and found.http_status == status
+            and exception_label(found) == "RuntimeError"
+            and "IP-MARK" not in str(found)
+            and "IP-MARK" not in json_text(found.diagnostic()),
+        )
+
+    check(
+        "B3: only the completion-limit message sets the reason label",
+        b3_ask(IpTransport(groq=b3_cases["completion-limit 400"][0])).reason
+        == "completion_limit_reached"
+        and b3_ask(IpTransport(
+            groq=b3_cases["other json_validate_failed"][0]
+        )).reason is None,
+    )
+
+    check(
+        "B3: unknown codes are named only when identifier-shaped",
+        b3_ask(IpTransport(groq=b3_cases["unknown status"][0])).code
+        == "weird_code"
+        and b3_ask(IpTransport(groq=ip_provider_error(
+            400, b3_error("IP MARK not an identifier")
+        ))).code is None,
+    )
+
+    for label, error in {
+        "connection error": requests.ConnectionError("IP-NET refused"),
+        "timeout": requests.Timeout("IP-NET timed out"),
+    }.items():
+        found = b3_ask(IpTransport(post_error=error))
+        check(
+            f"B3: network {label} is NETWORK_ERROR with fixed text",
+            isinstance(found, ProviderError)
+            and found.category == "NETWORK_ERROR"
+            and found.outcome == "UNAVAILABLE"
+            and "IP-NET" not in str(found)
+            and str(found) == "Groq request failed before a response was "
+            "received (" + type(error).__name__ + ").",
+        )
+
+    b3_decision = ip_agent(IpTransport(groq=b3_cases["completion-limit 400"][0]))
+
+    check(
+        "B3: the failure decision records the structured provider error",
+        b3_decision.get("provider_error") == {
+            "category": "OUTPUT_TRUNCATED", "http_status": 400,
+            "code": "json_validate_failed", "type": "invalid_request_error",
+            "reason": "completion_limit_reached",
+        }
+        and "IP-MARK" not in json_text(b3_decision)
+        and b3_decision["send_alert"] is False,
+    )
+
+    check(
+        "B3: the model cannot supply provider_error",
+        "provider_error" in PROGRAM_OWNED_FIELDS
+        and isinstance(
+            b2_raised(lambda: validate_decision(
+                dict(IP_REPLY, provider_error={"category": "x"}), []
+            )),
+            ResponseInvalidError,
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # C. Dubai enforcement (configuration and request) and observe-only
+    # response diagnostics. require_configuration and get_weather are
+    # deliberately not stubbed here.
+    # ------------------------------------------------------------
+    check(
+        "C: Dubai is the only configured location",
+        CITIES == {"Dubai": (25.20, 55.27)}
+        and DUBAI_LOCATION == {
+            "city": "Dubai", "latitude": 25.20, "longitude": 55.27,
+            "timezone": "Asia/Dubai",
+        },
+    )
+
+    def c_run(transport, extra=None):
+        overrides = {
+            "HTTP": transport, "GROQ_API_KEY": "gsk_pin_test",
+            "SHEET_URL": None,
+        }
+        overrides.update(extra or {})
+        out = io.StringIO()
+        holder = {}
+
+        def run():
+            with contextlib.redirect_stdout(out):
+                holder["decision"] = run_weather_agent()[0]
+
+        ip_override(overrides, run)
+        return holder["decision"], out.getvalue()
+
+    for label, extra in {
+        "a non-Dubai city": {"CITY": "Lahore"},
+        "edited Dubai coordinates": {"CITIES": {"Dubai": (25.30, 55.27)}},
+    }.items():
+        c_transport = IpTransport(groq=ip_completion(IP_REPLY))
+        c_decision, _ = c_run(c_transport, extra)
+        check(
+            f"C: {label} fails closed before any network call",
+            c_transport.calls == []
+            and c_decision["assessment_status"] == "INCOMPLETE"
+            and c_decision["alert_recommendation"] == "UNABLE_TO_ASSESS"
+            and c_decision["send_alert"] is False
+            and c_decision["reasoning"].startswith("ValueError: "),
+        )
+
+    def c_weather(**changes):
+        raw = ip_open_meteo()
+        raw.update(changes)
+
+        return IpResponse(200, json.dumps(raw))
+
+    c_transport = IpTransport(groq=ip_completion(IP_REPLY), weather=c_weather())
+    c_decision, _ = c_run(c_transport)
+    c_out = ip_job(
+        IpTransport(groq=ip_completion(IP_REPLY), weather=c_weather()),
+        stub_weather=False,
+    )["stdout"]
+
+    check(
+        "C: the weather request asks for Dubai and Asia/Dubai explicitly",
+        c_transport.weather_params is not None
+        and c_transport.weather_params.get("timezone") == "Asia/Dubai"
+        and c_transport.weather_params.get("latitude") == 25.20
+        and c_transport.weather_params.get("longitude") == 55.27,
+    )
+
+    check(
+        "C: the response location is observed and reported",
+        c_decision.get("location_observation") == {
+            "requested_timezone": "Asia/Dubai",
+            "returned_timezone": "Asia/Dubai",
+            "timezone_matches_request": True,
+            "returned_latitude": 25.2,
+            "returned_longitude": 55.25,
+            "utc_offset_seconds_present": True,
+        }
+        and "LOCATION OBSERVATION (program-generated; not enforced):" in c_out
+        and "location_observation" in PROGRAM_OWNED_FIELDS,
+    )
+
+    c_raw = ip_open_meteo(timezone="Asia/Karachi")
+    c_raw.update(latitude=31.5, longitude=74.3)
+    del c_raw["utc_offset_seconds"]
+    c_mismatch_transport = IpTransport(
+        groq=ip_completion(IP_REPLY), weather=IpResponse(200, json.dumps(c_raw))
+    )
+    c_mismatch, _ = c_run(c_mismatch_transport)
+
+    c_mismatch_obs = c_mismatch.get("location_observation")
+
+    check(
+        "C: a mismatched response location is reported, not enforced",
+        "ASSESSMENT_ERROR" not in [
+            reason.get("code")
+            for reason in c_mismatch.get("incomplete_reasons", [])
+        ]
+        and isinstance(c_mismatch_obs, dict)
+        and c_mismatch_obs.get("timezone_matches_request") is False
+        and c_mismatch_obs.get("returned_latitude") == 31.5
+        and c_mismatch_obs.get("utc_offset_seconds_present") is False
+        and c_mismatch["send_alert"] is False,
+    )
+
+    def c_marked_weather():
+        return c_weather(
+            timezone="Asia/Dubai::IP-MARK", latitude="IP-MARK",
+            longitude=float("nan"),
+        )
+
+    c_marked, _ = c_run(IpTransport(
+        groq=ip_completion(IP_REPLY), weather=c_marked_weather(),
+    ))
+    c_marked_out = ip_job(
+        IpTransport(groq=ip_completion(IP_REPLY), weather=c_marked_weather()),
+        stub_weather=False,
+    )["stdout"]
+
+    check(
+        "C: the observation copies no provider text",
+        isinstance(c_marked.get("location_observation"), dict)
+        and all(
+            key in c_marked["location_observation"]
+            for key in (
+                "returned_timezone", "returned_latitude", "returned_longitude",
+            )
+        )
+        and c_marked["location_observation"]["returned_timezone"] is None
+        and c_marked["location_observation"]["returned_latitude"] is None
+        and c_marked["location_observation"]["returned_longitude"] is None
+        and "IP-MARK" not in json_text(c_marked["location_observation"])
+        and "LOCATION OBSERVATION" in c_marked_out
+        and "IP-MARK" not in c_marked_out.split(
+            "LOCATION OBSERVATION", 1
+        )[1].splitlines()[0],
+    )
+
+    # ------------------------------------------------------------
+    # D. Warning verification is separate from assessment validity;
+    # alert authorization is centralized and never granted.
+    # ------------------------------------------------------------
+    check(
+        "D: NOT_CHECKED is the only warning status this program produces",
+        official_warning_verification()
+        == {"status": "NOT_CHECKED", "authority": None, "validity": None}
+        and WARNING_VERIFICATION_STATES == (
+            "NOT_CHECKED", "VERIFIED_NONE", "VERIFIED_ACTIVE", "UNAVAILABLE",
+        ),
+    )
+
+    d_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    d_production = [
+        node for node in d_tree.body
+        if not (isinstance(node, ast.FunctionDef) and node.name == "run_tests")
+    ]
+    d_status_literals = []
+    d_send_alert_values = []
+    d_send_alert_owners = set()
+
+    for top in d_production:
+        owner = getattr(top, "name", "<module>")
+
+        for node in ast.walk(top):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                    ):
+                        if target.slice.value == "official_warning_status":
+                            d_status_literals.append(
+                                isinstance(node.value, ast.Constant)
+                            )
+
+                        if target.slice.value == "send_alert":
+                            d_send_alert_values.append(node.value)
+                            d_send_alert_owners.add(owner)
+
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None)
+                == "reject_unverified_warning_claims"
+                and len(node.args) > 1
+            ):
+                d_status_literals.append(
+                    isinstance(node.args[1], ast.Constant)
+                )
+
+    check(
+        "D: no warning status is hard-coded outside the producer",
+        d_status_literals != [] and not any(d_status_literals),
+    )
+
+    check(
+        "D: the model still sees the program-reported NOT_CHECKED status",
+        "NOT_CHECKED (program-reported)"
+        in json_text(ip_ok_body.get("messages")),
+    )
+
+    d_claim = {"reasoning": "No official warning is in effect."}
+
+    check(
+        "D: the claim guard runs under every warning status",
+        all(
+            isinstance(
+                b2_raised(lambda status=status: reject_unverified_warning_claims(
+                    dict(d_claim), status
+                )),
+                UnverifiedWarningClaim,
+            )
+            for status in (
+                "NOT_CHECKED", "VERIFIED", "VERIFIED_NONE",
+                "VERIFIED_ACTIVE", "UNAVAILABLE", None,
+            )
+        ),
+    )
+
+    def d_status(**fields):
+        decision = {
+            "incomplete_reasons": [], "risk_score": 7.0,
+            "policy_status": "AVAILABLE",
+            "weather_retrieval_status": "AVAILABLE",
+            "official_warning_status": "NOT_CHECKED",
+        }
+        decision.update(fields)
+
+        return enforce_assessment_status(decision)
+
+    check(
+        "D: NOT_CHECKED warnings no longer decide assessment validity",
+        d_status()["assessment_status"] == "COMPLETE"
+        and d_status()["incomplete_reasons"] == [],
+    )
+
+    check(
+        "D: any missing requirement keeps the assessment INCOMPLETE",
+        all(
+            d_status(**fields)["assessment_status"] == "INCOMPLETE"
+            for fields in (
+                {"incomplete_reasons": [{"code": "X", "detail": None}]},
+                {"risk_score": None},
+                {"weather_retrieval_status": "UNAVAILABLE"},
+                {"policy_status": None},
+            )
+        ),
+    )
+
+    check(
+        "D: an unavailable policy gives UNAVAILABLE, never COMPLETE or INCOMPLETE",
+        d_status(policy_status="UNAVAILABLE")["assessment_status"]
+        == "UNAVAILABLE"
+        and d_status(
+            policy_status="UNAVAILABLE", risk_score=7.0, incomplete_reasons=[]
+        )["assessment_status"] == "UNAVAILABLE"
+        and d_status(policy_status="UNKNOWN")["assessment_status"]
+        == "INCOMPLETE"
+        and d_status(policy_status=None)["assessment_status"] == "INCOMPLETE"
+        and d_status(weather_retrieval_status="UNAVAILABLE")[
+            "assessment_status"
+        ] == "INCOMPLETE",
+    )
+
+    check(
+        "D: with today's evidence gates no assessment is COMPLETE",
+        ip_ok_decision["assessment_status"] == "INCOMPLETE"
+        and "RISK_DIMENSIONS_UNASSESSED" in [
+            reason["code"] for reason in ip_ok_decision["incomplete_reasons"]
+        ]
+        and "OFFICIAL_WARNINGS_NOT_VERIFIED" not in [
+            reason["code"] for reason in ip_ok_decision["incomplete_reasons"]
+        ]
+        and ip_ok_decision["official_warning_status"] == "NOT_CHECKED",
+    )
+
+    d_no_alert = ip_agent(IpTransport(groq=ip_completion(
+        dict(IP_REPLY, alert_recommendation="NO_ALERT_RECOMMENDED")
+    )))
+
+    check(
+        "D: a no-alert conclusion never survives unchecked warnings",
+        d_no_alert["alert_recommendation"] != "NO_ALERT_RECOMMENDED"
+        and apply_official_warning_guard({
+            "alert_recommendation": "NO_ALERT_RECOMMENDED",
+            "limitations": [], "missing_evidence": [],
+        })["alert_recommendation"] == "MONITOR",
+    )
+
+    check(
+        "D: send_alert is only ever assigned False, in one function",
+        d_send_alert_values != []
+        and all(
+            isinstance(value, ast.Constant) and value.value is False
+            for value in d_send_alert_values
+        )
+        and d_send_alert_owners == {"apply_alert_authorization"},
+    )
+
+    d_complete = d_status()
+    apply_alert_authorization(d_complete, assessment_failed=False)
+    d_failed = apply_alert_authorization({}, assessment_failed=True)
+
+    check(
+        "D: even a COMPLETE assessment is never authorized to alert",
+        d_complete["assessment_status"] == "COMPLETE"
+        and d_complete["send_alert"] is False
+        and d_complete["approval_status"] == "PENDING_REVIEW"
+        and d_complete["alert_message"] == ""
+        and d_complete["notification_status"] == "NOT_SENT"
+        and d_failed == {
+            "approval_status": "NOT_AUTHORIZED", "send_alert": False,
+            "alert_message": "", "notification_status": "NOT_SENT",
+        },
+    )
+
+    # ------------------------------------------------------------
+    # E. Outcome classification, exit codes, annotations and step
+    # summary, end to end through main() with transport-level stubs.
+    # ------------------------------------------------------------
+    check(
+        "E: exit codes are COMPLETE 0, INCOMPLETE 2, INVALID/UNAVAILABLE 1",
+        RUN_OUTCOME_EXIT_CODES == {
+            "COMPLETE": 0, "INCOMPLETE": 2, "INVALID": 1, "UNAVAILABLE": 1,
+        },
+    )
+
+    check(
+        "E: the script exits with main()'s return code",
+        any(
+            isinstance(node, ast.If)
+            and "raise SystemExit(main(sys.argv))" in ast.unparse(node)
+            for node in ast.parse(
+                Path(__file__).read_text(encoding="utf-8")
+            ).body
+        ),
+    )
+
+    check(
+        "E: run_agent_job returns the run outcome",
+        ip_ok["value"] == "INCOMPLETE" and ip_claim["value"] == "INVALID",
+    )
+
+    e_env_names = ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")
+
+    def e_main(transport, mode="agent-dry", extra=None, env=None, argv=None):
+        overrides = {
+            "HTTP": transport, "GROQ_API_KEY": "gsk_pin_test",
+            "SHEET_URL": IP_SHEET,
+        }
+        overrides.update(extra or {})
+        saved = {name: os.environ.pop(name, None) for name in e_env_names}
+        os.environ.update(env or {})
+        out = io.StringIO()
+        result = {"code": None, "raised": None}
+
+        def run():
+            with contextlib.redirect_stdout(out):
+                try:
+                    result["code"] = main(argv or ["weather_log.py", mode])
+                except Exception as exc:
+                    result["raised"] = exc
+
+        try:
+            ip_override(overrides, run)
+        finally:
+            for name in e_env_names:
+                os.environ.pop(name, None)
+
+            for name, value in saved.items():
+                if value is not None:
+                    os.environ[name] = value
+
+        text = out.getvalue()
+        fields = None
+        payload = None
+
+        if "RUN OUTCOME (program-generated):" in text:
+            fields, _ = json.JSONDecoder().raw_decode(
+                text.split("RUN OUTCOME (program-generated):", 1)[1].lstrip()
+            )
+
+        if "OUTPUT PAYLOAD:" in text:
+            payload, _ = json.JSONDecoder().raw_decode(
+                text.split("OUTPUT PAYLOAD:", 1)[1].lstrip()
+            )
+
+        result.update(
+            stdout=text, fields=fields, payload=payload,
+            annotations=[
+                line for line in text.splitlines() if line.startswith("::")
+            ],
+            sheet_posts=[url for url, _ in transport.posts if url == IP_SHEET],
+            calls=list(transport.calls),
+        )
+
+        return result
+
+    e_dir = Path(tempfile.mkdtemp())
+    (e_dir / "empty.md").write_text("", encoding="utf-8")
+
+    def e_transport(groq=None, weather=None, **kwargs):
+        return IpTransport(
+            groq=groq if groq is not None else ip_completion(IP_REPLY),
+            weather=(
+                weather if weather is not None
+                else IpResponse(200, json.dumps(ip_open_meteo()))
+            ),
+            **kwargs,
+        )
+
+    def e_raise(error):
+        def function(*args, **kwargs):
+            raise error
+
+        return function
+
+    class EBadWeatherResponse:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        def raise_for_status(self):
+            raise TypeError("IP-MARK programming error")
+
+        def json(self):
+            return {}
+
+    e_truncated = ip_provider_error(400, {
+        "message": "max completion tokens reached before generating a "
+                   "valid document IP-MARK",
+        "type": "invalid_request_error", "code": "json_validate_failed",
+        "failed_generation": "IP-MARK-FG",
+    })
+    e_claim_reply = ip_completion(
+        dict(IP_REPLY, reasoning="No official warnings were checked. IP-MARK")
+    )
+
+    e_matrix = [
+        ("an assessment with gated dimensions", e_transport(), {},
+         "INCOMPLETE", 2, "none", "none", "none"),
+        ("all dimensions evidenced (test-only gate removal)", e_transport(),
+         {"EVIDENCE_GATED_DIMENSIONS": {}}, "COMPLETE", 0, "none", "none",
+         "none"),
+        ("a non-Dubai city", e_transport(), {"CITY": "Lahore"},
+         "INVALID", 1, "CONFIGURATION_INVALID", "configuration", "none"),
+        ("a missing Groq key", e_transport(), {"GROQ_API_KEY": None},
+         "INVALID", 1, "CONFIGURATION_INVALID", "configuration", "none"),
+        ("a missing policy file", e_transport(),
+         {"GUIDELINES_PATH": e_dir / "none.md"},
+         "UNAVAILABLE", 1, "POLICY_UNAVAILABLE", "policy", "none"),
+        ("an empty policy file", e_transport(),
+         {"GUIDELINES_PATH": e_dir / "empty.md"},
+         "INVALID", 1, "POLICY_INVALID", "policy", "none"),
+        ("a weather network error",
+         e_transport(get_error=requests.ConnectionError("IP-MARK refused")),
+         {}, "UNAVAILABLE", 1, "WEATHER_UNAVAILABLE", "weather", "none"),
+        ("a weather response without hourly data",
+         e_transport(weather=IpResponse(200, json.dumps({
+             "current": {"time": "2026-11-08T12:00"}, "daily": {},
+         }))),
+         {}, "UNAVAILABLE", 1, "WEATHER_UNAVAILABLE", "weather", "none"),
+        ("a request over the character budget", e_transport(),
+         {"MAX_REQUEST_CHARS": 1000}, "UNAVAILABLE", 1,
+         "REQUEST_BUDGET_EXCEEDED", "assessment", "none"),
+        ("a completion-limit provider 400", e_transport(groq=e_truncated), {},
+         "INVALID", 1, "PROVIDER_ERROR", "assessment", "OUTPUT_TRUNCATED"),
+        ("another json_validate_failed",
+         e_transport(groq=ip_provider_error(400, {
+             "message": "IP-MARK", "type": "invalid_request_error",
+             "code": "json_validate_failed",
+         })),
+         {}, "INVALID", 1, "PROVIDER_ERROR", "assessment",
+         "OUTPUT_VALIDATION_UNSPECIFIED"),
+        ("a provider rate limit",
+         e_transport(groq=ip_provider_error(429, {
+             "code": "rate_limit_exceeded", "message": "IP-MARK",
+         })),
+         {}, "UNAVAILABLE", 1, "PROVIDER_ERROR", "assessment",
+         "RATE_LIMITED"),
+        ("a provider network error",
+         e_transport(post_error=requests.ConnectionError("IP-MARK refused")),
+         {}, "UNAVAILABLE", 1, "PROVIDER_ERROR", "assessment",
+         "NETWORK_ERROR"),
+        ("an unknown provider status",
+         e_transport(groq=ip_provider_error(600, {"message": "IP-MARK"})),
+         {}, "UNAVAILABLE", 1, "PROVIDER_ERROR", "assessment",
+         "PROVIDER_ERROR_UNCLASSIFIED"),
+        ("a truncated completion",
+         e_transport(groq=ip_completion(IP_REPLY, "length")), {},
+         "INVALID", 1, "PROVIDER_ERROR", "assessment", "OUTPUT_TRUNCATED"),
+        ("an invalid model response",
+         e_transport(groq=ip_completion({
+             key: value for key, value in IP_REPLY.items()
+             if key != "reasoning"
+         })),
+         {}, "INVALID", 1, "RESPONSE_INVALID", "assessment", "none"),
+        ("an unverified warning claim", e_transport(groq=e_claim_reply), {},
+         "INVALID", 1, "UNVERIFIED_WARNING_CLAIM", "assessment", "none"),
+    ]
+
+    e_results = {}
+
+    for label, transport, extra, outcome, code, failure, stage, provider in (
+        e_matrix
+    ):
+        result = e_main(transport, extra=extra)
+        e_results[label] = result
+        fields = result["fields"] or {}
+        check(
+            f"E: {label} exits {code} as {outcome}",
+            result["raised"] is None
+            and result["code"] == code
+            and fields.get("outcome") == outcome
+            and fields.get("exit_code") == code
+            and fields.get("failure_code") == failure
+            and fields.get("failure_stage") == stage
+            and fields.get("provider_category") == provider
+            and result["sheet_posts"] == [],
+        )
+
+    check(
+        "E: configuration and policy failures make no network call",
+        all(
+            e_results[label]["calls"] == []
+            for label in (
+                "a non-Dubai city", "a missing Groq key",
+                "a missing policy file", "an empty policy file",
+            )
+        )
+        and e_results["a request over the character budget"]["calls"]
+        == IP_BASELINE["dry_calls"][:2],
+    )
+
+    check(
+        "E: a missing policy gives assessment_status UNAVAILABLE (section 10)",
+        e_results["a missing policy file"]["payload"]["assessment_status"]
+        == "UNAVAILABLE"
+        and e_results["a missing policy file"]["payload"]["policy_status"]
+        == "UNAVAILABLE",
+    )
+
+    check(
+        "E: the gated dry run makes the pinned calls and no Sheets POST",
+        e_results["an assessment with gated dimensions"]["calls"]
+        == IP_BASELINE["dry_calls"],
+    )
+
+    e_internal = [
+        ("a policy-loader KeyError", e_transport(),
+         {"load_guidelines": e_raise(KeyError("IP-MARK"))}, "policy"),
+        ("a weather-response TypeError",
+         e_transport(weather=EBadWeatherResponse()), {}, "weather"),
+        ("a history ZeroDivisionError", e_transport(),
+         {"tool_get_history": e_raise(ZeroDivisionError("IP-MARK"))},
+         "history"),
+        ("a screening AttributeError", e_transport(),
+         {"identify_hazards": e_raise(AttributeError("IP-MARK"))},
+         "screening"),
+        ("an unknown hazard code (untyped ValueError)", e_transport(),
+         {"identify_hazards": lambda weather: {"BOGUS": ["x"]}}, "retrieval"),
+        ("a plain ValueError during assessment", e_transport(),
+         {"summarize_weather": e_raise(ValueError("IP-MARK"))}, "assessment"),
+        ("a Groq transport TypeError",
+         e_transport(post_error=TypeError("IP-MARK")), {}, "assessment"),
+    ]
+
+    for label, transport, extra, stage in e_internal:
+        result = e_main(transport, extra=extra)
+        e_results[label] = result
+        fields = result["fields"] or {}
+        check(
+            f"E: {label} is INTERNAL_ERROR, never a known cause",
+            result["raised"] is None
+            and result["code"] == 1
+            and fields.get("outcome") == "INVALID"
+            and fields.get("failure_code") == "INTERNAL_ERROR"
+            and fields.get("failure_stage") == stage
+            and fields.get("provider_category") == "none"
+            and result["sheet_posts"] == [],
+        )
+
+    check(
+        "E: every dry run prints the pinned payload with send_alert False",
+        all(
+            result["payload"] is not None
+            and sorted(result["payload"]) == IP_BASELINE["payload_keys"]
+            and result["payload"]["send_alert"] is False
+            and result["payload"]["alert_message"] == ""
+            for result in e_results.values()
+        ),
+    )
+
+    check(
+        "E: without GITHUB_ACTIONS no annotation is printed",
+        all(result["annotations"] == [] for result in e_results.values()),
+    )
+
+    e_summary = e_dir / "summary.md"
+    e_summary.write_text("PRE-EXISTING\n", encoding="utf-8")
+    e_env = {"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(e_summary)}
+    e_incomplete = e_main(e_transport(), env=e_env)
+    e_failed = e_main(e_transport(groq=e_truncated), env=e_env)
+    e_claimed = e_main(e_transport(groq=e_claim_reply), env=e_env)
+    e_complete = e_main(
+        e_transport(), extra={"EVIDENCE_GATED_DIMENSIONS": {}}, env=e_env
+    )
+    e_summary_text = e_summary.read_text(encoding="utf-8")
+
+    check(
+        "E: under GitHub Actions each run prints exactly one annotation",
+        e_incomplete["annotations"] == [
+            "::notice title=Assessment INCOMPLETE::exit_code=2"
+            " | reasons=RISK_DIMENSIONS_UNASSESSED | warnings=NOT_CHECKED"
+        ]
+        and e_failed["annotations"] == [
+            "::error title=Assessment INVALID::exit_code=1"
+            " | failure=PROVIDER_ERROR | stage=assessment"
+            " | provider=OUTPUT_TRUNCATED | claim=none"
+        ]
+        and e_claimed["annotations"] == [
+            "::error title=Assessment INVALID::exit_code=1"
+            " | failure=UNVERIFIED_WARNING_CLAIM | stage=assessment"
+            " | provider=none | claim=field=reasoning;pattern=3"
+        ]
+        and e_complete["annotations"] == [
+            "::notice title=Assessment COMPLETE::exit_code=0"
+            " | recommendation=MONITOR"
+        ]
+        and [e_incomplete["code"], e_failed["code"], e_claimed["code"],
+             e_complete["code"]] == [2, 1, 1, 0],
+    )
+
+    check(
+        "E: the step summary is appended, never overwritten",
+        e_summary_text.startswith("PRE-EXISTING\n")
+        and e_summary_text.count("### Weather assessment run") == 4,
+    )
+
+    check(
+        "E: the step summary records each outcome in fixed terms",
+        all(
+            row in e_summary_text
+            for row in (
+                "| Outcome | INCOMPLETE |", "| Exit code | 2 |",
+                "| Outcome | INVALID |", "| Provider error | OUTPUT_TRUNCATED |",
+                "| Warning claim | field=reasoning;pattern=3 |",
+                "| Outcome | COMPLETE |", "| Exit code | 0 |",
+                "| Official warning status | NOT_CHECKED |",
+                "| Location timezone matches request | yes |",
+                "| Hazards screened | HEAT |",
+            )
+        ),
+    )
+
+    e_sections = e_summary_text.split("### Weather assessment run")[1:]
+
+    def e_rows(section):
+        return {
+            line.split("|")[1].strip(): line.split("|")[2].strip()
+            for line in section.splitlines()
+            if line.startswith("| ") and line.count("|") == 3
+        }
+
+    e_summary_rows = [e_rows(section) for section in e_sections]
+    e_expected_rows = [
+        {   # INCOMPLETE: reasons kept, never labelled COMPLETE
+            "Outcome": "INCOMPLETE", "Exit code": "2",
+            "Assessment status": "INCOMPLETE",
+            "Incomplete reasons": "RISK_DIMENSIONS_UNASSESSED",
+            "Failure code": "none", "Failure stage": "none",
+        },
+        {   # provider output truncated
+            "Outcome": "INVALID", "Exit code": "1",
+            "Assessment status": "INCOMPLETE",
+            "Failure code": "PROVIDER_ERROR", "Failure stage": "assessment",
+            "Provider error": "OUTPUT_TRUNCATED",
+        },
+        {   # unverified warning claim
+            "Outcome": "INVALID", "Exit code": "1",
+            "Assessment status": "INCOMPLETE",
+            "Failure code": "UNVERIFIED_WARNING_CLAIM",
+            "Failure stage": "assessment",
+            "Warning claim": "field=reasoning;pattern=3",
+        },
+        {   # COMPLETE (test-only gate removal)
+            "Outcome": "COMPLETE", "Exit code": "0",
+            "Assessment status": "COMPLETE",
+            "Incomplete reasons": "none", "Failure code": "none",
+        },
+    ]
+
+    check(
+        "E: each step summary states its own status, reasons and failure code",
+        len(e_summary_rows) == 4
+        and all(
+            all(rows.get(key) == value for key, value in expected.items())
+            for rows, expected in zip(e_summary_rows, e_expected_rows)
+        )
+        and [rows.get("Assessment status") for rows in e_summary_rows]
+        == ["INCOMPLETE", "INCOMPLETE", "INCOMPLETE", "COMPLETE"],
+    )
+
+    e_public = (
+        "\n".join(
+            line
+            for result in list(e_results.values())
+            + [e_incomplete, e_failed, e_claimed, e_complete]
+            for line in result["annotations"]
+        )
+        + e_summary_text
+        + json_text([result["fields"] for result in e_results.values()])
+    )
+
+    check(
+        "E: annotations and summaries carry no model or provider text",
+        all(
+            marker not in e_public
+            for marker in (
+                "IP-MARK", "max completion tokens", "No official warnings",
+                "Heat screening triggered", "Limit strenuous", "gsk_",
+                "sheet.invalid", "open-meteo",
+            )
+        ),
+    )
+
+    check(
+        "E: every annotation line uses only the fixed format",
+        all(
+            re.fullmatch(
+                r"::(notice|warning|error) title=Assessment "
+                r"(COMPLETE|INCOMPLETE|INVALID|UNAVAILABLE)::"
+                r"[A-Za-z0-9_=|;, -]+",
+                line,
+            )
+            for result in (e_incomplete, e_failed, e_claimed, e_complete)
+            for line in result["annotations"]
+        ),
+    )
+
+    e_bogus = outcome_fields({
+        "assessment_status": "DONE::X",
+        "alert_recommendation": "SEND%0ANOW",
+        "incomplete_reasons": [
+            {"code": "EVIL::%0A"}, {"code": "RISK_DIMENSIONS_UNASSESSED"},
+            "not a dict",
+        ],
+        "failure_code": "PWNED", "failure_stage": "space",
+        "provider_error": {"category": "IP-MARK"},
+        "warning_claim_diagnostic": "field=x;pattern=9::IP-MARK",
+        "official_warning_status": "VERIFIED",
+        "hazard_screening": {"EVIL": [], "HEAT": []},
+        "sources": "not a list",
+        "location_observation": {
+            "timezone_matches_request": "yes",
+            "utc_offset_seconds_present": True,
+        },
+    }, "BOGUS")
+
+    check(
+        "E: the outcome formatter only emits closed-vocabulary values",
+        e_bogus == {
+            "outcome": "unknown", "exit_code": 1,
+            "assessment_status": "unknown",
+            "alert_recommendation": "unknown",
+            "incomplete_reasons": ["unknown", "RISK_DIMENSIONS_UNASSESSED"],
+            "failure_code": "unknown", "failure_stage": "unknown",
+            "provider_category": "unknown", "warning_claim": "unknown",
+            "official_warning_status": "unknown",
+            "hazards_screened": ["HEAT"], "policy_sources_cited": 0,
+            "location_timezone_matches": None,
+            "location_utc_offset_present": True,
+        }
+        and "IP-MARK" not in outcome_annotation(e_bogus)
+        and "IP-MARK" not in outcome_summary_markdown(e_bogus)
+        and _workflow_message("a%b\r\nc") == "a%25b%0D%0Ac",
+    )
+
+    e_bad_summary = e_main(e_transport(), env={
+        "GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(e_dir),
+    })
+
+    check(
+        "E: a step-summary write failure does not change the outcome",
+        e_bad_summary["code"] == 2
+        and "STEP SUMMARY: not written (file error)." in e_bad_summary["stdout"]
+        and len(e_bad_summary["annotations"]) == 1,
+    )
+
+    e_live_transport = e_transport()
+    e_live = e_main(e_live_transport, mode="agent")
+    e_live_payload = [body for url, body in e_live_transport.posts
+                      if url == IP_SHEET]
+
+    check(
+        "E: live mode writes one Sheets record, then exits 2 for INCOMPLETE",
+        e_live["raised"] is None
+        and e_live["code"] == 2
+        and e_live["sheet_posts"] == [IP_SHEET]
+        and len(e_live_payload) == 1
+        and sorted(e_live_payload[0]) == IP_BASELINE["payload_keys"]
+        and e_live_payload[0]["send_alert"] is False
+        and e_live["fields"]["outcome"] == "INCOMPLETE",
+    )
+
+    class ESheetDown(IpTransport):
+        def post(self, url, headers=None, json=None, timeout=None):
+            if url == IP_SHEET:
+                self.calls.append(("POST", url))
+                self.posts.append((url, json))
+                return IpResponse(503, "IP-MARK down")
+
+            return IpTransport.post(self, url, headers, json, timeout)
+
+    for label, transport in {
+        "an HTTP error": ESheetDown(
+            groq=ip_completion(IP_REPLY),
+            weather=IpResponse(200, json.dumps(ip_open_meteo())),
+        ),
+        "an unconfirmed write": e_transport(sheets="IP-MARK not ok"),
+    }.items():
+        result = e_main(transport, mode="agent")
+        check(
+            f"E: a Sheets write with {label} is SHEETS_WRITE_FAILED, re-raised",
+            isinstance(result["raised"], SheetsWriteError)
+            and result["code"] is None
+            and result["fields"]["outcome"] == "UNAVAILABLE"
+            and result["fields"]["failure_code"] == "SHEETS_WRITE_FAILED"
+            and result["fields"]["failure_stage"] == "sheets"
+            and "IP-MARK" not in json_text(result["fields"]),
+        )
+
+    e_test_calls = []
+    e_test_mode = e_main(
+        IpTransport(), argv=["weather_log.py", "test"],
+        extra={"run_tests": lambda: e_test_calls.append("run")},
+    )
+
+    try:
+        ip_override(
+            {"run_tests": e_raise(SystemExit(1))},
+            lambda: main(["weather_log.py", "test"]),
+        )
+        e_failing_exit = None
+    except SystemExit as exc:
+        e_failing_exit = exc.code
+
+    e_usage = e_main(IpTransport(), argv=["weather_log.py", "unknown-mode"])
+    e_search_transport = IpTransport()
+    e_search = e_main(
+        e_search_transport, argv=["weather_log.py", "search", "heat"]
+    )
+
+    check(
+        "E: test, search and usage modes keep their exit behaviour",
+        e_test_mode["code"] == 0 and e_test_calls == ["run"]
+        and e_failing_exit == 1
+        and e_usage["code"] == 1 and "Available commands:" in e_usage["stdout"]
+        and e_search["code"] == 0 and "SECTION:" in e_search["stdout"]
+        and e_search_transport.calls == [],
+    )
+
+    # ------------------------------------------------------------
+    # Review corrections L1-L5.
+    # ------------------------------------------------------------
+    # L1: only the typed policy failure is reported as a missing policy.
+    l1_untyped = ip_agent(
+        IpTransport(groq=ip_completion(IP_REPLY)),
+        extra={"summarize_weather": e_raise(FileNotFoundError("IP-MARK"))},
+    )
+
+    check(
+        "L1: an untyped FileNotFoundError is INTERNAL_ERROR, not a missing policy",
+        l1_untyped["run_outcome"] == "INVALID"
+        and l1_untyped["failure_code"] == "INTERNAL_ERROR"
+        and [r["code"] for r in l1_untyped["incomplete_reasons"]]
+        == ["ASSESSMENT_ERROR"]
+        and l1_untyped["incomplete_reasons"][0]["detail"] == "FileNotFoundError"
+        and l1_untyped["policy_status"] == "AVAILABLE",
+    )
+
+    l1_missing = ip_agent(
+        IpTransport(), extra={"GUIDELINES_PATH": e_dir / "absent.md"}
+    )
+
+    check(
+        "L1: a missing policy file is POLICY_UNAVAILABLE in every label",
+        l1_missing["run_outcome"] == "UNAVAILABLE"
+        and l1_missing["failure_code"] == "POLICY_UNAVAILABLE"
+        and l1_missing["failure_stage"] == "policy"
+        and [r["code"] for r in l1_missing["incomplete_reasons"]]
+        == ["POLICY_UNAVAILABLE"]
+        and l1_missing["policy_status"] == "UNAVAILABLE",
+    )
+
+    l1_stub = ip_agent(
+        IpTransport(),
+        extra={"load_guidelines": e_raise(FileNotFoundError("IP-MARK"))},
+    )
+
+    check(
+        "L1: an untyped loader error never claims the policy is missing",
+        l1_stub["failure_code"] == "INTERNAL_ERROR"
+        and l1_stub["policy_status"] == "UNKNOWN"
+        and "POLICY_UNAVAILABLE" not in [
+            r["code"] for r in l1_stub["incomplete_reasons"]
+        ],
+    )
+
+    # L2: a reporting failure names the real assessment status.
+    l2_incomplete = e_main(e_transport(sheets="IP-MARK not ok"), mode="agent")
+    l2_complete = e_main(
+        e_transport(sheets="IP-MARK not ok"), mode="agent",
+        extra={"EVIDENCE_GATED_DIMENSIONS": {}},
+    )
+
+    check(
+        "L2: a reporting failure names the actual assessment status",
+        isinstance(l2_incomplete["raised"], SheetsWriteError)
+        and l2_incomplete["fields"]["assessment_status"] == "INCOMPLETE"
+        and isinstance(l2_complete["raised"], SheetsWriteError)
+        and l2_complete["fields"]["assessment_status"] == "COMPLETE",
+    )
+
+    check(
+        "L2: naming the status leaves the outcome classification unchanged",
+        all(
+            result["code"] is None
+            and result["fields"]["outcome"] == "UNAVAILABLE"
+            and result["fields"]["failure_code"] == "SHEETS_WRITE_FAILED"
+            and result["fields"]["failure_stage"] == "sheets"
+            for result in (l2_incomplete, l2_complete)
+        ),
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        LAST_REPORTED_ASSESSMENT["status"] = "EVIL::X"
+        l2_bogus = emit_unhandled_failure(SheetsWriteError("x"))
+        LAST_REPORTED_ASSESSMENT["status"] = None
+        l2_none = emit_unhandled_failure(SheetsWriteError("x"))
+
+    check(
+        "L2: an unrecognised or missing status is reported as unknown",
+        l2_bogus["assessment_status"] == "unknown"
+        and l2_none["assessment_status"] == "unknown",
+    )
+
+    # L3: the realistic-history request (3 history records) is pinned too.
+    check(
+        "Pin: realistic-history Groq request is byte-identical to be5524a",
+        len(fz_request) == 17240
+        and ip_sha(fz_request)
+        == "f93405f17b7576003b75d4a9624e3158fabc3de428edf6abad497eab7627b081",
+    )
+
+    # L4: the dry-run payload stays the last output.
+    check(
+        "L4: the dry-run payload is still the last output",
+        ip_dry["stdout"].rstrip().endswith(json_text(ip_dry["payload"]))
+        and all(
+            result["stdout"].rstrip().endswith(json_text(result["payload"]))
+            for result in e_results.values()
+        ),
+    )
+
+    # L5: an unclassified exception while reporting is INTERNAL_ERROR at
+    # the report stage, gets one safe annotation and is re-raised as is.
+    LAST_REPORTED_ASSESSMENT["status"] = "COMPLETE"
+    l5_summary = e_dir / "l5_summary.md"
+    l5 = e_main(
+        IpTransport(),
+        extra={"run_weather_agent": lambda: (
+            {"incomplete_reasons": [{"no_code": "IP-MARK"}], "sources": []},
+            [],
+        )},
+        env={"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(l5_summary)},
+    )
+    l5_summary_text = (
+        l5_summary.read_text(encoding="utf-8") if l5_summary.exists() else ""
+    )
+
+    check(
+        "L5: an unclassified reporting error is INTERNAL_ERROR at report",
+        type(l5["raised"]) is KeyError
+        and l5["raised"].args == ("code",)
+        and l5["code"] is None
+        and l5["fields"] is not None
+        and l5["fields"]["outcome"] == "INVALID"
+        and l5["fields"]["exit_code"] == 1
+        and l5["fields"]["failure_code"] == "INTERNAL_ERROR"
+        and l5["fields"]["failure_stage"] == "report"
+        and l5["fields"]["assessment_status"] == "unknown",
+    )
+
+    check(
+        "L5: the reporting error gets one safe annotation and a summary",
+        l5["annotations"] == [
+            "::error title=Assessment INVALID::exit_code=1"
+            " | failure=INTERNAL_ERROR | stage=report | provider=none"
+            " | claim=none"
+        ]
+        and "| Failure stage | report |" in l5_summary_text
+        and "IP-MARK" not in l5_summary_text + "".join(l5["annotations"]),
+    )
+
+    # ------------------------------------------------------------
+    # Approved corrections: policy-unavailable status consistency and
+    # one authoritative INCOMPLETE warning.
+    # ------------------------------------------------------------
+    p1_summary = e_dir / "p1_summary.md"
+    p1_summary.write_text("", encoding="utf-8")
+    p1 = e_main(
+        e_transport(), extra={"GUIDELINES_PATH": e_dir / "absent.md"},
+        env={"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": str(p1_summary)},
+    )
+    p1_text = p1_summary.read_text(encoding="utf-8")
+
+    check(
+        "P1: a missing policy reads UNAVAILABLE on every surface",
+        p1["raised"] is None
+        and p1["code"] == 1
+        and p1["payload"].get("assessment_status") == "UNAVAILABLE"
+        and p1["payload"].get("policy_status") == "UNAVAILABLE"
+        and p1["payload"].get("alert_recommendation") == "UNABLE_TO_ASSESS"
+        and p1["payload"].get("send_alert") is False
+        and p1["payload"].get("alert_message") == ""
+        and p1["payload"].get("approval_status") == "NOT_AUTHORIZED"
+        and p1["payload"].get("notification_status") == "NOT_SENT"
+        and "ASSESSMENT: UNAVAILABLE" in p1["stdout"]
+        and p1["fields"]["outcome"] == "UNAVAILABLE"
+        and p1["fields"]["assessment_status"] == "UNAVAILABLE"
+        and p1["fields"]["failure_code"] == "POLICY_UNAVAILABLE"
+        and p1["fields"]["exit_code"] == 1
+        and "| Assessment status | UNAVAILABLE |" in p1_text
+        and "| Outcome | UNAVAILABLE |" in p1_text
+        and p1["annotations"] == [
+            "::error title=Assessment UNAVAILABLE::exit_code=1"
+            " | failure=POLICY_UNAVAILABLE | stage=policy | provider=none"
+            " | claim=none"
+        ]
+        and p1["sheet_posts"] == []
+        and p1["calls"] == [],
+    )
+
+    check(
+        "P1: every other failure keeps assessment_status INCOMPLETE",
+        all(
+            e_results[label]["payload"].get("assessment_status") == "INCOMPLETE"
+            and e_results[label]["fields"].get("assessment_status") == "INCOMPLETE"
+            for label in (
+                "an empty policy file", "a weather network error",
+                "a provider rate limit", "an invalid model response",
+                "an unverified warning claim", "a policy-loader KeyError",
+                "a request over the character budget",
+            )
+        )
+        and l1_untyped.get("assessment_status") == "INCOMPLETE"
+        and l1_stub.get("assessment_status") == "INCOMPLETE",
+    )
+
+    p1_policy = GUIDELINES_PATH.read_text(encoding="utf-8")
+    p1_unavailable = p1_policy.split(
+        "### If the guidelines file is unavailable", 1
+    )[1].split("### If the guidelines file is available", 1)[0]
+    p1_statuses = p1_policy.split("### Assessment status", 1)[1].split(
+        "A complete assessment requires", 1
+    )[0]
+
+    check(
+        "P1: guidelines section 10 and the code agree on the status",
+        re.findall(r"`assessment_status = (\w+)`", p1_unavailable)
+        == ["UNAVAILABLE"]
+        and re.findall(r"`assessment_status = (\w+)`", p1_unavailable)[0]
+        == p1["payload"].get("assessment_status")
+        and re.findall(r"^- `(\w+)`$", p1_statuses, re.M)
+        == ["COMPLETE", "INCOMPLETE", "INVALID", "UNAVAILABLE"]
+        and "`UNAVAILABLE` applies when the policy file cannot be retrieved "
+        "(section 10); no assessment is attempted." in p1_statuses,
+    )
+
+    # Duplicate and missing warnings: the program's own annotations are
+    # replayed by the stub, so the combined output is what the run shows.
+    p2_usable = (
+        wf_probe is not None and wf_probe["args"] == "weather_log.py agent-dry"
+    )
+
+    check(
+        "P2: the program reports INCOMPLETE as a notice with its reasons",
+        e_incomplete["annotations"] != []
+        and not any(
+            line.startswith("::warning") for line in e_incomplete["annotations"]
+        )
+        and all(
+            line.startswith("::notice title=Assessment INCOMPLETE::")
+            and "reasons=RISK_DIMENSIONS_UNASSESSED" in line
+            for line in e_incomplete["annotations"]
+        ),
+    )
+
+    if not p2_usable:
+        wf_skipped.append("duplicate-warning")
+        print(
+            "SKIP: duplicate-warning checks (no usable POSIX bash). "
+            "The INCOMPLETE warning count is then not exercised."
+        )
+    else:
+        p2_both = wf_run_step(2, emit=e_incomplete["annotations"])
+        p2_silent = wf_run_step(2)
+        p2_complete = wf_run_step(0, emit=e_complete["annotations"])
+        p2_failed = wf_run_step(1, emit=p1["annotations"])
+
+        def p2_levels(result, level):
+            return [
+                line for line in result["annotations"]
+                if line.startswith("::" + level)
+            ]
+
+        check(
+            "P2: an INCOMPLETE run shows exactly one warning, reasons kept",
+            p2_both["code"] == 0
+            and p2_levels(p2_both, "warning") == [wf_warning_text]
+            and p2_levels(p2_both, "notice") == e_incomplete["annotations"]
+            and p2_levels(p2_both, "error") == [],
+        )
+
+        check(
+            "P2: exit 2 without any program annotation still warns once",
+            p2_silent["code"] == 0
+            and p2_levels(p2_silent, "warning") == [wf_warning_text]
+            and len(p2_silent["annotations"]) == 1,
+        )
+
+        check(
+            "P2: COMPLETE and failed runs show no INCOMPLETE warning",
+            p2_complete["code"] == 0
+            and p2_levels(p2_complete, "warning") == []
+            and p2_levels(p2_complete, "notice") == e_complete["annotations"]
+            and p2_failed["code"] == 1
+            and p2_levels(p2_failed, "warning") == []
+            and p2_levels(p2_failed, "error") == p1["annotations"],
+        )
+
+    for name, value in saved_actions_env.items():
+        if value is not None:
+            os.environ[name] = value
+
     print("\n========== TEST RESULTS ==========")
     print("Passed:", passed)
     print("Failed:", failed)
     print("Total:", passed + failed)
+
+    if wf_skipped:
+        print("Skipped (no usable bash):", ", ".join(wf_skipped))
 
     if failed:
         raise SystemExit(1)
@@ -10246,11 +13275,12 @@ def run_tests():
 # 14. COMMAND LINE
 # ============================================================
 
-if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "agent"
+def main(argv):
+    """Command-line entry point. Returns the process exit code."""
+    mode = argv[1] if len(argv) > 1 else "agent"
 
     if mode == "search":
-        query = " ".join(sys.argv[2:])
+        query = " ".join(argv[2:])
 
         if not query.strip():
             query = "weather safety hazards"
@@ -10270,21 +13300,30 @@ if __name__ == "__main__":
 
         except Exception as exc:
             print("POLICY SEARCH ERROR:", exc)
-            raise SystemExit(1)
+            return 1
 
-    elif mode == "test":
+        return 0
+
+    if mode == "test":
         run_tests()
+        return 0
 
-    elif mode == "agent-dry":
-        run_agent_job(dry=True)
+    if mode in ("agent-dry", "agent"):
+        try:
+            outcome = run_agent_job(dry=(mode == "agent-dry"))
+        except Exception as exc:
+            emit_unhandled_failure(exc)
+            raise
 
-    elif mode == "agent":
-        run_agent_job(dry=False)
+        return RUN_OUTCOME_EXIT_CODES[outcome]
 
-    else:
-        print("Available commands:")
-        print("python weather_log.py search heat risk")
-        print("python weather_log.py test")
-        print("python weather_log.py agent-dry")
-        print("python weather_log.py agent")
-        raise SystemExit(1)
+    print("Available commands:")
+    print("python weather_log.py search heat risk")
+    print("python weather_log.py test")
+    print("python weather_log.py agent-dry")
+    print("python weather_log.py agent")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

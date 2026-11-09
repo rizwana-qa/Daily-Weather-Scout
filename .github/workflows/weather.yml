@@ -16,7 +16,22 @@ jobs:
       - run: pip install requests
       # Dry run: no Google Sheets write and no email. Switch back to
       # "agent" only after the output has been reviewed.
-      - run: python weather_log.py agent-dry
+      # Exit codes of weather_log.py: 0 COMPLETE; 2 INCOMPLETE, an
+      # expected assessment outcome that is reported as a warning (the
+      # program writes the details to the job summary); 1 and any other
+      # code fail the job. The file check keeps the interpreter's own
+      # "cannot open file" exit code 2 from being read as INCOMPLETE.
+      - name: Run weather assessment (dry run)
+        run: |
+          test -f weather_log.py || { echo "::error title=Weather assessment::weather_log.py was not found."; exit 1; }
+          code=0
+          python weather_log.py agent-dry || code=$?
+          case "$code" in
+            0) ;;
+            2) echo "::warning title=Weather assessment INCOMPLETE::The program reported an INCOMPLETE assessment (exit code 2). This is an expected outcome, not an execution failure. This dry run sends no alert. See the job summary for the reasons." ;;
+            1) exit 1 ;;
+            *) echo "::error title=Weather assessment::Unexpected exit code $code from weather_log.py (expected 0, 1 or 2)."; exit "$code" ;;
+          esac
         env:
           SHEET_URL: ${{ secrets.SHEET_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
