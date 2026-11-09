@@ -463,7 +463,7 @@ The retrieval process must verify:
 Set:
 
 - `policy_status = UNAVAILABLE`
-- `assessment_status = INCOMPLETE`
+- `assessment_status = UNAVAILABLE`
 - `alert_recommendation = UNABLE_TO_ASSESS`
 
 Record the exact retrieval error.
@@ -520,6 +520,8 @@ Use:
 - `INCOMPLETE`
 - `INVALID`
 - `UNAVAILABLE`
+
+`UNAVAILABLE` applies when the policy file cannot be retrieved (section 10); no assessment is attempted. Other failures keep their existing status until they are defined here.
 
 A complete assessment requires the relevant policy, valid weather evidence and all essential dimensions for the hazard being evaluated.
 
