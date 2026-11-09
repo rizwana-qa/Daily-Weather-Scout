@@ -36,6 +36,7 @@ CITIES = {
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-20b"
+REASONING_EFFORT = "low"
 
 GUIDELINES_PATH = Path(__file__).resolve().parent / "guidelines.md"
 
@@ -49,8 +50,10 @@ SHEET_TIMEOUT = 30
 # Request budgets. Which hazard combinations fit is pinned by the budget
 # tests; anything larger fails closed (INCOMPLETE) before a request is
 # sent. The guards measure the messages plus the response schema.
-# The token figure uses the conservative estimator below (2.5
-# characters per token), not a provider tokenizer. 8,000 is the
+# The token figure uses the component-aware estimate (see "Component-
+# aware request token estimate"), or the legacy conservative estimate
+# (2.5 characters per token) for a request without parts; neither is a
+# provider tokenizer. 8,000 is the
 # documented base tokens-per-minute limit for openai/gpt-oss-20b; the
 # account's own limit is unverified, and Groq's 413/429 responses are
 # handled as safe failures.
@@ -838,9 +841,21 @@ def ask_groq(messages, temperature=0.1):
     if not GROQ_API_KEY:
         raise ConfigurationError("GROQ_API_KEY is missing.")
 
-    # Both guards measure the messages and the response schema.
+    # Both guards measure the messages and the response schema. The
+    # character guard runs first and is independent of the token guard.
     request_text = serialized_request(messages)
-    estimated_input_tokens = estimate_tokens(request_text)
+    estimate_error = None
+
+    try:
+        budget = request_token_budget(messages, request_text)
+    except RequestBudgetError as exc:
+        # An estimate that cannot be verified never bypasses the
+        # guard: it is raised below, after the character guard.
+        estimate_error = exc
+        budget = legacy_token_budget(request_text)
+        budget["method"] = "unverified"
+
+    estimated_input_tokens = budget["estimated_input_tokens"]
 
     estimated_total = (
         estimated_input_tokens + MAX_COMPLETION_TOKENS
@@ -852,6 +867,7 @@ def ask_groq(messages, temperature=0.1):
     print("Estimated total tokens:", estimated_total)
     print("Request characters:", len(request_text))
     print("Response schema characters:", len(json_text(RESPONSE_FORMAT)))
+    print_budget_components(budget)
 
     if len(request_text) > MAX_REQUEST_CHARS:
         raise RequestBudgetError(
@@ -859,6 +875,9 @@ def ask_groq(messages, temperature=0.1):
             f"schema) exceeds the configured {MAX_REQUEST_CHARS}-"
             "character limit."
         )
+
+    if estimate_error is not None:
+        raise estimate_error
 
     if estimated_total > MAX_ESTIMATED_REQUEST_TOKENS:
         raise RequestBudgetError(
@@ -873,7 +892,7 @@ def ask_groq(messages, temperature=0.1):
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
         # Groq documents reasoning_effort and include_reasoning for
         # openai/gpt-oss-20b; reasoning_format is not supported there.
-        "reasoning_effort": "low",
+        "reasoning_effort": REASONING_EFFORT,
         "include_reasoning": False,
         # Strict structured outputs: every field required, no extras.
         "response_format": RESPONSE_FORMAT,
@@ -941,12 +960,31 @@ def ask_groq(messages, temperature=0.1):
         ),
         "estimated_input_tokens": estimated_input_tokens,
         "completion_allowance": MAX_COMPLETION_TOKENS,
+        "estimator_method": budget["method"],
+        "legacy_estimated_input_tokens": (
+            budget["legacy_estimated_input_tokens"]
+        ),
     })
 
     print("\nGROQ USAGE (reported by the API)")
 
     for key, value in LAST_GROQ_USAGE.items():
         print(f"{key}: {value}")
+
+    # Log only: a provider count above the estimate never changes the
+    # outcome, but it must be visible.
+    provider_prompt_tokens = LAST_GROQ_USAGE["prompt_tokens"]
+
+    if (
+        type(provider_prompt_tokens) is int
+        and provider_prompt_tokens > estimated_input_tokens
+    ):
+        print(
+            "ESTIMATOR UNDERRUN: provider prompt_tokens",
+            provider_prompt_tokens,
+            "exceeds the estimate",
+            estimated_input_tokens,
+        )
 
     if finish_reason != "stop":
         raise ProviderError(
@@ -2103,6 +2141,466 @@ def serialized_request(messages):
     return json_text({"messages": messages, "response_format": RESPONSE_FORMAT})
 
 
+# ============================================================
+# Component-aware request token estimate
+# ============================================================
+#
+# estimate_tokens() counts 2.5 characters per token over the whole
+# serialized request. Measured offline with the o200k_harmony tokenizer
+# (the gpt-oss tokenizer; a development-time tool only, never imported
+# here) it over-counts static prompt and policy text by about two times,
+# while digit-heavy evidence JSON runs near 2.2 characters per token.
+# The estimate below therefore counts each part of a request by what it
+# is, and the legacy estimate stays as the fallback and for direct calls:
+#
+# - static text (chat template, system prompt, instructions, response
+#   schema, policy blocks): token counts pinned by the SHA-256 of the
+#   exact text, generated by tools/token_table.py;
+# - numeric evidence JSON: an empirical bound of 13 tokens per 20 bytes
+#   (worst measured 0.52 tokens per byte);
+# - agent history JSON: one token per byte, an upper bound for any text
+#   because every token covers at least one byte;
+# - two provider-side allowances, kept separate. The historical one is
+#   the largest unexplained difference between a local count and
+#   recorded provider usage (JSON-object runs). The schema one is an
+#   assumption for strict-mode accounting. One strict-mode record exists
+#   (run #41, HEAT only: provider 4,112 tokens against a local
+#   reconstruction of about 4,109); a three-hazard request has never been
+#   sent to Groq, so its provider count is unverified.
+#
+# The harmony chat layout below is OpenAI's documented format. Groq's own
+# rendering is not public, so the layout is a reconstruction whose
+# unexplained difference the historical allowance covers.
+
+PROVIDER_ALLOWANCE_HISTORICAL_TOKENS = 192
+PROVIDER_ALLOWANCE_SCHEMA_TOKENS = 300
+
+# (numerator, denominator) of tokens per byte.
+NUMERIC_EVIDENCE_TOKEN_RATIO = (13, 20)
+HISTORY_TOKEN_RATIO = (1, 1)
+
+# Program-generated evidence holds few strings. More text than this (or
+# any non-ASCII) is counted at one token per byte instead of the
+# empirical numeric ratio.
+NUMERIC_EVIDENCE_TEXT_BYTES_LIMIT = 2500
+
+# The allowances and ratios were derived for exactly this request
+# configuration. Any difference falls back to the legacy estimate.
+ESTIMATOR_PINS = {
+    "model": "openai/gpt-oss-20b",
+    "reasoning_effort": "low",
+    "response_format_sha256": (
+        "ca0d29d77c08dd5f0ea03ef140952e36187778a2abf5153d34e9fc4fa913f315"
+    ),
+}
+
+HARMONY_SYSTEM_TEXT = (
+    "<|start|>system<|message|>You are ChatGPT, a large language model "
+    "trained by OpenAI.\nKnowledge cutoff: 2024-06\n"
+    "Current date: 2026-11-09\n\nReasoning: low\n\n"
+    "# Valid channels: analysis, commentary, final. Channel must be "
+    "included for every message.<|end|>"
+)
+HARMONY_DEVELOPER_PREFIX = (
+    "<|start|>developer<|message|># Instructions\n\n"
+)
+HARMONY_USER_PREFIX = "<|end|><|start|>user<|message|>"
+HARMONY_ASSISTANT_TAIL = "<|end|><|start|>assistant"
+
+# BEGIN STATIC_TOKEN_TABLE
+STATIC_TOKEN_TABLE_META = {
+    "encoding": "o200k_harmony",
+    "tokenizer": "tiktoken 0.14.0",
+    "entries": 28,
+}
+
+STATIC_TOKEN_TABLE = {
+    # chat template: system message
+    "2f7aa320695440f44ba8954b669b1609ce5c2fde7da59f5a12324af443ba2f0d": 61,
+    # chat template: developer prefix and system prompt
+    "15c0844a9f1ccabb01d31e936fa9c53c0eb8c75fc2a3976680114711fc982d77": 311,
+    # response format section
+    "a0681249b32cac03fde57309a8b463bcc6e4d24465f7676980f2b04bb739eb62": 288,
+    # chat template: user prefix and instructions
+    "d47206cd430b829227e0e7acb6fafeee0396f0c9fd0cfffa6da8722ec77609a0": 69,
+    # policy block separator
+    "75a11da44c802486bc6f65640aa48a730f0f684c5c07a42ba3cd1735eb3fb070": 1,
+    # evidence heading
+    "7494512a07022b4975f686099bd88f35d9db63959f0ec7d48a65d3633dee1b40": 9,
+    # chat template: assistant header
+    "b5718bd75e24fe8c88e0b835aaaeac8aa27d6eada8aa7ae062a34b9a542699cf": 3,
+    # policy block: 1. Purpose and Governing Principles
+    "63756f4029b90ed364ed8ced100dabd509687b5825b6acda408ce2cb20bde2a4": 261,
+    # policy block: 2. Official Sources and Evidence Hierarchy
+    "cde04a58e406dad8792a79073c54288e105f892fa4f224d803cb28b10dc23236": 294,
+    # policy block: 3. Evidence Quality and Confidence
+    "083048653dfbeb5de0e108cf027a618b57ed8acc2af45e7af05b39c91d742294": 211,
+    # policy block: 4. Risk Assessment Dimensions
+    "c667cfc7f237432b3d3fee8fd869cce7aa70a2a31ae642c364020667fe6ace7c": 634,
+    # policy block: 5. Risk Calculation Model
+    "8b26003d25d76cb0261d7ab90ec2b11b2234a084a602a11ec772ed3fc091edb8": 384,
+    # policy block: 6. Weather Hazard Assessment
+    "f32394c681866719a2a743b84897fa11bdbca35ad214c0cdd643dbdd1d04b0f6": 31,
+    # policy block: 7. Regulatory and Workplace Compliance
+    "a1c5f7e8ce3cecd3a54cc3bd763d0b7189c955ec71801fb9d14861d6e4a816c8": 162,
+    # policy block: 8. Alert Decision Framework
+    "be0a36d5feb17e725ecb26005483f3ed3a8db21c22b2a1b1396f4c22a22c6927": 407,
+    # policy block: 9. Official Warning Override
+    "feb93cda8c408d5da1245c5120e3917e9497815b33684a4ac606cbb3ceb3f131": 144,
+    # policy block: 10. Policy Retrieval and Validation
+    "8385e20b46ba0c68dc3dea33ef2a074265b0507120c29a56086cadf31b46b176": 268,
+    # policy block: 11. Data Quality and Assessment Completeness
+    "0ad9becb5d1e3ed9bf4497321705bd13dc179f779877c1aba2b3419d01587b87": 235,
+    # policy block: 12. Required Structured Assessment Output
+    "0a22d109a225fd9d4a9b78633468d5ed96a0f5cd8d28dd8ebbb07fdb6bb363a9": 393,
+    # policy block: 13. Advice and Communication Requirements
+    "b8f5c427b77c410950707fdf6b60d5db92eba0565f032ca10f7aa0e63f31887d": 164,
+    # policy block: 14. Human Approval and Notification Governance
+    "e8b145fa9d06812c976e275d9992467153405bfe317bfaff409c4dc8acdc0e94": 186,
+    # policy block: 15. Assessment Quality and Consistency Rules
+    "4367bf0f9d2a7d55674b4b50f557c898b062630a9ab82e2b97958d10b9bcbad4": 166,
+    # policy block: 16. Final Decision Rule
+    "29fec544c492e7819077d841a891568a723ee73ca94c3dbff038c6f5c385afd0": 166,
+    # policy block: 6.1 Extreme Heat
+    "8f5a2a111efc991a7cb084151a2d6583d5c9d53b52d31a8229b9ba92c7189fcc": 188,
+    # policy block: 6.2 Wind and Dust
+    "f58f50675dc1752a219fb1c07a3e149acfa2d99cd3dc18916aef1444d2d21f54": 119,
+    # policy block: 6.3 Rain, Thunderstorms and Flooding
+    "63356fe8a7444b174460be9afb4518afe8c88dee24f9b4462d9a8769415345a4": 140,
+    # policy block: 6.4 Low Temperatures and Cold Conditions
+    "796ff476b73adc70448517bff60a80d8eaee11752721a96449031e80f5021693": 84,
+    # policy block: 6.5 Lightning and Thunderstorms
+    "e7634ca7f177fb2fb1475f2861e8893ef3817d22acf2f4d4a59f821e648f4e9b": 89,
+}
+# END STATIC_TOKEN_TABLE
+
+
+class RequestParts:
+    """
+    The components a chat request is assembled from, kept so the
+    estimate can count each one. The estimator rebuilds the messages from
+    these parts and refuses to estimate if they differ by a single byte.
+    """
+
+    __slots__ = (
+        "system", "preamble", "blocks", "evidence_text", "history_text",
+    )
+
+    def __init__(self, system, preamble, blocks, evidence_text,
+                 history_text):
+        self.system = system
+        self.preamble = preamble
+        self.blocks = tuple(blocks)
+        self.evidence_text = evidence_text
+        self.history_text = history_text
+
+
+class BudgetedMessages(list):
+    """
+    A plain list of chat messages that also carries its RequestParts. It
+    compares equal to, and serializes exactly like, the list it wraps.
+    """
+
+    def __init__(self, messages, parts):
+        super().__init__(messages)
+        self.budget_parts = parts
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def response_format_section_text():
+    return (
+        "\n\n# Response Formats\n\n## "
+        + RESPONSE_SCHEMA_NAME
+        + "\n\n"
+        + json_text(RESPONSE_FORMAT["json_schema"]["schema"])
+    )
+
+
+def static_token_texts(policy):
+    """
+    Every static text a request can contain, as (label, text) pairs: the
+    chat template, the prompts, the response schema and every policy
+    block. tools/token_table.py counts these; the estimator looks them up.
+    """
+    items = [
+        ("chat template: system message", HARMONY_SYSTEM_TEXT),
+        (
+            "chat template: developer prefix and system prompt",
+            HARMONY_DEVELOPER_PREFIX + SYSTEM_PROMPT.strip(),
+        ),
+        ("response format section", response_format_section_text()),
+        (
+            "chat template: user prefix and instructions",
+            HARMONY_USER_PREFIX + USER_PROMPT_PREAMBLE,
+        ),
+        ("policy block separator", POLICY_BLOCK_JOIN),
+        ("evidence heading", EVIDENCE_HEADING),
+        ("chat template: assistant header", HARMONY_ASSISTANT_TAIL),
+    ]
+
+    parent, intro, subsections = parse_hazard_sections(policy)
+
+    for title, text in policy["sections"].items():
+        items.append((
+            f"policy block: {title}",
+            policy_block_text(title, intro if title == parent else text),
+        ))
+
+    for title, text in subsections.items():
+        items.append((
+            f"policy block: {title}", policy_block_text(title, text)
+        ))
+
+    return items
+
+
+def unverified_estimate(reason):
+    return RequestBudgetError(
+        "Groq request blocked: the request token estimate could not be "
+        f"verified ({reason})."
+    )
+
+
+def verify_static_token_table():
+    table = STATIC_TOKEN_TABLE
+
+    valid = (
+        type(table) is dict
+        and table
+        and STATIC_TOKEN_TABLE_META.get("encoding") == "o200k_harmony"
+        and STATIC_TOKEN_TABLE_META.get("entries") == len(table)
+        and all(
+            type(key) is str
+            and re.fullmatch(r"[0-9a-f]{64}", key)
+            and type(value) is int
+            and value > 0
+            for key, value in table.items()
+        )
+    )
+
+    if not valid:
+        raise unverified_estimate("static token table is stale or invalid")
+
+
+def static_token_count(text):
+    count = STATIC_TOKEN_TABLE.get(sha256_text(text))
+
+    if type(count) is not int or count <= 0:
+        raise unverified_estimate("static token table is stale or invalid")
+
+    return count
+
+
+def estimator_pins_match():
+    return (
+        MODEL == ESTIMATOR_PINS["model"]
+        and REASONING_EFFORT == ESTIMATOR_PINS["reasoning_effort"]
+        and sha256_text(json_text(RESPONSE_FORMAT))
+        == ESTIMATOR_PINS["response_format_sha256"]
+    )
+
+
+def ceil_ratio(byte_count, ratio):
+    numerator, denominator = ratio
+
+    return -(-byte_count * numerator // denominator)
+
+
+def evidence_text_bytes(value):
+    """UTF-8 bytes of every string (keys and values) in parsed JSON."""
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+
+    if isinstance(value, dict):
+        return sum(
+            len(str(key).encode("utf-8")) + evidence_text_bytes(item)
+            for key, item in value.items()
+        )
+
+    if isinstance(value, list):
+        return sum(evidence_text_bytes(item) for item in value)
+
+    return 0
+
+
+def verify_request_parts(messages, parts):
+    """Raise unless the parts rebuild the messages byte for byte."""
+    if type(parts) is not RequestParts:
+        raise unverified_estimate("request parts are malformed")
+
+    texts = (
+        parts.system, parts.preamble, parts.evidence_text,
+        parts.history_text,
+    )
+
+    if not all(type(text) is str for text in texts) or not all(
+        type(block) is str for block in parts.blocks
+    ):
+        raise unverified_estimate("request parts are malformed")
+
+    well_formed = (
+        isinstance(messages, list)
+        and len(messages) == 2
+        and all(
+            type(message) is dict
+            and set(message) == {"role", "content"}
+            and type(message["content"]) is str
+            for message in messages
+        )
+        and [message["role"] for message in messages]
+        == ["system", "user"]
+    )
+
+    if not well_formed:
+        raise unverified_estimate("request parts are malformed")
+
+    user_text = (
+        parts.preamble
+        + POLICY_BLOCK_JOIN.join(parts.blocks)
+        + EVIDENCE_HEADING
+        + parts.evidence_text
+    )
+
+    if (
+        messages[0]["content"] != parts.system
+        or messages[1]["content"] != user_text
+    ):
+        raise unverified_estimate(
+            "request parts do not rebuild the messages"
+        )
+
+    try:
+        evidence = json.loads(parts.evidence_text)
+    except ValueError:
+        raise unverified_estimate("request parts are malformed") from None
+
+    if (
+        type(evidence) is not dict
+        or json_text(evidence.get("recent_agent_history"))
+        != parts.history_text
+        or parts.history_text not in parts.evidence_text
+    ):
+        raise unverified_estimate("request parts are malformed")
+
+    return evidence
+
+
+def legacy_token_budget(request_text):
+    estimate = estimate_tokens(request_text)
+
+    return {
+        "method": "legacy",
+        "estimated_input_tokens": estimate,
+        "legacy_estimated_input_tokens": estimate,
+        "reason": None,
+        "components": {},
+    }
+
+
+def request_token_budget(messages, request_text):
+    """
+    The token estimate that gates a request. Plain message lists, and any
+    request whose model, schema or reasoning-effort pin differs, use the
+    legacy estimate. A request carrying its parts is counted by component;
+    if that cannot be verified, RequestBudgetError is raised and the
+    request is never sent.
+    """
+    budget = legacy_token_budget(request_text)
+    parts = getattr(messages, "budget_parts", None)
+
+    if parts is None:
+        budget["reason"] = "no request parts"
+        return budget
+
+    if not estimator_pins_match():
+        budget["reason"] = (
+            "model, response schema or reasoning effort differs from the "
+            "pinned configuration"
+        )
+        return budget
+
+    try:
+        verify_static_token_table()
+        evidence = verify_request_parts(messages, parts)
+
+        static_items = [
+            HARMONY_SYSTEM_TEXT,
+            HARMONY_DEVELOPER_PREFIX + parts.system,
+            response_format_section_text(),
+            HARMONY_USER_PREFIX + parts.preamble,
+            *parts.blocks,
+            *([POLICY_BLOCK_JOIN] * max(len(parts.blocks) - 1, 0)),
+            EVIDENCE_HEADING,
+            HARMONY_ASSISTANT_TAIL,
+        ]
+        static_tokens = sum(static_token_count(text) for text in static_items)
+
+        history_bytes = len(parts.history_text.encode("utf-8"))
+        numeric_text = parts.evidence_text.replace(parts.history_text, "", 1)
+        numeric_bytes = len(numeric_text.encode("utf-8"))
+        text_bytes = evidence_text_bytes({
+            key: value for key, value in evidence.items()
+            if key != "recent_agent_history"
+        })
+        bounded = (
+            numeric_text.isascii()
+            and text_bytes <= NUMERIC_EVIDENCE_TEXT_BYTES_LIMIT
+        )
+        numeric_tokens = ceil_ratio(
+            numeric_bytes, NUMERIC_EVIDENCE_TOKEN_RATIO if bounded else (1, 1)
+        )
+        history_tokens = ceil_ratio(history_bytes, HISTORY_TOKEN_RATIO)
+    except RequestBudgetError:
+        raise
+    except Exception as exc:
+        raise unverified_estimate("estimate could not be computed") from exc
+
+    budget["method"] = "component"
+    budget["estimated_input_tokens"] = (
+        static_tokens
+        + numeric_tokens
+        + history_tokens
+        + PROVIDER_ALLOWANCE_HISTORICAL_TOKENS
+        + PROVIDER_ALLOWANCE_SCHEMA_TOKENS
+    )
+    budget["components"] = {
+        "policy blocks": len(parts.blocks),
+        "static text tokens (pinned)": static_tokens,
+        "numeric evidence bytes": numeric_bytes,
+        "numeric evidence bound": (
+            "empirical 0.65 tokens per byte" if bounded
+            else "1 token per byte (non-ASCII or unexpected text)"
+        ),
+        "numeric evidence tokens": numeric_tokens,
+        "history bytes": history_bytes,
+        "history tokens (1 per byte)": history_tokens,
+        "historical residual allowance": (
+            PROVIDER_ALLOWANCE_HISTORICAL_TOKENS
+        ),
+        "strict-schema allowance": PROVIDER_ALLOWANCE_SCHEMA_TOKENS,
+    }
+
+    return budget
+
+
+def print_budget_components(budget):
+    print("Estimator method:", budget["method"])
+
+    if budget.get("reason"):
+        print("Estimator note:", budget["reason"])
+
+    for label, value in budget["components"].items():
+        print(f"  {label}: {value}")
+
+    print(
+        "Legacy estimate (2.5 characters per token):",
+        budget["legacy_estimated_input_tokens"],
+    )
+
+
 def json_type_name(value):
     if value is None:
         return "null"
@@ -3201,12 +3699,28 @@ score, never a guessed value, and explain why in its rationale.
 
 POLICY_BLOCK_START = "=== POLICY SECTION: "
 POLICY_BLOCK_END = "=== END POLICY SECTION ==="
+POLICY_BLOCK_JOIN = "\n\n"
+EVIDENCE_HEADING = "\n\nEVIDENCE AND STATUS (JSON):\n"
+
+# The instructions that open the user message, before the policy blocks.
+USER_PROMPT_PREAMBLE = (
+    "Assess the supplied weather situation using the policy "
+    "sections below. Do not infer official warning status. "
+    "Do not claim the assessment is complete. In sources, give "
+    "each title exactly as it appears after 'POLICY SECTION:' in a "
+    "block header (for example '6.1 Extreme Heat'), without the "
+    "prefix or the '===' markers.\n\n"
+)
 
 
-def format_policy_text(sections):
+def policy_block_text(title, text):
+    return f"{POLICY_BLOCK_START}{title} ===\n{text}\n{POLICY_BLOCK_END}"
+
+
+def policy_blocks(sections):
     """
-    Render policy sections as plain text. Section text is sent
-    verbatim (no JSON escaping); a section that contains the block
+    Render each policy section as one plain-text block. Section text is
+    sent verbatim (no JSON escaping); a section that contains the block
     delimiters is rejected so it cannot break out of its block.
     """
     blocks = []
@@ -3222,12 +3736,13 @@ def format_policy_text(sections):
                 + item["section"]
             )
 
-        blocks.append(
-            f"{POLICY_BLOCK_START}{item['section']} ===\n"
-            f"{item['text']}\n{POLICY_BLOCK_END}"
-        )
+        blocks.append(policy_block_text(item["section"], item["text"]))
 
-    return "\n\n".join(blocks)
+    return blocks
+
+
+def format_policy_text(sections):
+    return POLICY_BLOCK_JOIN.join(policy_blocks(sections))
 
 
 def assess_weather(weather, history, policy, retrieved_sections):
@@ -3250,28 +3765,38 @@ def assess_weather(weather, history, policy, retrieved_sections):
         ),
     }
 
+    blocks = policy_blocks(retrieved_sections)
+    evidence_text = json_text(context)
+
     user_prompt = (
-        "Assess the supplied weather situation using the policy "
-        "sections below. Do not infer official warning status. "
-        "Do not claim the assessment is complete. In sources, give "
-        "each title exactly as it appears after 'POLICY SECTION:' in a "
-        "block header (for example '6.1 Extreme Heat'), without the "
-        "prefix or the '===' markers.\n\n"
-        + format_policy_text(retrieved_sections)
-        + "\n\nEVIDENCE AND STATUS (JSON):\n"
-        + json_text(context)
+        USER_PROMPT_PREAMBLE
+        + POLICY_BLOCK_JOIN.join(blocks)
+        + EVIDENCE_HEADING
+        + evidence_text
     )
 
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT.strip(),
-        },
-        {
-            "role": "user",
-            "content": user_prompt,
-        },
-    ]
+    # The same messages, carrying the parts they were assembled from so
+    # the request guard can count each part. Serialized exactly like a
+    # plain list.
+    messages = BudgetedMessages(
+        [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT.strip(),
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        RequestParts(
+            SYSTEM_PROMPT.strip(),
+            USER_PROMPT_PREAMBLE,
+            blocks,
+            evidence_text,
+            json_text(compact_history),
+        ),
+    )
 
     LAST_RESPONSE_DIAGNOSTICS.clear()
 
@@ -5063,15 +5588,28 @@ def run_tests():
 
         return sections, captured[0]
 
+    def production_input_estimate(messages, text):
+        """The estimate the request guard uses; None if it cannot be
+        verified (which the guard treats as blocked)."""
+        try:
+            return request_token_budget(messages, text)[
+                "estimated_input_tokens"
+            ]
+        except RequestBudgetError:
+            return None
+
     def fits_all_budgets(hazards):
         sections, messages = build_request(
             {code: ["t"] for code in hazards}
         )
         serialized = serialized_request(messages)
+        estimate = production_input_estimate(messages, serialized)
 
+        # The production estimate, as the request guard computes it.
         return (
             len(serialized) <= MAX_REQUEST_CHARS
-            and estimate_tokens(serialized) + MAX_COMPLETION_TOKENS
+            and estimate is not None
+            and estimate + MAX_COMPLETION_TOKENS
             <= MAX_ESTIMATED_REQUEST_TOKENS
         )
 
@@ -5091,11 +5629,13 @@ def run_tests():
         fits_all_budgets(["HEAT", "WIND_DUST"]),
     )
 
-    # With the response schema counted, five hazards no longer fit.
+    # The legacy 2.5 characters-per-token estimate blocked this request;
+    # the component-aware estimate fits it. The realistic-evidence
+    # five-hazard request is still blocked (see the realistic tests).
     check(
-        "All five hazards together are blocked once the schema is "
-        "counted",
-        not fits_all_budgets(list(HAZARD_POLICY_TITLES)),
+        "All five hazards together fit this fixture's budgets with the "
+        "component-aware estimate",
+        fits_all_budgets(list(HAZARD_POLICY_TITLES)),
     )
 
     uncertain_all = {
@@ -5548,9 +6088,40 @@ def run_tests():
 
     check(
         "Pipeline records actual Groq usage on the decision",
-        good["groq_usage"]["prompt_tokens"] == 1234
-        and good["groq_usage"]["finish_reason"] == "stop"
+        good["groq_usage"].get("prompt_tokens") == 1234
+        and good["groq_usage"].get("finish_reason") == "stop"
         and good["assessment_status"] == "INCOMPLETE",
+    )
+
+    # A request blocked before Groq (a stale static token table) sends
+    # nothing, records no usage and fails closed. Checks of the usage
+    # record fail on this outcome; they never raise or pass.
+    blocked_transport = FakeHttp(FakeResponse(body=groq_body()))
+    blocked = with_globals(
+        {
+            "GROQ_API_KEY": secret_key,
+            "HTTP": blocked_transport,
+            "STATIC_TOKEN_TABLE": {},
+            "require_configuration": (
+                lambda require_sheet=False: None
+            ),
+            "get_weather": lambda city: make_weather(),
+            "tool_get_history": lambda n=3: [],
+        },
+        lambda: run_weather_agent()[0],
+    )
+
+    check(
+        "A request blocked before Groq sends nothing, records no usage "
+        "and fails closed",
+        blocked_transport.requests == []
+        and "prompt_tokens" not in blocked["groq_usage"]
+        and "could not be verified" in blocked["reasoning"]
+        and blocked["assessment_status"] == "INCOMPLETE"
+        and blocked["alert_recommendation"] == "UNABLE_TO_ASSESS"
+        and blocked["send_alert"] is False
+        and blocked["notification_status"] == "NOT_SENT"
+        and secret_key not in json_text(blocked),
     )
 
     # ------------------------------------------------------------
@@ -6371,10 +6942,10 @@ def run_tests():
         and good_result["send_alert"] is False
         and good_result["notification_status"] == "NOT_SENT"
         and good_result["official_warning_status"] == "NOT_CHECKED"
-        and good_result["groq_usage"]["prompt_tokens"] == 3239
-        and good_result["groq_usage"]["completion_tokens"] == 694
-        and good_result["groq_usage"]["reasoning_tokens"] == 301
-        and good_result["groq_usage"]["finish_reason"] == "stop"
+        and good_result["groq_usage"].get("prompt_tokens") == 3239
+        and good_result["groq_usage"].get("completion_tokens") == 694
+        and good_result["groq_usage"].get("reasoning_tokens") == 301
+        and good_result["groq_usage"].get("finish_reason") == "stop"
         and "gsk_adv_test_key_not_real" not in good_output
         and len(good_transport.posts) == 1,
     )
@@ -6399,8 +6970,8 @@ def run_tests():
         and incident_result["send_alert"] is False
         and incident_result["notification_status"] == "NOT_SENT"
         and incident_result["official_warning_status"] == "NOT_CHECKED"
-        and incident_result["groq_usage"]["completion_tokens"] == 694
-        and incident_result["groq_usage"]["finish_reason"] == "stop"
+        and incident_result["groq_usage"].get("completion_tokens") == 694
+        and incident_result["groq_usage"].get("finish_reason") == "stop"
         and "gsk_adv_test_key_not_real"
         not in json_text(incident_result) + incident_output,
     )
@@ -6434,13 +7005,18 @@ def run_tests():
         ),
     )
 
+    absent_reasoning_usage = adv_pipeline(
+        json_text(adv_response(sources=real_sources)),
+        usage={"prompt_tokens": 1, "completion_tokens": 2,
+               "total_tokens": 3},
+    )[0]["groq_usage"]
+
+    # A missing usage record must fail this check, not satisfy "is None".
     check(
         "Absent reasoning-token detail is recorded as null",
-        adv_pipeline(
-            json_text(adv_response(sources=real_sources)),
-            usage={"prompt_tokens": 1, "completion_tokens": 2,
-                   "total_tokens": 3},
-        )[0]["groq_usage"]["reasoning_tokens"] is None,
+        absent_reasoning_usage.get("prompt_tokens") == 1
+        and "reasoning_tokens" in absent_reasoning_usage
+        and absent_reasoning_usage["reasoning_tokens"] is None,
     )
 
     # ------------------------------------------------------------
@@ -6802,7 +7378,12 @@ def run_tests():
         abc_override({"ask_groq": capture}, assemble)
         text = serialized_request(captured[0])
 
-        return len(text), estimate_tokens(text) + MAX_COMPLETION_TOKENS
+        estimate = production_input_estimate(captured[0], text)
+
+        return len(text), (
+            (10 ** 9 if estimate is None else estimate)
+            + MAX_COMPLETION_TOKENS
+        )
 
     def abc_fits(hazards):
         chars, tokens = abc_request_size(hazards)
@@ -6822,12 +7403,13 @@ def run_tests():
             abc_fits({code: ["t"]}),
         )
 
-    # With the 1,000-token completion allowance, heat + wind with
-    # worst-case history exceeds the 8,000-token estimate (fails closed).
+    # The legacy estimate exceeded the 8,000-token budget for heat +
+    # wind with worst-case history at the 1,000-token completion
+    # allowance; the component-aware estimate fits it.
     check(
-        "24-hour series: heat with wind is blocked at the 1,000-token "
-        "completion allowance",
-        not abc_fits({"HEAT": ["t"], "WIND_DUST": ["t"]}),
+        "24-hour series: heat with wind fits at the 1,000-token "
+        "completion allowance with the component-aware estimate",
+        abc_fits({"HEAT": ["t"], "WIND_DUST": ["t"]}),
     )
 
     check(
@@ -7099,9 +7681,12 @@ def run_tests():
         rv_override({"ask_groq": capture}, assemble)
         text = serialized_request(captured[0])
 
+        estimate = production_input_estimate(captured[0], text)
+
         return (
             len(text) <= MAX_REQUEST_CHARS
-            and estimate_tokens(text) + MAX_COMPLETION_TOKENS
+            and estimate is not None
+            and estimate + MAX_COMPLETION_TOKENS
             <= MAX_ESTIMATED_REQUEST_TOKENS
         )
 
@@ -7109,8 +7694,8 @@ def run_tests():
 
     for label, hazards, expected in (
         ("no hazard", (), True),
-        ("heat", ("HEAT",), False),
-        ("heat + wind", ("HEAT", "WIND_DUST"), False),
+        ("heat", ("HEAT",), True),
+        ("heat + wind", ("HEAT", "WIND_DUST"), True),
         ("heat + wind + rain", ("HEAT", "WIND_DUST", "RAIN_FLOOD"), False),
         ("four hazards", rv_four, False),
         ("five hazards", tuple(HAZARD_POLICY_TITLES), False),
@@ -7313,26 +7898,30 @@ def run_tests():
         and five_decision["send_alert"] is False,
     )
 
+    # The legacy estimate rejected both of these before Groq. The
+    # component-aware estimate sends them once; the outcome is still an
+    # INCOMPLETE assessment that never authorizes an alert.
     check(
-        "Heat + wind with worst-case history is rejected before Groq "
-        "once the schema is counted",
+        "Heat + wind with worst-case history reaches Groq once and is "
+        "assessed (component-aware estimate)",
         set(heat_wind_decision["hazard_screening"])
         == {"HEAT", "WIND_DUST"}
-        and heat_wind_transport.posts == []
+        and len(heat_wind_transport.posts) == 1
+        and heat_wind_decision["groq_usage"].get("estimator_method")
+        == "component"
         and heat_wind_decision["assessment_status"] == "INCOMPLETE"
-        and heat_wind_decision["alert_recommendation"]
-        == "UNABLE_TO_ASSESS",
+        and heat_wind_decision["send_alert"] is False,
     )
 
     check(
-        "Heat-only with worst-case history is rejected before Groq at "
-        "the 1,000-token completion allowance",
+        "Heat-only with worst-case history reaches Groq once and is "
+        "assessed (component-aware estimate)",
         set(heat_worst_decision["hazard_screening"]) == {"HEAT"}
-        and heat_worst_transport.posts == []
-        and "token budget" in heat_worst_decision["reasoning"]
+        and len(heat_worst_transport.posts) == 1
+        and heat_worst_decision["groq_usage"].get("estimator_method")
+        == "component"
         and heat_worst_decision["assessment_status"] == "INCOMPLETE"
-        and heat_worst_decision["alert_recommendation"]
-        == "UNABLE_TO_ASSESS",
+        and heat_worst_decision["send_alert"] is False,
     )
 
     check(
@@ -7340,7 +7929,7 @@ def run_tests():
         "assessed",
         set(fit_decision["hazard_screening"]) == {"HEAT"}
         and len(fit_transport.posts) == 1
-        and fit_decision["groq_usage"]["prompt_tokens"] == 3239
+        and fit_decision["groq_usage"].get("prompt_tokens") == 3239
         and fit_decision["assessment_status"] == "INCOMPLETE"
         and "RISK_DIMENSIONS_UNASSESSED"
         in [r["code"] for r in fit_decision["incomplete_reasons"]],
@@ -8186,7 +8775,7 @@ def run_tests():
         and incident["response_diagnostics"]["missing_field_variants"][
             "reasoning"
         ]["prefix_or_suffix_variant"] is True
-        and incident["groq_usage"]["reasoning_tokens"] == 105,
+        and incident["groq_usage"].get("reasoning_tokens") == 105,
     )
 
     check(
@@ -8910,6 +9499,10 @@ def run_tests():
         and len(fz_request) <= MAX_REQUEST_CHARS
         and estimate_tokens(fz_request) + MAX_COMPLETION_TOKENS
         <= MAX_ESTIMATED_REQUEST_TOKENS
+        and type(fz_decision["groq_usage"].get("estimated_input_tokens"))
+        is int
+        and type(fz_decision["groq_usage"].get("completion_allowance"))
+        is int
         and fz_decision["groq_usage"]["estimated_input_tokens"]
         + fz_decision["groq_usage"]["completion_allowance"]
         <= MAX_ESTIMATED_REQUEST_TOKENS,
@@ -9565,7 +10158,7 @@ def run_tests():
         "Model Exposure 4 and Geographic Impact 4 are both overridden",
         eg_d["exposure_score"] is None
         and eg_d["geographic_impact_score"] is None
-        and eg_d["evidence_gate_overrides"]
+        and eg_d.get("evidence_gate_overrides")
         == ["exposure_score", "geographic_impact_score"]
         and eg_d["likelihood_score"] == 3
         and eg_d["severity_score"] == 3
@@ -9632,7 +10225,7 @@ def run_tests():
 
     check(
         "Model nulls need no override and stay unassessed",
-        only_null["decision"]["evidence_gate_overrides"] == []
+        only_null["decision"].get("evidence_gate_overrides") == []
         and only_null["decision"]["risk_band"] == "UNASSESSED",
     )
 
@@ -10601,7 +11194,7 @@ def run_tests():
 
         check(
             f"Claim in remaining model field still fails closed: {field}",
-            po_g["warning_claim_diagnostic"] is not None
+            po_g.get("warning_claim_diagnostic") is not None
             and po_g["warning_claim_diagnostic"].startswith(
                 f"field={field};"
             )
@@ -10802,7 +11395,8 @@ def run_tests():
 
     check(
         "Pattern 2 claim failure records its shape and leaks no text",
-        d2_dec["warning_claim_diagnostic"] == "field=reasoning;pattern=2"
+        d2_dec.get("warning_claim_diagnostic")
+        == "field=reasoning;pattern=2"
         and d2_dec["response_diagnostics"].get("warning_claim_shape")
         == d2_shape("there_is", False, 0, "warning", "evidence_noun")
         and "warning_claim_shape" in d2_run["log"]
@@ -10883,9 +11477,9 @@ def run_tests():
         reasoning="There are no active warnings.",
         sources=ur_citations,
     ))
-    ur_counts = ur_run["decision"]["response_diagnostics"][
-        "source_resolution"
-    ]["resolution_counts"]
+    ur_counts = ur_run["decision"].get("response_diagnostics", {}).get(
+        "source_resolution", {}
+    ).get("resolution_counts", {})
 
     check(
         "A claim failure records the unresolved-reference buckets",
@@ -10895,7 +11489,7 @@ def run_tests():
         and sum(ur_counts.values()) == 8
         and "UR-MARK" not in json_text(ur_run["decision"])
         + ur_run["log"] + ur_run["report"]
-        and ur_run["decision"]["warning_claim_diagnostic"]
+        and ur_run["decision"].get("warning_claim_diagnostic")
         == "field=reasoning;pattern=2",
     )
 
@@ -13254,6 +13848,1016 @@ def run_tests():
             and p2_levels(p2_failed, "warning") == []
             and p2_levels(p2_failed, "error") == p1["annotations"],
         )
+
+    # ------------------------------------------------------------
+    # Component-aware request estimate (BE groups). Offline. The
+    # tokenizer groups need tiktoken and WEATHER_TOKENIZER_TESTS=1 and
+    # are reported as skipped otherwise, never as passed.
+    # ------------------------------------------------------------
+    import itertools
+    import random
+    import string
+
+    be_json = json
+    be_skipped = []
+    be_encoding = None
+
+    if os.getenv("WEATHER_TOKENIZER_TESTS") == "1":
+        try:
+            import tiktoken
+
+            be_encoding = tiktoken.get_encoding("o200k_harmony")
+        except Exception as exc:
+            be_skipped.append(f"tokenizer unavailable ({type(exc).__name__})")
+    else:
+        be_skipped.append("tokenizer groups (set WEATHER_TOKENIZER_TESTS=1)")
+
+    def be_tokens(text):
+        return len(be_encoding.encode(text, allowed_special="all"))
+
+    def be_plain_tokens(text):
+        return len(
+            be_encoding.encode(
+                text, allowed_special=set(), disallowed_special=()
+            )
+        )
+
+    def be_exact_tokens(messages):
+        """Documented harmony layout, counted by the development tokenizer."""
+        return be_tokens(
+            HARMONY_SYSTEM_TEXT
+            + HARMONY_DEVELOPER_PREFIX + messages[0]["content"]
+            + response_format_section_text()
+            + HARMONY_USER_PREFIX + messages[1]["content"]
+            + HARMONY_ASSISTANT_TAIL
+        )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        be_policy = load_guidelines()
+
+    be_hazard_codes = list(HAZARD_POLICY_TITLES)
+    be_combos = [()] + [
+        combo
+        for size in range(1, len(be_hazard_codes) + 1)
+        for combo in itertools.combinations(be_hazard_codes, size)
+    ]
+    be_rng = random.Random(7)
+    be_prose = (
+        "Limit strenuous outdoor work during the midday heat, drink water "
+        "often and rest in shade. "
+    )
+    be_arabic = "".join(chr(code) for code in range(0x0621, 0x064B))
+
+    def be_field(kind, size):
+        if kind == "English":
+            return (be_prose * 6)[:size]
+        if kind == "Arabic":
+            return "".join(be_rng.choice(be_arabic + "   ") for _ in range(size))
+        if kind == "ASCII":
+            alphabet = string.ascii_letters + string.digits + string.punctuation
+            return "".join(be_rng.choice(alphabet) for _ in range(size))
+
+        return "".join(
+            chr(be_rng.choice([
+                be_rng.randint(0x0621, 0x064A),
+                be_rng.randint(0x4E00, 0x9FFF),
+                be_rng.randint(0x1F300, 0x1F5FF),
+            ]))
+            for _ in range(size)
+        )
+
+    def be_history(variant):
+        if variant == "typical":
+            return [{
+                "timestamp": "2026-11-09T04:10:11.417000+00:00",
+                "city": "Dubai", "advice": (be_prose * 6)[:86],
+                "alert_sent": False, "alert_message": "",
+            } for _ in range(MAX_HISTORY_RECORDS)]
+
+        return [{
+            "timestamp": "2026-11-09T04:10:11.417000+00:00",
+            "city": be_field(variant, 50), "advice": be_field(variant, 130),
+            "alert_sent": True, "alert_message": be_field(variant, 90),
+        } for _ in range(MAX_HISTORY_RECORDS)]
+
+    be_variants = {
+        "typical": be_history("typical"),
+        "English at caps": be_history("English"),
+        "Arabic at caps": be_history("Arabic"),
+        "ASCII at caps": be_history("ASCII"),
+        "CJK/emoji at caps": be_history("CJK"),
+    }
+    be_weather = rv_weather()
+    be_sections = {}
+
+    def be_sections_for(combo):
+        if combo not in be_sections:
+            hazards = {code: ["t"] for code in combo}
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                required = select_hazard_guidance(be_policy, hazards)
+                required += select_conditional_sections(
+                    be_policy, hazards, be_weather
+                )
+                be_sections[combo] = search_guidelines(
+                    be_policy, "x", k=0, required_sections=required
+                )
+
+        return be_sections[combo]
+
+    def be_build(combo, history, weather=None):
+        captured = []
+
+        def capture(messages, temperature=0.1):
+            captured.append(messages)
+            raise RuntimeError("captured")
+
+        def assemble():
+            try:
+                assess_weather(
+                    weather or be_weather, history, be_policy,
+                    be_sections_for(combo),
+                )
+            except RuntimeError:
+                pass
+
+        with_globals({"ask_groq": capture}, assemble)
+
+        return captured[0]
+
+    be_requests = {
+        (combo, name): be_build(combo, history)
+        for combo in be_combos
+        for name, history in be_variants.items()
+    }
+
+    be_unverified_components = {
+        "policy blocks": 0, "static text tokens (pinned)": 0,
+        "numeric evidence bytes": 0, "numeric evidence bound": "",
+        "numeric evidence tokens": 0, "history bytes": 0,
+        "history tokens (1 per byte)": 0,
+        "historical residual allowance": 0, "strict-schema allowance": 0,
+    }
+
+    def be_budget(messages):
+        """The production estimate. An estimate that cannot be verified
+        is reported as an impossibly large one so the checks fail by
+        assertion instead of crashing."""
+        text = serialized_request(messages)
+
+        try:
+            return request_token_budget(messages, text)
+        except RequestBudgetError:
+            return {
+                "method": "unverified",
+                "estimated_input_tokens": 10 ** 9,
+                "legacy_estimated_input_tokens": estimate_tokens(text),
+                "reason": None,
+                "components": dict(be_unverified_components),
+            }
+
+    be_budgets = {
+        key: be_budget(messages) for key, messages in be_requests.items()
+    }
+    be_limit = MAX_ESTIMATED_REQUEST_TOKENS - MAX_COMPLETION_TOKENS
+
+    class BeTransport:
+        """Recording stand-in for the HTTP session (no network)."""
+
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts.append(json)
+
+            return IpResponse(200, be_json.dumps({
+                "choices": [{
+                    "message": {"content": be_json.dumps(IP_REPLY)},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 4300, "completion_tokens": 700,
+                          "total_tokens": 5000},
+            }))
+
+    be_transport = BeTransport()
+
+    def be_send(messages, **overrides):
+        """The real ask_groq with a recording transport. Returns the error
+        text (or None) and the payloads posted."""
+        be_transport.posts.clear()
+        error = None
+        settings = {"HTTP": be_transport, "GROQ_API_KEY": "gsk_be_test"}
+        settings.update(overrides)
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                return ask_groq(messages)
+
+        try:
+            with_globals(settings, run)
+        except RequestBudgetError as exc:
+            error = str(exc)
+
+        return error, list(be_transport.posts)
+
+    # BE1: the parts rebuild the messages byte for byte, and the wrapper
+    # changes no serialized byte.
+    def be_verified(messages):
+        try:
+            return verify_request_parts(
+                messages, messages.budget_parts
+            ) is not None
+        except RequestBudgetError:
+            return False
+
+    def be_rebuilds(messages):
+        parts = messages.budget_parts
+
+        return (
+            type(messages) is BudgetedMessages
+            and messages[0]["content"] == parts.system
+            and messages[1]["content"]
+            == parts.preamble
+            + POLICY_BLOCK_JOIN.join(parts.blocks)
+            + EVIDENCE_HEADING
+            + parts.evidence_text
+            and be_verified(messages)
+            and serialized_request(messages)
+            == serialized_request(list(messages))
+            and json_text(messages) == json_text(list(messages))
+            and messages == list(messages)
+        )
+
+    check(
+        "BE1: parts rebuild the messages exactly for 32 hazard "
+        "combinations x 5 history variants",
+        len(be_requests) == 160
+        and all(be_rebuilds(m) for m in be_requests.values()),
+    )
+
+    be_triple = ("HEAT", "RAIN_FLOOD", "LIGHTNING")
+    be_triple_messages = be_requests[(be_triple, "typical")]
+    be_guard = serialized_request(be_triple_messages)
+    be_escape = lambda text: be_json.dumps(text, ensure_ascii=False)[1:-1]
+
+    check(
+        "BE1: the guard text is exactly the sum of its serialized pieces",
+        len(be_guard)
+        == len('{"messages":[{"role":"system","content":"')
+        + len(be_escape(be_triple_messages[0]["content"]))
+        + len('"},{"role":"user","content":"')
+        + len(be_escape(be_triple_messages[1]["content"]))
+        + len('"}],"response_format":')
+        + len(json_text(RESPONSE_FORMAT))
+        + len("}"),
+    )
+
+    be_error, be_posts = be_send(be_triple_messages)
+    be_error_plain, be_posts_plain = be_send(
+        list(be_triple_messages), MAX_ESTIMATED_REQUEST_TOKENS=10 ** 9
+    )
+
+    check(
+        "BE1: the posted payload is byte-identical with and without the "
+        "parts wrapper",
+        be_error is None and be_error_plain is None
+        and len(be_posts) == 1 and len(be_posts_plain) == 1
+        and be_json.dumps(be_posts[0], allow_nan=False)
+        == be_json.dumps(be_posts_plain[0], allow_nan=False),
+    )
+
+    # BE2: the static token table matches the static texts exactly.
+    be_texts = static_token_texts(be_policy)
+    be_digests = [sha256_text(text) for _, text in be_texts]
+
+    check(
+        "BE2: the static token table covers exactly the static texts",
+        len(set(be_digests)) == len(be_digests)
+        and set(be_digests) == set(STATIC_TOKEN_TABLE)
+        and STATIC_TOKEN_TABLE_META["entries"] == len(STATIC_TOKEN_TABLE)
+        and STATIC_TOKEN_TABLE_META["encoding"] == "o200k_harmony"
+        and all(
+            type(value) is int and value > 0
+            for value in STATIC_TOKEN_TABLE.values()
+        ),
+    )
+
+    check(
+        "BE2: every block any request carries is in the table",
+        all(
+            sha256_text(block) in STATIC_TOKEN_TABLE
+            for messages in be_requests.values()
+            for block in messages.budget_parts.blocks
+        ),
+    )
+
+    def be_expected_static(messages):
+        parts = messages.budget_parts
+        texts = [
+            HARMONY_SYSTEM_TEXT,
+            HARMONY_DEVELOPER_PREFIX + SYSTEM_PROMPT.strip(),
+            response_format_section_text(),
+            HARMONY_USER_PREFIX + USER_PROMPT_PREAMBLE,
+            *parts.blocks,
+            *([POLICY_BLOCK_JOIN] * (len(parts.blocks) - 1)),
+            EVIDENCE_HEADING,
+            HARMONY_ASSISTANT_TAIL,
+        ]
+
+        return sum(
+            STATIC_TOKEN_TABLE.get(sha256_text(text), 0) for text in texts
+        )
+
+    check(
+        "BE2: the static count is exactly the pinned counts of every "
+        "static text of the request, none omitted or repeated (160 "
+        "requests)",
+        all(
+            be_budgets[key]["components"]["static text tokens (pinned)"]
+            == be_expected_static(messages)
+            for key, messages in be_requests.items()
+        ),
+    )
+
+    check(
+        "BE2: the estimate is exactly static + numeric evidence + "
+        "history + the two separate allowances (160 requests)",
+        all(
+            budget["estimated_input_tokens"]
+            == budget["components"]["static text tokens (pinned)"]
+            + budget["components"]["numeric evidence tokens"]
+            + budget["components"]["history tokens (1 per byte)"]
+            + 192 + 300
+            and budget["components"]["historical residual allowance"]
+            == 192
+            and budget["components"]["strict-schema allowance"] == 300
+            for budget in be_budgets.values()
+        ),
+    )
+
+    if be_encoding is not None:
+        check(
+            "BE2: every pinned count equals the development tokenizer's",
+            all(
+                STATIC_TOKEN_TABLE.get(sha256_text(text)) == be_tokens(text)
+                for _, text in be_texts
+            ),
+        )
+    else:
+        print("SKIP: BE2 pinned counts versus the development tokenizer")
+
+    # BE3: fit and block verdicts for every combination and history type.
+    be_verdict = {
+        key: (
+            be_budgets[key]["estimated_input_tokens"] <= be_limit,
+            len(serialized_request(messages)) <= MAX_REQUEST_CHARS,
+        )
+        for key, messages in be_requests.items()
+    }
+    be_realistic = (
+        "typical", "English at caps", "Arabic at caps", "ASCII at caps"
+    )
+
+    check(
+        "BE3: all 32 combinations fit the token budget for typical, "
+        "English, Arabic and ASCII history",
+        all(
+            be_verdict[(combo, name)][0]
+            for combo in be_combos for name in be_realistic
+        ),
+    )
+
+    be_cjk_fit = {
+        combo for combo in be_combos
+        if be_verdict[(combo, "CJK/emoji at caps")][0]
+    }
+
+    check(
+        "BE3: CJK/emoji-heavy history at caps fails closed for every "
+        "combination containing heat, and for most others",
+        all("HEAT" not in combo for combo in be_cjk_fit)
+        and len(be_cjk_fit) < len(be_combos) // 2,
+    )
+
+    print(
+        "BE3 token verdict fits (of 32):",
+        {name: sum(be_verdict[(c, name)][0] for c in be_combos)
+         for name in be_variants},
+        "| over the 19,000-character cap (of 32):",
+        {name: sum(not be_verdict[(c, name)][1] for c in be_combos)
+         for name in be_variants},
+    )
+
+    be_cap_only = [
+        key for key, (tokens_ok, chars_ok) in be_verdict.items()
+        if tokens_ok and not chars_ok
+    ]
+
+    check(
+        "BE3: the character cap blocks on its own where the token estimate "
+        "fits",
+        len(be_cap_only) > 0
+        and all(
+            "character limit" in (be_send(be_requests[key])[0] or "")
+            and be_send(be_requests[key])[1] == []
+            for key in be_cap_only[:3]
+        ),
+    )
+
+    # BE9: the production three-hazard request (offline reconstruction).
+    be_triple_titles = [s["section"] for s in be_sections_for(be_triple)]
+    be_triple_budget = be_budgets[(be_triple, "typical")]
+
+    check(
+        "BE9: the three-hazard request carries all 11 sections, unchanged",
+        len(be_triple_titles) == 11
+        and be_triple_messages.budget_parts.blocks
+        == tuple(policy_blocks(be_sections_for(be_triple)))
+        and all(
+            item["text"] in be_triple_messages[1]["content"]
+            for item in be_sections_for(be_triple)
+        )
+        and any(t.startswith("6.1 ") for t in be_triple_titles)
+        and any(t.startswith("6.3 ") for t in be_triple_titles)
+        and any(t.startswith("6.5 ") for t in be_triple_titles)
+        and any(t.startswith("7. ") for t in be_triple_titles),
+    )
+
+    check(
+        "BE9: the three-hazard request is sent once under the real limits",
+        be_error is None
+        and len(be_posts) == 1
+        and be_triple_budget["method"] == "component"
+        and be_triple_budget["estimated_input_tokens"] <= be_limit
+        and len(be_guard) <= MAX_REQUEST_CHARS
+        and be_posts[0]["messages"] == list(be_triple_messages),
+    )
+
+    # BE7: pins, strict schema and the legacy fallback.
+    check(
+        "BE7: the pinned model, reasoning effort and response format "
+        "match the request configuration",
+        estimator_pins_match()
+        and ESTIMATOR_PINS["model"] == MODEL == "openai/gpt-oss-20b"
+        and ESTIMATOR_PINS["reasoning_effort"] == REASONING_EFFORT == "low"
+        and len(be_posts) == 1
+        and be_posts[0]["reasoning_effort"] == "low"
+        and be_posts[0]["response_format"] == RESPONSE_FORMAT
+        and be_posts[0]["model"] == MODEL
+        and be_posts[0]["temperature"] == 0.1
+        and be_posts[0]["max_completion_tokens"] == 1000,
+    )
+
+    check(
+        "BE7: the response-format section is the real strict schema",
+        response_format_section_text()
+        == "\n\n# Response Formats\n\n## weather_safety_assessment\n\n"
+        + be_json.dumps(
+            RESPONSE_FORMAT["json_schema"]["schema"],
+            separators=(",", ":"),
+        )
+        and RESPONSE_FORMAT["json_schema"]["strict"] is True,
+    )
+
+    be_changed_format = be_json.loads(json_text(RESPONSE_FORMAT))
+    be_changed_format["json_schema"]["schema"]["properties"]["extra"] = {
+        "type": "string"
+    }
+
+    for label, overrides in {
+        "model": {"MODEL": "other/model"},
+        "reasoning effort": {"REASONING_EFFORT": "high"},
+        "response schema": {"RESPONSE_FORMAT": be_changed_format},
+    }.items():
+        budget, legacy = with_globals(
+            overrides,
+            lambda: (
+                be_budget(be_triple_messages),
+                estimate_tokens(serialized_request(be_triple_messages)),
+            ),
+        )
+        error, posts = be_send(be_triple_messages, **overrides)
+
+        check(
+            f"BE7: a different {label} falls back to the legacy estimate",
+            budget["method"] == "legacy"
+            and budget["estimated_input_tokens"] == legacy
+            and "token budget" in (error or "")
+            and posts == [],
+        )
+
+    check(
+        "BE7: a plain message list uses the legacy estimate",
+        be_budget(list(be_triple_messages))["method"] == "legacy",
+    )
+
+    # BE12: fail-closed behaviour.
+    def be_blocked(messages, **overrides):
+        error, posts = be_send(messages, **overrides)
+
+        return (
+            error is not None
+            and "could not be verified" in error
+            and posts == []
+        )
+
+    be_parts = be_triple_messages.budget_parts
+
+    def be_consistent(parts):
+        """Messages rebuilt from the given parts, so only the parts'
+        own defect is under test."""
+        return BudgetedMessages(
+            [
+                {"role": "system", "content": parts.system},
+                {"role": "user", "content": parts.preamble
+                 + POLICY_BLOCK_JOIN.join(parts.blocks) + EVIDENCE_HEADING
+                 + parts.evidence_text},
+            ],
+            parts,
+        )
+
+    def be_parts_with(**changes):
+        values = {
+            "system": be_parts.system, "preamble": be_parts.preamble,
+            "blocks": be_parts.blocks,
+            "evidence_text": be_parts.evidence_text,
+            "history_text": be_parts.history_text,
+        }
+        values.update(changes)
+
+        return RequestParts(**values)
+
+    be_mutated = BudgetedMessages(
+        [
+            dict(be_triple_messages[0]),
+            {"role": "user",
+             "content": be_triple_messages[1]["content"] + " "},
+        ],
+        be_parts,
+    )
+    be_extra_key = BudgetedMessages(
+        [dict(be_triple_messages[0], extra="x"), be_triple_messages[1]],
+        be_parts,
+    )
+
+    check(
+        "BE12: malformed or mismatching parts fail closed before sending",
+        be_blocked(BudgetedMessages(
+            list(be_triple_messages), be_parts_with(system=be_parts.system + "x")
+        ))
+        and be_blocked(be_mutated)
+        and be_blocked(be_extra_key)
+        and be_blocked(BudgetedMessages(
+            list(be_triple_messages), be_parts_with(blocks=be_parts.blocks[:-1])
+        ))
+        and be_blocked(BudgetedMessages(
+            list(be_triple_messages),
+            be_parts_with(blocks=list(be_parts.blocks) + [1]),
+        ))
+        and be_blocked(BudgetedMessages(list(be_triple_messages), "parts"))
+        and be_blocked(BudgetedMessages(list(be_triple_messages), object())),
+    )
+
+    check(
+        "BE12: evidence that is not valid JSON, or a history that is not "
+        "the evidence's own, fails closed",
+        be_blocked(be_consistent(
+            be_parts_with(evidence_text='{"city": "Dubai"', history_text="[]")
+        ))
+        and be_blocked(be_consistent(be_parts_with(history_text="[]")))
+        and be_blocked(be_consistent(
+            be_parts_with(history_text=be_parts.history_text + " ")
+        ))
+        and be_blocked(be_consistent(
+            be_parts_with(evidence_text="[1, 2]", history_text="[]")
+        )),
+    )
+
+    be_first = next(iter(STATIC_TOKEN_TABLE))
+    be_without_first = {
+        key: value for key, value in STATIC_TOKEN_TABLE.items()
+        if key != be_first
+    }
+
+    check(
+        "BE12: a stale, incomplete or invalid static table fails closed",
+        be_blocked(
+            be_triple_messages,
+            STATIC_TOKEN_TABLE=be_without_first,
+            STATIC_TOKEN_TABLE_META=dict(
+                STATIC_TOKEN_TABLE_META, entries=len(be_without_first)
+            ),
+        )
+        and be_blocked(be_triple_messages, STATIC_TOKEN_TABLE={})
+        and be_blocked(
+            be_triple_messages,
+            STATIC_TOKEN_TABLE=dict(STATIC_TOKEN_TABLE, bad=1),
+        )
+        and be_blocked(
+            be_triple_messages,
+            STATIC_TOKEN_TABLE_META=dict(
+                STATIC_TOKEN_TABLE_META, encoding="cl100k_base"
+            ),
+        )
+        and be_blocked(be_triple_messages, STATIC_TOKEN_TABLE=None)
+        and be_blocked(
+            be_triple_messages,
+            STATIC_TOKEN_TABLE=dict(STATIC_TOKEN_TABLE, **{be_first: 0}),
+        ),
+    )
+
+    check(
+        "BE12: an unverified estimate is a typed REQUEST_BUDGET_EXCEEDED "
+        "failure with the existing outcome",
+        issubclass(RequestBudgetError, ClassifiedFailure)
+        and RequestBudgetError.failure_code == "REQUEST_BUDGET_EXCEEDED"
+        and RequestBudgetError.outcome == "UNAVAILABLE"
+        and unverified_estimate("x").failure_code
+        == "REQUEST_BUDGET_EXCEEDED",
+    )
+
+    be_oversize_error, be_oversize_posts = be_send(
+        BudgetedMessages(
+            list(be_triple_messages), be_parts_with(system="x")
+        ),
+        MAX_REQUEST_CHARS=100,
+    )
+
+    check(
+        "BE12: the character guard runs before an unverifiable estimate",
+        "character limit" in (be_oversize_error or "")
+        and be_oversize_posts == [],
+    )
+
+    be_unicode_weather = rv_weather()
+    be_unicode_weather["timezone"] = "Asia/Dubaï"
+    be_unicode_budget = be_budget(
+        be_build(be_triple, be_variants["typical"], be_unicode_weather)
+    )
+    be_text_weather = rv_weather()
+    be_text_weather["timezone"] = "A" * (NUMERIC_EVIDENCE_TEXT_BYTES_LIMIT + 5)
+    be_text_budget = be_budget(
+        be_build(be_triple, be_variants["typical"], be_text_weather)
+    )
+
+    check(
+        "BE12: non-ASCII or text-heavy numeric evidence is counted at one "
+        "token per byte, normal evidence at the empirical ratio",
+        "1 token per byte"
+        in be_unicode_budget["components"]["numeric evidence bound"]
+        and be_unicode_budget["components"]["numeric evidence tokens"]
+        == be_unicode_budget["components"]["numeric evidence bytes"]
+        and "1 token per byte"
+        in be_text_budget["components"]["numeric evidence bound"]
+        and be_text_budget["components"]["numeric evidence tokens"]
+        == be_text_budget["components"]["numeric evidence bytes"]
+        and be_triple_budget["components"]["numeric evidence bound"]
+        == "empirical 0.65 tokens per byte",
+    )
+
+    be_cjk = be_requests[(be_triple, "CJK/emoji at caps")]
+    be_cjk_error, be_cjk_posts = be_send(be_cjk)
+
+    check(
+        "BE12: CJK/emoji-heavy history over the budget fails closed with "
+        "the existing token-budget error and no truncation",
+        be_budgets[(be_triple, "CJK/emoji at caps")][
+            "estimated_input_tokens"
+        ] > be_limit
+        and "token budget" in (be_cjk_error or "")
+        and be_cjk_posts == []
+        and be_cjk.budget_parts.history_text
+        == json_text(summarize_history(be_variants["CJK/emoji at caps"]))
+        and be_cjk.budget_parts.blocks
+        == tuple(policy_blocks(be_sections_for(be_triple))),
+    )
+
+    # BE10 and BE11: boundaries, on requests whose padding is exactly one
+    # estimated token and one character per ASCII byte of history.
+    be_blocks = list(be_triple_messages.budget_parts.blocks)
+    be_context = be_json.loads(be_triple_messages.budget_parts.evidence_text)
+
+    def be_padded(pad):
+        history = [{"advice": "a" * pad}]
+        evidence_text = json_text(
+            dict(be_context, recent_agent_history=history)
+        )
+
+        return be_consistent(RequestParts(
+            SYSTEM_PROMPT.strip(), USER_PROMPT_PREAMBLE, be_blocks,
+            evidence_text, json_text(history),
+        ))
+
+    be_pad_zero = be_budget(be_padded(0))["estimated_input_tokens"]
+    be_pad_one = be_budget(be_padded(1))["estimated_input_tokens"]
+    be_token_pad = be_limit - be_pad_zero
+    be_relax_chars = {"MAX_REQUEST_CHARS": 10 ** 9}
+    be_relax_tokens = {"MAX_ESTIMATED_REQUEST_TOKENS": 10 ** 9}
+
+    check(
+        "BE10: one byte of history is exactly one estimated token",
+        be_pad_one - be_pad_zero == 1 and be_token_pad > 0,
+    )
+
+    be_below = be_send(be_padded(be_token_pad - 1), **be_relax_chars)
+    be_at = be_send(be_padded(be_token_pad), **be_relax_chars)
+    be_above = be_send(be_padded(be_token_pad + 1), **be_relax_chars)
+
+    check(
+        "BE10: 7,999 and 8,000 estimated total tokens are sent, 8,001 is "
+        "blocked",
+        be_budget(be_padded(be_token_pad - 1))["estimated_input_tokens"]
+        + MAX_COMPLETION_TOKENS == MAX_ESTIMATED_REQUEST_TOKENS - 1
+        and be_budget(be_padded(be_token_pad))["estimated_input_tokens"]
+        + MAX_COMPLETION_TOKENS == MAX_ESTIMATED_REQUEST_TOKENS
+        and be_below[0] is None and len(be_below[1]) == 1
+        and be_at[0] is None and len(be_at[1]) == 1
+        and "token budget" in (be_above[0] or "") and be_above[1] == [],
+    )
+
+    be_base_chars = len(serialized_request(be_padded(0)))
+
+    def be_chars_target(target):
+        return be_padded(target - be_base_chars)
+
+    be_c_below = be_send(be_chars_target(MAX_REQUEST_CHARS - 1), **be_relax_tokens)
+    be_c_at = be_send(be_chars_target(MAX_REQUEST_CHARS), **be_relax_tokens)
+    be_c_above = be_send(be_chars_target(MAX_REQUEST_CHARS + 1), **be_relax_tokens)
+
+    check(
+        "BE11: 18,999 and 19,000 request characters are sent, 19,001 is "
+        "blocked",
+        len(serialized_request(be_chars_target(MAX_REQUEST_CHARS - 1)))
+        == MAX_REQUEST_CHARS - 1
+        and len(serialized_request(be_chars_target(MAX_REQUEST_CHARS)))
+        == MAX_REQUEST_CHARS
+        and len(serialized_request(be_chars_target(MAX_REQUEST_CHARS + 1)))
+        == MAX_REQUEST_CHARS + 1
+        and be_c_below[0] is None and len(be_c_below[1]) == 1
+        and be_c_at[0] is None and len(be_c_at[1]) == 1
+        and "character limit" in (be_c_above[0] or "")
+        and be_c_above[1] == [],
+    )
+
+    check(
+        "BE11: each guard blocks on its own, and the character guard "
+        "comes first when both trip",
+        "token budget" in (
+            be_send(be_padded(be_token_pad + 1), **be_relax_chars)[0] or ""
+        )
+        and "character limit" in (
+            be_send(
+                be_chars_target(MAX_REQUEST_CHARS + 1), **be_relax_tokens
+            )[0] or ""
+        )
+        and "character limit" in (
+            be_send(
+                be_padded(be_token_pad + 1), MAX_REQUEST_CHARS=1000
+            )[0] or ""
+        ),
+    )
+
+    # The provider count above the estimate is logged and never fatal.
+    be_real_estimate = request_token_budget
+
+    def be_small_estimate(messages, request_text):
+        budget = be_real_estimate(messages, request_text)
+        budget["estimated_input_tokens"] = 100
+
+        return budget
+
+    be_underrun_out = io.StringIO()
+
+    def be_underrun_run():
+        with contextlib.redirect_stdout(be_underrun_out):
+            return ask_groq(be_triple_messages)
+
+    be_underrun_error = None
+
+    try:
+        with_globals(
+            {"HTTP": be_transport, "GROQ_API_KEY": "gsk_be_test",
+             "request_token_budget": be_small_estimate},
+            be_underrun_run,
+        )
+    except Exception as exc:
+        be_underrun_error = exc
+
+    check(
+        "BE12: a provider count above the estimate is logged, not fatal; "
+        "the usage record carries the estimator method",
+        be_underrun_error is None
+        and "ESTIMATOR UNDERRUN" in be_underrun_out.getvalue()
+        and LAST_GROQ_USAGE.get("estimator_method") == "component"
+        and LAST_GROQ_USAGE.get("legacy_estimated_input_tokens")
+        == estimate_tokens(be_guard),
+    )
+
+    # BE8: recorded provider usage. Run #41 (be5524a, strict schema, HEAT
+    # only): the legacy estimate was 6,889 and Groq reported 4,112 prompt
+    # tokens. A HEAT-only request with 3 history records must be counted
+    # at no less than that.
+    be_run41 = {"legacy": 6889, "prompt_tokens": 4112}
+    be_heat_budget = be_budgets[(("HEAT",), "typical")]
+    be_allowances = (
+        PROVIDER_ALLOWANCE_HISTORICAL_TOKENS + PROVIDER_ALLOWANCE_SCHEMA_TOKENS
+    )
+
+    check(
+        "BE8: a HEAT-only request is counted at no less than the recorded "
+        "run #41 provider usage, before and after the allowances",
+        be_heat_budget["estimated_input_tokens"] - be_allowances
+        >= be_run41["prompt_tokens"]
+        and be_heat_budget["estimated_input_tokens"]
+        >= be_run41["prompt_tokens"] + be_allowances
+        and math.ceil(17221 / 2.5) == be_run41["legacy"]
+        and math.ceil(17222 / 2.5) == be_run41["legacy"],
+    )
+
+    # BE4 to BE6: tokenizer-dependent groups.
+    if be_encoding is not None:
+        check(
+            "BE4: the component estimate never falls below the exact local "
+            "token count (160 requests)",
+            all(
+                be_budgets[key]["estimated_input_tokens"] - be_allowances
+                >= be_exact_tokens(messages)
+                for key, messages in be_requests.items()
+            ),
+        )
+
+        check(
+            "BE4: the allowances sit on top of an estimate that already "
+            "covers the exact count (160 requests)",
+            all(
+                be_budgets[key]["estimated_input_tokens"]
+                >= be_exact_tokens(messages) + be_allowances
+                for key, messages in be_requests.items()
+            ),
+        )
+
+        def be_numeric_case(weather):
+            messages = be_build(("HEAT",), [], weather)
+            text = messages.budget_parts.evidence_text.replace(
+                messages.budget_parts.history_text, "", 1
+            )
+            size = len(text.encode("utf-8"))
+
+            return (
+                be_plain_tokens(text),
+                -(-size * NUMERIC_EVIDENCE_TOKEN_RATIO[0]
+                  // NUMERIC_EVIDENCE_TOKEN_RATIO[1]),
+                size,
+            )
+
+        def be_random_weather(rng):
+            weather = rv_weather()
+
+            for record in weather["hourly_forecast_next_24h"]:
+                record["temperature"] = round(rng.uniform(5, 49.9), 1)
+                record["apparent_temperature"] = round(rng.uniform(5, 59.9), 1)
+                record["humidity"] = rng.randint(1, 100)
+                record["precipitation"] = rng.choice(
+                    [0.0, round(rng.uniform(0.1, 9.9), 1),
+                     round(rng.uniform(10, 99.9), 1)]
+                )
+                record["wind"] = round(rng.uniform(0, 99.9), 1)
+                record["gust"] = round(rng.uniform(0, 149.9), 1)
+                record["visibility"] = round(rng.uniform(0, 99999.9), 1)
+                record["weather_code"] = rng.choice([0, 1, 3, 61, 95, 99])
+                record["cape"] = round(rng.uniform(0, 9999.9), 1)
+
+            return weather
+
+        be_evidence_rng = random.Random(11)
+        be_cases = [rv_weather()] + [
+            be_random_weather(be_evidence_rng) for _ in range(120)
+        ]
+        be_results = [be_numeric_case(weather) for weather in be_cases]
+
+        check(
+            "BE5: numeric evidence stays within the empirical bound for "
+            "the realistic and 120 random payloads",
+            all(tokens <= bound for tokens, bound, _ in be_results)
+            and max(tokens / size for tokens, _, size in be_results) < 0.6,
+        )
+
+        be_classes = {
+            "English": lambda size: (be_prose * 6)[:size],
+            "letters and spaces": lambda size: "".join(
+                be_rng.choice(string.ascii_letters + "   ")
+                for _ in range(size)),
+            "alphanumeric": lambda size: "".join(
+                be_rng.choice(string.ascii_letters + string.digits)
+                for _ in range(size)),
+            "punctuation": lambda size: "".join(
+                be_rng.choice(string.punctuation) for _ in range(size)),
+            "printable ASCII": lambda size: "".join(
+                be_rng.choice(string.printable.strip()) for _ in range(size)),
+            "Arabic": lambda size: be_field("Arabic", size),
+            "CJK/emoji mix": lambda size: be_field("CJK", size),
+        }
+        be_fuzz_ok = True
+        be_fuzz_covered = True
+
+        for label, make in be_classes.items():
+            for _ in range(40):
+                history = [{
+                    "timestamp": "2026-11-09T04:10:11.417000+00:00",
+                    "city": make(45), "advice": make(125),
+                    "alert_sent": False, "alert_message": make(85),
+                }] * MAX_HISTORY_RECORDS
+                messages = be_build(("HEAT",), history)
+                text = messages.budget_parts.history_text
+                tokens = be_plain_tokens(text)
+                budget = be_budget(messages)
+
+                be_fuzz_ok &= tokens <= len(text.encode("utf-8"))
+                be_fuzz_covered &= (
+                    budget["components"]["history tokens (1 per byte)"]
+                    >= tokens
+                )
+
+        check(
+            "BE6: history tokens never exceed history bytes, and the "
+            "estimate covers them, across 7 text classes x 40 samples",
+            be_fuzz_ok and be_fuzz_covered,
+        )
+    else:
+        for name in (
+            "BE4 estimate versus the exact local count",
+            "BE5 numeric evidence bound over payloads",
+            "BE6 history token fuzz and Unicode classes",
+        ):
+            print("SKIP:", name)
+
+    # BE13: preservation specific to this change.
+    be_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    be_imported = {
+        alias.name.split(".")[0]
+        for node in be_tree.body if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".")[0]
+        for node in be_tree.body if isinstance(node, ast.ImportFrom)
+    }
+    be_function_imports = {
+        alias.name.split(".")[0]
+        for node in be_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name != "run_tests"
+        for sub in ast.walk(node) if isinstance(sub, ast.Import)
+        for alias in sub.names
+    } | {
+        (sub.module or "").split(".")[0]
+        for node in be_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name != "run_tests"
+        for sub in ast.walk(node) if isinstance(sub, ast.ImportFrom)
+    }
+
+    check(
+        "BE13: no runtime tokenizer dependency: tiktoken is not imported "
+        "at module level or inside any production function",
+        "tiktoken" not in be_imported
+        and "tiktoken" not in be_function_imports,
+    )
+
+    be_alert_writes = [
+        sub for node in ast.walk(be_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in (
+            "request_token_budget", "verify_request_parts", "ask_groq",
+            "assess_weather", "print_budget_components",
+            "static_token_texts", "verify_static_token_table",
+            "legacy_token_budget", "static_token_count",
+        )
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Subscript)
+        and isinstance(sub.slice, ast.Constant)
+        and sub.slice.value in (
+            "send_alert", "alert_message", "approval_status",
+            "notification_status",
+        )
+        and isinstance(sub.ctx, ast.Store)
+    ]
+
+    check(
+        "BE13: the estimator, guard and request assembly never write an "
+        "alert field",
+        not be_alert_writes,
+    )
+
+    check(
+        "BE13: the budgets and completion allowance are unchanged",
+        MAX_COMPLETION_TOKENS == 1000
+        and MAX_ESTIMATED_REQUEST_TOKENS == 8000
+        and MAX_REQUEST_CHARS == 19000
+        and MAX_POLICY_CHARS == 13500
+        and PROVIDER_ALLOWANCE_HISTORICAL_TOKENS == 192
+        and PROVIDER_ALLOWANCE_SCHEMA_TOKENS == 300,
+    )
+
+    if be_skipped:
+        print("Skipped (tokenizer tests):", "; ".join(be_skipped))
 
     for name, value in saved_actions_env.items():
         if value is not None:
